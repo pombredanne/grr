@@ -7,69 +7,318 @@ performing basic analysis.
 
 
 
+import json
+
 import logging
+
 from grr.lib import aff4
 from grr.lib import config_lib
 from grr.lib import flow
-from grr.lib import rdfvalue
+from grr.lib import rekall_profile_server
 from grr.lib import utils
-from grr.lib.flows.general import transfer
+
+# For RekallResponseCollection pylint: disable=unused-import
+from grr.lib.aff4_objects import aff4_rekall
+# pylint: enable=unused-import
+from grr.lib.flows.general import file_finder
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import structs as rdf_structs
+
 from grr.proto import flows_pb2
 
 
-class ImageMemoryToSocket(transfer.SendFile):
-  """This flow sends a memory image to remote listener.
+class MemoryCollectorCondition(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorCondition
 
-  It will first initialize the memory device, then send the image to the
-  specified socket.
 
-  To use this flow, choose a key and an IV in hex format (if run from the GUI,
+class MemoryCollectorWithoutLocalCopyDumpOption(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorWithoutLocalCopyDumpOption
+
+
+class MemoryCollectorWithLocalCopyDumpOption(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorWithLocalCopyDumpOption
+
+
+class MemoryCollectorDumpOption(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorDumpOption
+
+
+class MemoryCollectorDownloadAction(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorDownloadAction
+
+
+class MemoryCollectorSendToSocketAction(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorSendToSocketAction
+
+
+class MemoryCollectorAction(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorAction
+
+
+class MemoryCollectorArgs(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MemoryCollectorArgs
+
+
+class MemoryCollector(flow.GRRFlow):
+  """Flow for scanning and imaging memory.
+
+  MemoryCollector applies "action" (e.g. Download) to memory if memory contents
+  match all given "conditions". Matches are then written to the results
+  collection. If there are no "conditions", "action" is applied immediately.
+
+  MemoryCollector replaces deprecated DownloadMemoryImage and
+  ImageMemoryToSocket.
+
+  When downloading memory:
+  If the file transfer fails and you specified local copy, you can attempt to
+  download again using the FileFinder flow without needing to copy all of memory
+  to disk again.  FileFinder will only retrieve parts of the image that weren't
+  already downloaded.  Note that if the flow fails, you'll need to run
+  Administrative/DeleteGRRTempFiles to clean up the disk.
+
+  When imaging memory to socket:
+  Choose a key and an IV in hex format (if run from the GUI,
   there will be a pregenerated pair key and iv for you to use) and run a
   listener on the server you want to use like this:
 
   nc -l <port> | openssl aes-128-cbc -d -K <key> -iv <iv> > <filename>
-
-  Returns to parent flow:
-    A rdfvalue.StatEntry of the sent file.
   """
-
+  friendly_name = "Memory Collector"
   category = "/Memory/"
+  behaviours = flow.GRRFlow.behaviours + "BASIC"
+  args_type = MemoryCollectorArgs
 
-  # TODO(user): Handle the path, pathtype args post refactor.
+  def ConditionsToFileFinderConditions(self, conditions):
+    ff_condition_type_cls = file_finder.FileFinderCondition.Type
+    result = []
+    for c in conditions:
+      if c.condition_type == MemoryCollectorCondition.Type.LITERAL_MATCH:
+        result.append(file_finder.FileFinderCondition(
+            condition_type=ff_condition_type_cls.CONTENTS_LITERAL_MATCH,
+            contents_literal_match=c.literal_match))
+      elif c.condition_type == MemoryCollectorCondition.Type.REGEX_MATCH:
+        result.append(file_finder.FileFinderCondition(
+            condition_type=ff_condition_type_cls.CONTENTS_REGEX_MATCH,
+            contents_regex_match=c.regex_match))
+      else:
+        raise ValueError("Unknown condition type: %s", c.condition_type)
 
-  @flow.StateHandler(next_state="SendFile")
+    return result
+
+  @flow.StateHandler(next_state="StoreMemoryInformation")
   def Start(self):
-    self.CallFlow("LoadMemoryDriver", next_state="SendFile")
+    self.state.Register("memory_information", None)
+    self.state.Register(
+        "destdir",
+        self.args.action.download.dump_option.with_local_copy.destdir)
 
-  @flow.StateHandler(next_state="Done")
-  def SendFile(self, responses):
-    """Queue the sending of the file if the driver loaded."""
+    self.CallFlow("LoadMemoryDriver",
+                  driver_installer=self.args.driver_installer,
+                  next_state="StoreMemoryInformation")
+
+  def _DiskFreeCheckRequired(self):
+    ac = self.args.action
+    dump_option = ac.download.dump_option
+    return all([
+        ac.action_type == "DOWNLOAD",
+        dump_option.option_type == "WITH_LOCAL_COPY",
+        dump_option.with_local_copy.check_disk_free_space])
+
+  @flow.StateHandler(next_state=["Filter", "StoreTmpDir", "CheckDiskFree"])
+  def StoreMemoryInformation(self, responses):
     if not responses.success:
-      raise flow.FlowError("Failed due to no memory driver.")
-    memory_information = responses.First()
-    pathspec = rdfvalue.PathSpec(
-        path=memory_information.device.path,
-        pathtype=rdfvalue.PathSpec.PathType.MEMORY)
+      raise flow.FlowError("Failed due to no memory driver:%s." %
+                           responses.status)
 
-    self.CallClient("SendFile", key=utils.SmartStr(self.state.key),
-                    iv=utils.SmartStr(self.state.iv),
-                    pathspec=pathspec,
-                    address_family=self.state.family,
-                    host=self.state.host, port=self.state.port,
+    self.state.memory_information = responses.First()
+
+    if self._DiskFreeCheckRequired():
+      if self.state.destdir:
+        self.CallStateInline(next_state="CheckDiskFree")
+      else:
+        self.CallClient("GetConfiguration", next_state="StoreTmpDir")
+    else:
+      self.CallStateInline(next_state="Filter")
+
+  @flow.StateHandler(next_state=["CheckDiskFree"])
+  def StoreTmpDir(self, responses):
+    # For local copy we need to know where the file will land to check for
+    # disk free space there. The default is to leave this blank, which will
+    # cause the client to use Client.tempdir
+    if not responses.success:
+      raise flow.FlowError("Couldn't get client config: %s." % responses.status)
+
+    self.state.destdir = responses.First().get("Client.tempdir")
+
+    if not self.state.destdir:
+      # This means Client.tempdir wasn't explicitly defined in the client
+      # config,  so we use the current server value with the right context for
+      # the client instead.  This may differ from the default value deployed
+      # with the client, but it's a fairly safe bet.
+      self.state.destdir = config_lib.CONFIG.Get(
+          "Client.tempdir",
+          context=GetClientContext(self.client_id, self.token))
+
+      if not self.state.destdir:
+        raise flow.FlowError("Couldn't determine Client.tempdir file "
+                             "destination, required for disk free check: %s.")
+
+      self.Log("Couldn't get Client.tempdir from client for disk space check,"
+               "guessing %s from server config", self.state.destdir)
+
+    self.CallFlow("DiskVolumeInfo",
+                  path_list=[self.state.destdir],
+                  next_state="CheckDiskFree")
+
+  @flow.StateHandler(next_state=["Filter"])
+  def CheckDiskFree(self, responses):
+    if not responses.success or not responses.First():
+      raise flow.FlowError(
+          "Couldn't determine disk free space for path %s" %
+          self.args.action.download.dump_option.with_local_copy.destdir)
+
+    free_space = responses.First().FreeSpaceBytes()
+
+    mem_size = 0
+    for run in self.state.memory_information.runs:
+      mem_size += run.length
+
+    if free_space < mem_size:
+      # We expect that with compression the disk required will be significantly
+      # less, so this ensures there will still be some left once we are done.
+      raise flow.FlowError("Free space may be too low for local copy. Free "
+                           "space on volume %s is %s bytes. Mem size is: %s "
+                           "bytes. Override with check_disk_free_space=False."
+                           % (self.state.destdir, free_space, mem_size))
+
+    self.CallStateInline(next_state="Filter")
+
+  @flow.StateHandler(next_state=["Action"])
+  def Filter(self, responses):
+    if self.args.conditions:
+      self.CallFlow("FileFinder",
+                    paths=[self.state.memory_information.device.path],
+                    pathtype=rdf_paths.PathSpec.PathType.MEMORY,
+                    conditions=self.ConditionsToFileFinderConditions(
+                        self.args.conditions),
+                    next_state="Action")
+    else:
+      self.CallStateInline(next_state="Action")
+
+  @property
+  def action_options(self):
+    if self.args.action.action_type == MemoryCollectorAction.Action.DOWNLOAD:
+      return self.args.action.download
+    elif (self.args.action.action_type ==
+          MemoryCollectorAction.Action.SEND_TO_SOCKET):
+      return self.args.action.send_to_socket
+
+  @flow.StateHandler(next_state=["Transfer"])
+  def Action(self, responses):
+    if not responses.success:
+      raise flow.FlowError(
+          "Applying conditions failed: %s" % (responses.status))
+
+    if self.args.conditions:
+      if not responses:
+        self.Status("Memory doesn't match specified conditions.")
+        return
+      for response in responses:
+        for match in response.matches:
+          self.SendReply(match)
+
+    if self.action_options:
+      if (self.action_options.dump_option.option_type ==
+          MemoryCollectorDumpOption.Option.WITHOUT_LOCAL_COPY):
+        self.CallStateInline(next_state="Transfer")
+      elif (self.action_options.dump_option.option_type ==
+            MemoryCollectorDumpOption.Option.WITH_LOCAL_COPY):
+        dump_option = self.action_options.dump_option.with_local_copy
+        self.CallClient("CopyPathToFile",
+                        offset=dump_option.offset,
+                        length=dump_option.length,
+                        src_path=self.state.memory_information.device,
+                        dest_dir=dump_option.destdir,
+                        gzip_output=dump_option.gzip,
+                        next_state="Transfer")
+    else:
+      self.Status("Nothing to do: no action specified.")
+
+  @flow.StateHandler(next_state=["Done"])
+  def Transfer(self, responses):
+    # We can only get a failure if Transfer is called from CopyPathToFile
+    if not responses.success:
+      raise flow.FlowError("Local copy failed: %s" % (responses.status))
+
+    if (self.action_options.dump_option.option_type ==
+        MemoryCollectorDumpOption.Option.WITH_LOCAL_COPY):
+      self.state.Register("memory_src_path", responses.First().dest_path)
+    else:
+      self.state.Register("memory_src_path",
+                          self.state.memory_information.device)
+
+    if self.args.action.action_type == MemoryCollectorAction.Action.DOWNLOAD:
+      self.CallFlow("GetFile", pathspec=self.state.memory_src_path,
                     next_state="Done")
+    elif (self.args.action.action_type ==
+          MemoryCollectorAction.Action.SEND_TO_SOCKET):
+      options = self.state.args.action.send_to_socket
+
+      self.CallClient("SendFile", key=utils.SmartStr(options.key),
+                      iv=utils.SmartStr(options.iv),
+                      pathspec=self.state.memory_src_path,
+                      address_family=options.address_family,
+                      host=options.host,
+                      port=options.port,
+                      next_state="Done")
+
+  @flow.StateHandler(next_state=["DeleteFile"])
+  def Done(self, responses):
+    """'Done' state always gets executed after 'Transfer' state is done."""
+    if not responses.success:
+      # Leave file on disk to allow the user to retry GetFile without having to
+      # copy the whole memory image again.
+      raise flow.FlowError("Transfer of %s failed %s" % (
+          self.state.memory_src_path, responses.status))
+
+    if self.args.action.action_type == MemoryCollectorAction.Action.DOWNLOAD:
+      stat = responses.First()
+      self.state.Register("downloaded_file", stat.aff4path)
+      self.Log("Downloaded %s successfully." % self.state.downloaded_file)
+      self.Notify("ViewObject", self.state.downloaded_file,
+                  "Memory image transferred successfully")
+      self.Status("Memory image transferred successfully.")
+      self.SendReply(stat)
+    elif (self.args.action.action_type ==
+          MemoryCollectorAction.Action.SEND_TO_SOCKET):
+      self.Status("Memory image transferred successfully.")
+
+    if (self.action_options.dump_option.option_type ==
+        MemoryCollectorDumpOption.Option.WITH_LOCAL_COPY):
+      self.CallClient("DeleteGRRTempFiles",
+                      self.state.memory_src_path, next_state="DeleteFile")
+
+  @flow.StateHandler()
+  def DeleteFile(self, responses):
+    """Checks for errors from DeleteGRRTempFiles called from 'Done' state."""
+    if not responses.success:
+      raise flow.FlowError("Removing local file %s failed: %s" % (
+          self.state.memory_src_path, responses.status))
 
 
-class DownloadMemoryImageArgs(rdfvalue.RDFProtoStruct):
+class DownloadMemoryImageArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.DownloadMemoryImageArgs
 
 
 class DownloadMemoryImage(flow.GRRFlow):
   """Copy memory image to local disk then retrieve the file.
 
-  If the file transfer fails you can attempt to download again using the GetFile
-  flow without needing to copy all of memory to disk again.  Note that if the
-  flow fails, you'll need to run Administrative/DeleteGRRTempFiles to clean up
-  the disk.
+  DEPRECATED.
+  This flow is now deprecated in favor of MemoryCollector. Please use
+  MemoryCollector without conditions with "Download" action. You can
+  set "dump option" to "create local copy first" or "don't create local copy".
 
   Returns to parent flow:
     A rdfvalue.CopyPathToFileRequest.
@@ -79,7 +328,7 @@ class DownloadMemoryImage(flow.GRRFlow):
   args_type = DownloadMemoryImageArgs
 
   # This flow is also a basic flow.
-  behaviours = flow.GRRFlow.behaviours + "BASIC"
+  behaviours = flow.GRRFlow.behaviours + "ADVANCED"
 
   @classmethod
   def GetDefaultArgs(cls, token=None):
@@ -148,7 +397,7 @@ class DownloadMemoryImage(flow.GRRFlow):
                 "Memory image transferred successfully")
 
 
-class LoadMemoryDriverArgs(rdfvalue.RDFProtoStruct):
+class LoadMemoryDriverArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.LoadMemoryDriverArgs
 
 
@@ -164,25 +413,31 @@ class LoadMemoryDriver(flow.GRRFlow):
   def Start(self):
     """Check if driver is already loaded."""
     self.state.Register("device_urn", self.client_id.Add("devices/memory"))
-    self.state.Register("driver_installer", self.args.driver_installer)
+    self.state.Register("installer_urns", [])
+    self.state.Register("current_installer", None)
 
     if not self.args.driver_installer:
       # Fetch the driver installer from the data store.
-      self.state.driver_installer = GetMemoryModule(self.client_id,
-                                                    token=self.token)
+      self.state.installer_urns = GetMemoryModules(self.client_id,
+                                                   token=self.token)
 
       # Create a protobuf containing the request.
-      if not self.state.driver_installer:
+      if not self.state.installer_urns:
         raise IOError("Could not determine path for memory driver. No module "
                       "available for this platform.")
 
     if self.args.reload_if_loaded:
       self.CallStateInline(next_state="LoadDriver")
     else:
+      # We just check for one of the drivers, assuming that they all use the
+      # same device path.
+      installer = GetDriverFromURN(self.state.installer_urns[0],
+                                   token=self.token)
+
       self.CallClient("GetMemoryInformation",
-                      rdfvalue.PathSpec(
-                          path=self.state.driver_installer.device_path,
-                          pathtype=rdfvalue.PathSpec.PathType.MEMORY),
+                      rdf_paths.PathSpec(
+                          path=installer.device_path,
+                          pathtype=rdf_paths.PathSpec.PathType.MEMORY),
                       next_state="CheckMemoryInformation")
 
   @flow.StateHandler(next_state=["LoadDriver", "GotMemoryInformation"])
@@ -198,21 +453,27 @@ class LoadMemoryDriver(flow.GRRFlow):
 
   @flow.StateHandler(next_state=["InstalledDriver"])
   def LoadDriver(self, _):
-    # We want to force unload old driver and reload the current one.
-    self.state.driver_installer.force_reload = 1
-    self.CallClient("InstallDriver", self.state.driver_installer,
-                    next_state="InstalledDriver")
+    if not self.state.installer_urns:
+      raise flow.FlowError("Could not find a working memory driver")
 
-  @flow.StateHandler(next_state="GotMemoryInformation")
+    installer_urn = self.state.installer_urns.pop(0)
+    installer = GetDriverFromURN(installer_urn, token=self.token)
+    self.state.current_installer = installer
+    # We want to force unload old driver and reload the current one.
+    installer.force_reload = 1
+    self.CallClient("InstallDriver", installer, next_state="InstalledDriver")
+
+  @flow.StateHandler(next_state=["GotMemoryInformation", "LoadDriver",
+                                 "InstalledDriver"])
   def InstalledDriver(self, responses):
     if not responses.success:
-      raise flow.FlowError("Could not install memory driver %s" %
-                           responses.status)
+      # This driver didn't work, let's try the next one.
+      self.CallStateInline(next_state="LoadDriver")
 
     self.CallClient("GetMemoryInformation",
-                    rdfvalue.PathSpec(
-                        path=self.state.driver_installer.device_path,
-                        pathtype=rdfvalue.PathSpec.PathType.MEMORY),
+                    rdf_paths.PathSpec(
+                        path=self.state.current_installer.device_path,
+                        pathtype=rdf_paths.PathSpec.PathType.MEMORY),
                     next_state="GotMemoryInformation")
 
   @flow.StateHandler()
@@ -232,28 +493,59 @@ class LoadMemoryDriver(flow.GRRFlow):
       self.SendReply(layout)
     else:
       raise flow.FlowError("Failed to query device %s (%s)" %
-                           (self.state.driver_installer.device_path,
+                           (self.state.current_installer.device_path,
                             responses.status))
 
   @flow.StateHandler()
   def End(self):
-    if self.state.context.state != rdfvalue.Flow.State.ERROR:
+    if self.state.context.state != rdf_flows.Flow.State.ERROR:
       self.Notify("ViewObject", self.state.device_urn,
                   "Driver successfully initialized.")
 
 
-def GetMemoryModule(client_id, token):
-  """Given a host, return an appropriate memory module.
+def GetClientContext(client_id, token):
+  """Get context for the given client id.
+
+  Get platform, os release, and arch contexts for the client.
+
+  Args:
+    client_id: The client_id of the host to use.
+    token: Token to use for access.
+  Returns:
+    array of client_context strings
+  """
+  client_context = []
+  client = aff4.FACTORY.Open(client_id, token=token)
+  system = client.Get(client.Schema.SYSTEM)
+  if system:
+    client_context.append("Platform:%s" % system)
+
+  arch = utils.SmartStr(client.Get(client.Schema.ARCH)).lower()
+  # Support synonyms for i386.
+  if arch == "x86":
+    arch = "i386"
+
+  if arch == "x86_64":
+    arch = "amd64"
+
+  if arch:
+    client_context.append("Arch:%s" % arch)
+
+  return client_context
+
+
+def GetMemoryModules(client_id, token):
+  """Given a host, returns a list of urns to appropriate memory modules.
 
   Args:
     client_id: The client_id of the host to use.
     token: Token to use for access.
 
   Returns:
-    A GRRSignedDriver.
+    A list of URNs pointing to GRRSignedDriver objects.
 
   Raises:
-    IOError: on inability to get driver.
+    IOError: on inability to get any driver.
 
   The driver is retrieved from the AFF4 configuration space according to the
   client's known attributes. The exact layout of the driver's configuration
@@ -282,44 +574,38 @@ def GetMemoryModule(client_id, token):
       .... Key 1 .... (Public)
 
     Arch:amd64:
-      MemoryDriver.aff4_path:  |
-          aff4:/config/drivers/windows/pmem_amd64.sys
+      MemoryDriver.aff4_paths:
+        - aff4:/config/drivers/windows/pmem_amd64.sys
 
     Arch:i386:
-      MemoryDriver.aff4_path:  |
-          aff4:/config/drivers/windows/pmem_x86.sys
+      MemoryDriver.aff4_paths:
+        - aff4:/config/drivers/windows/pmem_x86.sys
   """
-  client_context = []
-  client = aff4.FACTORY.Open(client_id, token=token)
-  system = client.Get(client.Schema.SYSTEM)
-  if system:
-    client_context.append("Platform:%s" % system)
-
-  release = client.Get(client.Schema.OS_RELEASE)
-  if release:
-    client_context.append(utils.SmartStr(release))
-
-  arch = utils.SmartStr(client.Get(client.Schema.ARCH)).lower()
-  # Support synonyms for i386.
-  if arch == "x86":
-    arch = "i386"
-
-  if arch:
-    client_context.append("Arch:%s" % arch)
-
-  # Now query the configuration system for the driver.
-  aff4_path = config_lib.CONFIG.Get("MemoryDriver.aff4_path",
-                                    context=client_context)
-
-  if aff4_path:
+  installer_urns = []
+  for aff4_path in config_lib.CONFIG.Get(
+      "MemoryDriver.aff4_paths", context=GetClientContext(client_id, token)):
     logging.debug("Will fetch driver at %s for client %s",
                   aff4_path, client_id)
-    fd = aff4.FACTORY.Open(aff4_path, aff4_type="GRRMemoryDriver",
+    if GetDriverFromURN(aff4_path, token):
+      logging.debug("Driver at %s found.", aff4_path)
+      installer_urns.append(aff4_path)
+    else:
+      logging.debug("Unable to load driver at %s.", aff4_path)
+
+  if not installer_urns:
+    raise IOError("Unable to find a driver for client.")
+
+  return installer_urns
+
+
+def GetDriverFromURN(urn, token=None):
+  """Returns the actual driver from a driver URN."""
+  try:
+    fd = aff4.FACTORY.Open(urn, aff4_type="GRRMemoryDriver",
                            mode="r", token=token)
 
     # Get the signed driver.
-    driver_blob = fd.Get(fd.Schema.BINARY)
-    if driver_blob:
+    for driver_blob in fd:
       # How should this driver be installed?
       driver_installer = fd.Get(fd.Schema.INSTALLATION)
 
@@ -329,72 +615,194 @@ def GetMemoryModule(client_id, token):
 
         return driver_installer
 
-  raise IOError("Unable to find a driver for client.")
+  except IOError:
+    pass
+
+  return None
 
 
-class AnalyzeClientMemoryArgs(rdfvalue.RDFProtoStruct):
+class AnalyzeClientMemoryArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.AnalyzeClientMemoryArgs
 
 
 class AnalyzeClientMemory(flow.GRRFlow):
-  """Runs client side analysis using volatility.
+  """Runs client side analysis using Rekall.
 
-  This flow takes a list of volatility plugins to run. It first calls
+  This flow takes a list of Rekall plugins to run. It first calls
   LoadMemoryDriver to ensure a Memory driver is loaded.
-  It then sends the list of volatility commands to the client. The client will
-  run those plugins using the client's copy of volatility.
+  It then sends the list of Rekall commands to the client. The client will
+  run those plugins using the client's copy of Rekall.
 
-  Each plugin will return it's results and they will be stored in the
-  /analysis part of the vfs.
+  Each plugin will return it's results and they will be stored in
+  RekallResultCollections.
   """
 
   category = "/Memory/"
   args_type = AnalyzeClientMemoryArgs
   behaviours = flow.GRRFlow.behaviours + "BASIC"
 
-  @flow.StateHandler(next_state=["RunVolatilityPlugins"])
+  @flow.StateHandler(next_state=["RunPlugins", "KcoreStatResult",
+                                 "StoreResults"])
   def Start(self, _):
-    self.CallFlow("LoadMemoryDriver", next_state="RunVolatilityPlugins",
+    # Our output collection is a RekallResultCollection.
+    if self.runner.output is not None:
+      self.runner.output = aff4.FACTORY.Create(
+          self.runner.output.urn, "RekallResponseCollection",
+          mode="rw", token=self.token)
+
+    self.state.Register("rekall_context_messages", {})
+    self.state.Register("output_files", [])
+    self.state.Register("plugin_errors", [])
+
+    self.state.Register("rekall_request", self.args.request.Copy())
+
+    if self.args.debug_logging:
+      self.state.rekall_request.session[
+          u"logging_level"] = u"DEBUG"
+
+    # We want to disable local profile building on the client machines.
+    self.state.rekall_request.session[
+        u"autodetect_build_local"] = u"none"
+
+    # If a device is already provided, just us it.
+    if self.state.rekall_request.device:
+      self.CallClient("RekallAction", self.state.rekall_request,
+                      next_state="StoreResults")
+      return
+
+    # If it is a linux client, check for kcore.
+    client = aff4.FACTORY.Open(self.client_id, token=self.token)
+    system = client.Get(client.Schema.SYSTEM)
+    if self.args.use_kcore_if_present and system == "Linux":
+      kcore_pathspec = rdf_paths.PathSpec(
+          path="/proc/kcore",
+          pathtype=rdf_paths.PathSpec.PathType.OS,
+          # Devices are always outside the chroot so we specify this flag so
+          # the client is able to locate it.
+          is_virtualroot=True)
+      self.CallClient("StatFile",
+                      pathspec=kcore_pathspec,
+                      next_state="KcoreStatResult")
+      return
+
+    self.CallFlow("LoadMemoryDriver", next_state="RunPlugins",
                   driver_installer=self.args.driver_installer)
 
+  @flow.StateHandler(next_state=["StoreResults", "RunPlugins"])
+  def KcoreStatResult(self, responses):
+    if responses.success:
+      self.state.rekall_request.device = responses.First().pathspec
+      self.CallClient("RekallAction", self.state.rekall_request,
+                      next_state="StoreResults")
+    else:
+      self.CallFlow("LoadMemoryDriver", next_state="RunPlugins",
+                    driver_installer=self.args.driver_installer)
+
   @flow.StateHandler(next_state=["StoreResults"])
-  def RunVolatilityPlugins(self, responses):
-    """Call the client with the volatility actions."""
+  def RunPlugins(self, responses):
+    """Call the client with the Rekall actions."""
     if not responses.success:
       raise flow.FlowError("Unable to install memory driver.")
 
-    for plugin in self.args.request.plugins:
-      if plugin not in self.args.request.args:
-        self.args.request.args[plugin] = {}
-
     memory_information = responses.First()
-    self.args.request.device = memory_information.device
-    self.CallClient("VolatilityAction", self.args.request,
+    # Update the device from the result of LoadMemoryDriver.
+    self.state.rekall_request.device = memory_information.device
+    self.CallClient("RekallAction", self.state.rekall_request,
                     next_state="StoreResults")
 
   @flow.StateHandler()
+  def UpdateProfile(self, responses):
+    if not responses.success:
+      self.Log(responses.status)
+
+  @flow.StateHandler(next_state=["StoreResults", "UpdateProfile",
+                                 "DeleteFiles"])
   def StoreResults(self, responses):
     """Stores the results."""
     if not responses.success:
-      self.Log("Error running plugins: %s.", responses.status)
-      return
+      self.state.plugin_errors.append(unicode(responses.status.error_message))
 
-    self.Log("Volatility returned %s responses." % len(responses))
+    self.Log("Rekall returned %s responses." % len(responses))
     for response in responses:
-      self.SendReply(response)
-      if self.runner.output:
-        output_urn = self.runner.output.urn.Add(response.plugin)
-        with aff4.FACTORY.Create(output_urn, "VolatilityResponse",
-                                 mode="rw", token=self.token) as fd:
-          fd.Set(fd.Schema.DESCRIPTION("Volatility plugin by %s: %s" % (
-              self.state.context.user, str(self.args.request))))
-          fd.Set(fd.Schema.RESULT(response))
+      if response.missing_profile:
+        server_type = config_lib.CONFIG["Rekall.profile_server"]
+        logging.info("Getting missing Rekall profile '%s' from %s",
+                     response.missing_profile, server_type)
+        profile_server = rekall_profile_server.ProfileServer.classes[
+            server_type]()
+        profile = profile_server.GetProfileByName(
+            response.missing_profile,
+            version=response.repository_version
+        )
+
+        if profile:
+          self.CallClient("WriteRekallProfile", profile,
+                          next_state="UpdateProfile")
+        else:
+          self.Log("Needed profile %s not found! See "
+                   "https://github.com/google/grr-doc/blob/master/"
+                   "troubleshooting.adoc#missing-rekall-profiles",
+                   response.missing_profile)
+
+      if response.json_messages:
+        response.client_urn = self.client_id
+        if self.state.rekall_context_messages:
+          response.json_context_messages = json.dumps(
+              self.state.rekall_context_messages.items(),
+              separators=(",", ":"))
+
+        json_data = json.loads(response.json_messages)
+        for message in json_data:
+          if len(message) >= 1:
+            if message[0] in ["t", "s"]:
+              self.state.rekall_context_messages[message[0]] = message[1]
+
+            if message[0] == "file":
+              pathspec = rdf_paths.PathSpec(**message[1])
+              self.state.output_files.append(pathspec)
+
+            if message[0] == "L":
+              if len(message) > 1:
+                log_record = message[1]
+                self.Log("%s:%s:%s", log_record["level"],
+                         log_record["name"], log_record["msg"])
+
+        self.SendReply(response)
+
+    if responses.iterator.state != rdf_client.Iterator.State.FINISHED:
+      self.state.rekall_request.iterator = responses.iterator
+      self.CallClient("RekallAction", self.state.rekall_request,
+                      next_state="StoreResults")
+    else:
+      if self.state.output_files:
+        self.Log("Getting %i files.", len(self.state.output_files))
+        self.CallFlow("MultiGetFile", pathspecs=self.state.output_files,
+                      next_state="DeleteFiles")
+
+  @flow.StateHandler(next_state="LogDeleteFiles")
+  def DeleteFiles(self, responses):
+    # Check that the GetFiles flow worked.
+    if not responses.success:
+      raise flow.FlowError("Could not get files: %s" % responses.status)
+    for output_file in self.state.output_files:
+      self.CallClient("DeleteGRRTempFiles", output_file,
+                      next_state="LogDeleteFiles")
+
+  @flow.StateHandler()
+  def LogDeleteFiles(self, responses):
+    # Check that the DeleteFiles flow worked.
+    if not responses.success:
+      raise flow.FlowError("Could not delete file: %s" % responses.status)
 
   @flow.StateHandler()
   def End(self):
-    if self.runner.output:
+    if self.state.plugin_errors:
+      all_errors = u"\n".join([unicode(e) for e in self.state.plugin_errors])
+      raise flow.FlowError("Error running plugins: %s" % all_errors)
+
+    if self.runner.output is not None:
       self.Notify("ViewObject", self.runner.output.urn,
-                  "Ran volatility plugins")
+                  "Ran analyze client memory")
 
 
 class UnloadMemoryDriver(LoadMemoryDriver):
@@ -407,28 +815,33 @@ class UnloadMemoryDriver(LoadMemoryDriver):
   def Start(self):
     """Start processing."""
     self.state.Register("driver_installer", self.args.driver_installer)
+    self.state.Register("success", False)
 
-    if not self.args.driver_installer:
-      self.state.driver_installer = GetMemoryModule(self.client_id, self.token)
+    if self.args.driver_installer:
+      self.CallClient("UninstallDriver", self.state.driver_installer,
+                      next_state="Done")
+      return
 
-      if not self.state.driver_installer:
-        raise IOError("No memory driver currently available for this system.")
+    urns = GetMemoryModules(self.client_id, self.token)
+    if not urns:
+      raise IOError("No memory driver currently available for this system.")
 
-    self.CallClient("UninstallDriver", self.state.driver_installer,
-                    next_state="Done")
+    for urn in urns:
+      installer = GetDriverFromURN(urn, token=self.token)
+      self.CallClient("UninstallDriver", installer, next_state="Done")
 
   @flow.StateHandler()
   def Done(self, responses):
-    if not responses.success:
-      raise flow.FlowError("Failed to uninstall memory driver: %s",
-                           responses.status.error_message)
+    if responses.success:
+      self.state.success = True
 
   @flow.StateHandler()
   def End(self):
-    pass
+    if not self.state.success:
+      raise flow.FlowError("Failed to uninstall memory driver.")
 
 
-class ScanMemoryArgs(rdfvalue.RDFProtoStruct):
+class ScanMemoryArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ScanMemoryArgs
 
 
@@ -451,11 +864,6 @@ class ScanMemory(flow.GRRFlow):
   def Start(self):
     self.args.grep.xor_in_key = self.XOR_IN_KEY
     self.args.grep.xor_out_key = self.XOR_OUT_KEY
-    # For literal matches we xor the search term. This stops us matching the GRR
-    # client itself.
-    if self.args.grep.literal:
-      self.args.grep.literal = utils.Xor(
-          self.args.grep.literal, self.XOR_IN_KEY)
 
     self.CallFlow("LoadMemoryDriver", next_state="Grep")
 
@@ -469,8 +877,14 @@ class ScanMemory(flow.GRRFlow):
     memory_information = responses.First()
 
     # Coerce the BareGrepSpec into a GrepSpec explicitly.
-    grep_request = rdfvalue.GrepSpec(target=memory_information.device,
-                                     **self.args.grep.AsDict())
+    grep_request = rdf_client.GrepSpec(target=memory_information.device,
+                                       **self.args.grep.AsDict())
+
+    # For literal matches we xor the search term. This stops us matching the GRR
+    # client itself.
+    if self.args.grep.literal:
+      grep_request.literal = utils.Xor(
+          utils.SmartStr(self.args.grep.literal), self.XOR_IN_KEY)
 
     self.CallClient("Grep", request=grep_request, next_state="Done")
 
@@ -486,17 +900,17 @@ class ScanMemory(flow.GRRFlow):
           self.CallFlow("DownloadMemoryImage", next_state="End")
 
     else:
-      raise flow.FlowError("Error grepping memory: %s.", responses.status)
+      raise flow.FlowError("Error grepping memory: %s." % responses.status)
 
 
-class ListVADBinariesArgs(rdfvalue.RDFProtoStruct):
+class ListVADBinariesArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ListVADBinariesArgs
 
 
 class ListVADBinaries(flow.GRRFlow):
-  """Get list of all running binaries from Volatility, (optionally) fetch them.
+  """Get list of all running binaries from Rekall, (optionally) fetch them.
 
-    This flow executes the "vad" Volatility plugin to get the list of all
+    This flow executes the "vad" Rekall plugin to get the list of all
     currently running binaries (including dynamic libraries). Then if
     fetch_binaries option is set to True, it fetches all the binaries it has
     found.
@@ -535,73 +949,55 @@ class ListVADBinaries(flow.GRRFlow):
   @flow.StateHandler(next_state="FetchBinaries")
   def Start(self):
     """Request VAD data."""
-    if self.runner.output:
+    if self.runner.output is not None:
       self.runner.output.Set(self.runner.output.Schema.DESCRIPTION(
-          "GetProcessesBinariesVolatility binaries (regex: %s) " %
+          "GetProcessesBinariesRekall binaries (regex: %s) " %
           self.args.filename_regex or "None"))
 
-    self.args.request.plugins.Append("vad")
-    self.CallClient("VolatilityAction", self.args.request,
-                    next_state="FetchBinaries")
+    self.CallFlow("ArtifactCollectorFlow",
+                  artifact_list=["FullVADBinaryList"],
+                  store_results_in_aff4=False,
+                  next_state="FetchBinaries")
 
   @flow.StateHandler(next_state="HandleDownloadedFiles")
   def FetchBinaries(self, responses):
-    """Parses Volatility response and initiates FetchFiles flows."""
+    """Parses the Rekall response and initiates FileFinder flows."""
     if not responses.success:
       self.Log("Error fetching VAD data: %s", responses.status)
       return
 
-    binaries = set()
+    self.Log("Found %d binaries", len(responses))
 
-    # Collect binaries list from VolatilityResponse. We search for tables that
-    # have "protection" and "filename" columns.
-    # TODO(user): create an RDFProto class to reuse the functionality below.
-    for response in responses:
-      for section in response.sections:
-        table = section.table
-
-        # Find indices of "protection" and "filename" columns
-        indexed_headers = dict([(header.name, i)
-                                for i, header in enumerate(table.headers)])
-        try:
-          protection_col_index = indexed_headers["protection"]
-          filename_col_index = indexed_headers["filename"]
-        except KeyError:
-          # If we can't find "protection" and "filename" columns, just skip
-          # this section
-          continue
-
-        for row in table.rows:
-          protection_attr = row.values[protection_col_index]
-          filename_attr = row.values[filename_col_index]
-
-          if protection_attr.svalue in ("EXECUTE_READ",
-                                        "EXECUTE_READWRITE",
-                                        "EXECUTE_WRITECOPY"):
-            if filename_attr.svalue:
-              binaries.add(filename_attr.svalue)
-
-    self.Log("Found %d binaries", len(binaries))
     if self.args.filename_regex:
-      binaries = filter(self.args.filename_regex.Match, binaries)
-      self.Log("Applied filename regex. Will fetch %d files",
+      binaries = []
+      for response in responses:
+        if self.args.filename_regex.Match(response.CollapsePath()):
+          binaries.append(response)
+
+      self.Log("Applied filename regex. Have %d files after filtering.",
                len(binaries))
+    else:
+      binaries = responses
 
     if self.args.fetch_binaries:
-      self.CallFlow("FetchFiles",
-                    next_state="HandleDownloadedFiles",
-                    paths=binaries, pathtype=rdfvalue.PathSpec.PathType.OS)
+      self.CallFlow(
+          "FileFinder",
+          next_state="HandleDownloadedFiles",
+          paths=[rdf_paths.GlobExpression(b.CollapsePath()) for b in binaries],
+          pathtype=rdf_paths.PathSpec.PathType.OS,
+          action=file_finder.FileFinderAction(
+              action_type=file_finder.FileFinderAction.Action.DOWNLOAD))
     else:
       for b in binaries:
-        self.SendReply(rdfvalue.RDFString(b))
+        self.SendReply(b)
 
   @flow.StateHandler()
   def HandleDownloadedFiles(self, responses):
-    """Handle success/failure of the FetchFiles flow."""
+    """Handle success/failure of the FileFinder flow."""
     if responses.success:
-      for response_stat in responses:
-        self.SendReply(response_stat)
-        self.Log("Downloaded %s", response_stat.pathspec.CollapsePath())
+      for file_finder_result in responses:
+        self.SendReply(file_finder_result.stat_entry)
+        self.Log("Downloaded %s",
+                 file_finder_result.stat_entry.pathspec.CollapsePath())
     else:
-      self.Log("Download of file %s failed %s",
-               response_stat.pathspec.CollapsePath(), responses.status)
+      self.Log("Binaries download failed: %s", responses.status)

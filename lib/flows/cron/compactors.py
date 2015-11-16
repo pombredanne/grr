@@ -2,53 +2,77 @@
 """These cron flows perform data compaction in various subsystems."""
 
 
+
+import logging
+
 from grr.lib import aff4
-from grr.lib import data_store
+from grr.lib import config_lib
 from grr.lib import flow
 from grr.lib import rdfvalue
+from grr.lib import registry
+from grr.lib import stats
+
+from grr.lib.aff4_objects import collections
+from grr.lib.aff4_objects import cronjobs
 
 
-class PackedVersionedCollectionCompactor(flow.GRRFlow):
+class PackedVersionedCollectionCompactor(cronjobs.SystemCronFlow):
   """A Compactor which runs over all versioned collections."""
-  URN = "aff4:/cron/versioned_collection_compactor"
 
-  frequency = rdfvalue.Duration("1h")
-  lifetime = rdfvalue.Duration("20h")
-
-  @flow.StateHandler(next_state="Process")
-  def Start(self):
-    """Calls "Process" state to avoid spending too much time in Start method."""
-    self.CallState(next_state="Process")
+  frequency = rdfvalue.Duration("5m")
+  lifetime = rdfvalue.Duration("40m")
 
   @flow.StateHandler()
-  def Process(self):
+  def Start(self):
     """Check all the dirty versioned collections, and compact them."""
     # Detect all changed collections:
-    for predicate, urn, _ in data_store.DB.ResolveRegex(
-        self.URN, "index:changed/.+", timestamp=data_store.DB.NEWEST_TIMESTAMP,
-        token=self.token):
-      data_store.DB.DeleteAttributes(self.URN, [predicate], token=self.token)
+    processed_count = 0
+    errors_count = 0
+    already_locked_count = 0
+
+    freeze_timestamp = rdfvalue.RDFDatetime().Now()
+    for urn in collections.PackedVersionedCollection.QueryNotifications(
+        timestamp=freeze_timestamp, token=self.token):
+      collections.PackedVersionedCollection.DeleteNotifications(
+          [urn], end=urn.age, token=self.token)
+
+      self.HeartBeat()
       try:
-        self.Compact(urn)
+        if self.Compact(urn):
+          processed_count += 1
+        else:
+          already_locked_count += 1
       except IOError:
-        pass
+        self.Log("Error while processing %s", urn)
+        errors_count += 1
+
+    self.Log("Total processed collections: %d, successful: %d, failed: %d, "
+             "already locked: %d", processed_count + errors_count,
+             processed_count, errors_count, already_locked_count)
 
   def Compact(self, urn):
     """Run a compaction cycle on a PackedVersionedCollection."""
-    fd = aff4.FACTORY.Open(urn, aff4_type="PackedVersionedCollection",
-                           mode="rw", age=aff4.ALL_TIMES, token=self.token)
+    lease_time = config_lib.CONFIG["Worker.compaction_lease_time"]
 
-    # Update the collection size.
-    size = fd.Get(fd.Schema.SIZE)
+    try:
+      with aff4.FACTORY.OpenWithLock(
+          urn, lease_time=lease_time, aff4_type="PackedVersionedCollection",
+          blocking=False, age=aff4.ALL_TIMES, token=self.token) as fd:
+        num_compacted = fd.Compact(callback=self.HeartBeat)
+        self.Log("Compacted %d items in %s", num_compacted, urn)
 
-    for item in sorted(fd.GetValuesForAttribute(fd.Schema.DATA),
-                       key=lambda x: x.age):
-      super(fd.__class__, fd).Add(item.payload)
-      size += 1
+        return True
+    except aff4.LockError:
+      stats.STATS.IncrementCounter("compactor_locking_errors")
+      logging.error("Trying to compact locked collection: %s", urn)
 
-    # Clear the data predicate now that its in the aff4 stream.
-    fd.DeleteAttribute(fd.Schema.DATA)
-    fd.Set(size)
+      return False
 
-    # Flush to the data store.
-    fd.Close()
+
+class CompactorsInitHook(registry.InitHook):
+
+  pre = ["StatsInit"]
+
+  def RunOnce(self):
+    """Register compactors-related stats."""
+    stats.STATS.RegisterCounterMetric("compactor_locking_errors")

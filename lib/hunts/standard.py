@@ -1,23 +1,36 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
-
 """Some multiclient flows aka hunts."""
 
 
 
-import re
-import stat
+import threading
 
 import logging
 
 from grr.lib import aff4
+from grr.lib import config_lib
 from grr.lib import data_store
 from grr.lib import flow
 from grr.lib import rdfvalue
+from grr.lib import registry
+from grr.lib import stats
 from grr.lib import utils
+from grr.lib.aff4_objects import collections
 from grr.lib.aff4_objects import cronjobs
 from grr.lib.hunts import implementation
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import protodict as rdf_protodict
+from grr.lib.rdfvalues import structs as rdf_structs
+from grr.parsers import wmi_parser
 from grr.proto import flows_pb2
+from grr.proto import output_plugin_pb2
+
+
+class OutputPluginBatchProcessingStatus(rdf_structs.RDFProtoStruct):
+  """Describes processing status of a single batch by a hunt output plugin."""
+  protobuf = output_plugin_pb2.OutputPluginBatchProcessingStatus
 
 
 class Error(Exception):
@@ -28,12 +41,33 @@ class HuntError(Error):
   pass
 
 
-class CreateGenericHuntFlowArgs(rdfvalue.RDFProtoStruct):
+class ResultsProcessingError(Error):
+  """This exception is raised when errors happen during results processing."""
+
+  def __init__(self):
+    self.exceptions_by_hunt = {}
+    super(ResultsProcessingError, self).__init__()
+
+  def RegisterSubException(self, hunt_urn, plugin_name, exception):
+    self.exceptions_by_hunt.setdefault(hunt_urn, {}).setdefault(
+        plugin_name, []).append(exception)
+
+  def __repr__(self):
+    messages = []
+    for hunt_urn, exceptions_by_plugin in self.exceptions_by_hunt.items():
+      for plugin_name, exception in exceptions_by_plugin.items():
+        messages.append("Exception for hunt %s (plugin %s): %s" %
+                        (hunt_urn, plugin_name, exception))
+
+    return "\n".join(messages)
+
+
+class CreateGenericHuntFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.CreateGenericHuntFlowArgs
 
 
 class CreateGenericHuntFlow(flow.GRRFlow):
-  """Create and run GenericHunt with given name, args and rules.
+  """Create but don't run a GenericHunt with the given name, args and rules.
 
   As direct write access to the data store is forbidden, we have to use flows to
   perform any kind of modifications. This flow delegates ACL checks to
@@ -56,11 +90,39 @@ class CreateGenericHuntFlow(flow.GRRFlow):
 
       # Nothing really to do here - hunts are always created in the paused
       # state.
-      self.Log("User %s created a new %s hunt",
-               self.token.username, hunt.state.args.flow_runner_args.flow_name)
+      self.Log("User %s created a new %s hunt (%s)",
+               self.token.username, hunt.state.args.flow_runner_args.flow_name,
+               hunt.urn)
 
 
-class StartHuntFlowArgs(rdfvalue.RDFProtoStruct):
+class CreateAndRunGenericHuntFlow(flow.GRRFlow):
+  """Create and run a GenericHunt with the given name, args and rules.
+
+  This flow is different to the CreateGenericHuntFlow in that it
+  immediately runs the hunt it created. This functionality cannot be
+  offered in a SUID flow or every user could run any flow on any
+  client without approval by just running a hunt on just that single
+  client. Thus, this flow must *not* be SUID.
+  """
+
+  args_type = CreateGenericHuntFlowArgs
+
+  @flow.StateHandler()
+  def Start(self):
+    """Create the hunt and run it."""
+    with implementation.GRRHunt.StartHunt(
+        runner_args=self.args.hunt_runner_args,
+        args=self.args.hunt_args,
+        token=self.token) as hunt:
+
+      hunt.Run()
+
+      self.Log("User %s created a new %s hunt (%s)",
+               self.token.username, hunt.state.args.flow_runner_args.flow_name,
+               hunt.urn)
+
+
+class StartHuntFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.StartHuntFlowArgs
 
 
@@ -89,15 +151,42 @@ class StartHuntFlow(flow.GRRFlow):
       hunt.Run()
 
 
-class PauseHuntFlowArgs(rdfvalue.RDFProtoStruct):
-  protobuf = flows_pb2.PauseHuntFlowArgs
+class DeleteHuntFlowArgs(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.DeleteHuntFlowArgs
 
 
-class PauseHuntFlow(flow.GRRFlow):
+class DeleteHuntFlow(flow.GRRFlow):
+  """Delete an existing hunt, if it hasn't done anything yet."""
+  ACL_ENFORCED = False
+  args_type = DeleteHuntFlowArgs
+
+  @flow.StateHandler()
+  def Start(self):
+    with aff4.FACTORY.Open(
+        self.args.hunt_urn, aff4_type="GRRHunt", mode="rw",
+        token=self.token) as hunt:
+      # Check for approval if the hunt was created by somebody else.
+      if self.token.username != hunt.creator:
+        data_store.DB.security_manager.CheckHuntAccess(
+            self.token.RealUID(), self.args.hunt_urn)
+      if hunt.GetRunner().IsHuntStarted():
+        raise RuntimeError("Unable to delete a running hunt.")
+      if (not config_lib.CONFIG["AdminUI.allow_hunt_results_delete"] and
+          hunt.client_count):
+        raise RuntimeError("Unable to delete a hunt with results while "
+                           "AdminUI.allow_hunt_results_delete is disabled.")
+    aff4.FACTORY.Delete(self.args.hunt_urn, token=self.token)
+
+
+class StopHuntFlowArgs(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.StopHuntFlowArgs
+
+
+class StopHuntFlow(flow.GRRFlow):
   """Run already created hunt with given id."""
   # This flow can run on any client without ACL enforcement (an SUID flow).
   ACL_ENFORCED = False
-  args_type = PauseHuntFlowArgs
+  args_type = StopHuntFlowArgs
 
   @flow.StateHandler()
   def Start(self):
@@ -110,11 +199,10 @@ class PauseHuntFlow(flow.GRRFlow):
         self.args.hunt_urn, aff4_type="GRRHunt", mode="rw",
         token=self.token) as hunt:
 
-      with hunt.GetRunner() as runner:
-        runner.Pause()
+      hunt.Stop()
 
 
-class ModifyHuntFlowArgs(rdfvalue.RDFProtoStruct):
+class ModifyHuntFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ModifyHuntFlowArgs
 
 
@@ -137,20 +225,37 @@ class ModifyHuntFlow(flow.GRRFlow):
         self.args.hunt_urn, aff4_type="GRRHunt",
         mode="rw", token=self.token) as hunt:
 
-      with hunt.GetRunner() as runner:
-        data_store.DB.security_manager.CheckHuntAccess(
-            self.token.RealUID(), hunt.urn)
+      runner = hunt.GetRunner()
+      data_store.DB.security_manager.CheckHuntAccess(
+          self.token.RealUID(), hunt.urn)
 
-        # Make sure the hunt is not running:
-        if runner.IsHuntStarted():
-          raise RuntimeError("Unable to modify a running hunt. Pause it first.")
+      # Make sure the hunt is not running:
+      if runner.IsHuntStarted():
+        raise RuntimeError("Unable to modify a running hunt.")
 
-        # Just go ahead and change the hunt now.
-        runner.context.expires = self.args.expiry_time
-        runner.args.client_limit = self.args.client_limit
+      # Record changes in the audit event
+      changes = []
+      if runner.context.expires != self.args.expiry_time:
+        changes.append("Expires: Old=%s, New=%s" % (runner.context.expires,
+                                                    self.args.expiry_time))
+
+      if runner.args.client_limit != self.args.client_limit:
+        changes.append("Client Limit: Old=%s, New=%s" % (
+            runner.args.client_limit, self.args.client_limit))
+
+      description = ", ".join(changes)
+      event = flow.AuditEvent(user=self.token.username,
+                              action="HUNT_MODIFIED",
+                              urn=self.args.hunt_urn,
+                              description=description)
+      flow.Events.PublishEvent("Audit", event, token=self.token)
+
+      # Just go ahead and change the hunt now.
+      runner.context.expires = self.args.expiry_time
+      runner.args.client_limit = self.args.client_limit
 
 
-class CheckHuntAccessFlowArgs(rdfvalue.RDFProtoStruct):
+class CheckHuntAccessFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.CheckHuntAccessFlowArgs
 
 
@@ -170,7 +275,7 @@ class CheckHuntAccessFlow(flow.GRRFlow):
         self.token.RealUID(), self.args.hunt_urn)
 
 
-class SampleHuntArgs(rdfvalue.RDFProtoStruct):
+class SampleHuntArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.SampleHuntArgs
 
 
@@ -182,9 +287,9 @@ class SampleHunt(implementation.GRRHunt):
   > hunt = hunts.SampleHunt()
 
   # We want to schedule on clients that run windows and OS_RELEASE 7.
-  > int_rule = rdfvalue.ForemanAttributeInteger(
+  > int_rule = rdf_foreman.ForemanAttributeInteger(
                    attribute_name=client.Schema.OS_RELEASE.name,
-                   operator=rdfvalue.ForemanAttributeInteger.Operator.EQUAL,
+                   operator=rdf_foreman.ForemanAttributeInteger.Operator.EQUAL,
                    value=7)
   > regex_rule = hunts.GRRHunt.MATCH_WINDOWS
 
@@ -208,8 +313,8 @@ class SampleHunt(implementation.GRRHunt):
 
   @flow.StateHandler()
   def RunClient(self, responses):
-    pathspec = rdfvalue.PathSpec(pathtype=rdfvalue.PathSpec.PathType.OS,
-                                 path=self.args.filename)
+    pathspec = rdf_paths.PathSpec(pathtype=rdf_paths.PathSpec.PathType.OS,
+                                  path=self.args.filename)
 
     for client_id in responses:
       self.CallFlow("GetFile", pathspec=pathspec, next_state="StoreResults",
@@ -230,359 +335,6 @@ class SampleHunt(implementation.GRRHunt):
     self.MarkClientDone(client_id)
 
 
-class RegistryFileHunt(implementation.GRRHunt):
-  """A hunt that downloads registry files."""
-
-  registry_files = ["DEFAULT", "SAM", "SECURITY", "SOFTWARE", "SYSTEM"]
-
-  files = None
-
-  @flow.StateHandler(next_state=["StoreResults"])
-  def Start(self, responses):
-    """Start."""
-    client_id = responses.request.client_id
-
-    if not self.args.files:
-      self.args.files = {}
-
-    self.args.files[client_id] = 0
-    for filename in self.registry_files:
-      pathspec = rdfvalue.PathSpec(
-          pathtype=rdfvalue.PathSpec.PathType.TSK,
-          path=r"C:\windows\system32\config\%s" % filename)
-
-      self.args.files[client_id] += 1
-      self.CallFlow("GetFile", pathspec=pathspec, next_state="StoreResults",
-                    client_id=client_id)
-
-    client = aff4.FACTORY.Open(aff4.ROOT_URN.Add(client_id), mode="r",
-                               token=self.token)
-    users = client.Get(client.Schema.USER) or []
-    for user in users:
-      pathspec = rdfvalue.PathSpec(
-          pathtype=rdfvalue.PathSpec.PathType.TSK,
-          path=user.homedir + r"\NTUSER.DAT")
-      self.args.files[client_id] += 1
-      self.CallFlow("GetFile", pathspec=pathspec, next_state="StoreResults",
-                    client_id=client_id)
-
-  @flow.StateHandler()
-  def StoreResults(self, responses):
-    """Stores the responses."""
-    client_id = responses.request.client_id
-    if responses.success:
-      pathspec = responses.First().pathspec
-      self.LogResult(
-          client_id, "Got file %s." % pathspec,
-          aff4.AFF4Object.VFSGRRClient.PathspecToURN(pathspec, client_id))
-    else:
-      self.LogClientError(client_id, log_message=responses.status)
-
-    self.args.files[client_id] -= 1
-    if self.args.files[client_id] == 0:
-      self.MarkClientDone(client_id)
-
-
-class ProcessesHunt(implementation.GRRHunt):
-  """A hunt that downloads process lists."""
-
-  @flow.StateHandler(next_state=["StoreResults"])
-  def RunClient(self, responses):
-    for client_id in responses:
-      self.CallFlow("ListProcesses", next_state="StoreResults",
-                    client_id=client_id)
-
-  @flow.StateHandler()
-  def StoreResults(self, responses):
-    """Stores the responses."""
-    client_id = responses.request.client_id
-    if responses.success:
-      self.LogResult(client_id, "Got process listing.",
-                     aff4.ROOT_URN.Add(client_id).Add("processes"))
-    else:
-      self.LogClientError(client_id, log_message=responses.status)
-
-    self.MarkClientDone(client_id)
-
-  def FindProcess(self, process_name):
-    """This finds processes that contain process_name."""
-
-    hunt = aff4.FACTORY.Open(self.args.urn,
-                             age=aff4.ALL_TIMES, token=self.token)
-    log = hunt.GetValuesForAttribute(hunt.Schema.LOG)
-
-    for log_entry in log:
-      proc_list = aff4.FACTORY.Open(log_entry.urn, "ProcessListing",
-                                    token=self.token)
-      procs = proc_list.Get(proc_list.Schema.PROCESSES)
-      for process in procs:
-        if process_name.lower() in process.name.lower():
-          print "Found process for %s:" % log_entry.client_id
-          print process
-
-  def ProcessHistogram(self, full_path=True):
-    """This generates a histogram of all the processes found."""
-
-    hist = {}
-
-    hunt = aff4.FACTORY.Open(self.args.urn,
-                             age=aff4.ALL_TIMES, token=self.token)
-    log = hunt.GetValuesForAttribute(hunt.Schema.LOG)
-
-    for log_entry in log:
-      proc_list = aff4.FACTORY.Open(log_entry.urn, "ProcessListing",
-                                    token=self.token)
-      procs = proc_list.Get(proc_list.Schema.PROCESSES)
-      for process in procs:
-        if full_path:
-          cmd = " ".join(process.cmdline)
-        else:
-          cmd = process.name
-        hist.setdefault(cmd, 0)
-        hist[cmd] += 1
-
-    proc_list = sorted(hist.iteritems(), reverse=True, key=lambda (k, v): v)
-    for proc, freq in proc_list:
-      print "%d  %s" % (freq, proc)
-
-    return hist
-
-
-class MBRHuntArgs(rdfvalue.RDFProtoStruct):
-  protobuf = flows_pb2.MBRHuntArgs
-
-
-class MBRHunt(implementation.GRRHunt):
-  """A hunt that downloads MBRs."""
-
-  args_type = MBRHuntArgs
-
-  @flow.StateHandler(next_state=["StoreResults"])
-  def RunClient(self, responses):
-    for client_id in responses:
-      self.CallFlow("GetMBR", length=self.args.length,
-                    next_state="StoreResults", client_id=client_id)
-
-  @flow.StateHandler()
-  def StoreResults(self, responses):
-    """Stores the responses."""
-    client_id = responses.request.client_id
-    if responses.success:
-      self.LogResult(client_id, "Got MBR.", client_id.Add("mbr"))
-    else:
-      self.LogClientError(client_id, log_message=utils.SmartStr(
-          responses.status))
-
-    self.MarkClientDone(client_id)
-
-  def MBRHistogram(self, length=512):
-    """Prints a histogram of the MBRs found."""
-
-    hist = {}
-
-    hunt = aff4.FACTORY.Open(self.args.urn,
-                             age=aff4.ALL_TIMES, token=self.token)
-
-    log = hunt.GetValuesForAttribute(hunt.Schema.LOG)
-
-    for log_entry in log:
-      try:
-        mbr = aff4.FACTORY.Open(log_entry.urn, token=self.token)
-        mbr_data = mbr.Read(length)
-        # Skip over the table of primary partitions.
-        mbr_data = mbr_data[:440] + "\x00"*70 + mbr_data[440+70:]
-        key = mbr_data.encode("hex")
-        hist.setdefault(key, []).append(log_entry.client_id)
-      except AttributeError:
-        print "Error for urn %s" % log_entry.urn
-
-    mbr_list = sorted(hist.iteritems(), reverse=True, key=lambda (k, v): len(v))
-    for mbr, freq in mbr_list:
-      print "%d  %s" % (len(freq), mbr)
-
-    return mbr_list
-
-
-class MatchRegistryHunt(implementation.GRRHunt):
-  """A hunt to download registry keys containing a search string."""
-
-  def __init__(self, paths, search_string=None, max_depth=None,
-               match_case=False, **kw):
-    """This hunt looks for registry keys matching a given string.
-
-    Args:
-      paths: A list of registry keys where this hunt should look for values.
-      search_string: The string to look for. If none is given, this just
-                     downloads all the values found and searches can be done
-                     later using FindString().
-      max_depth: If given, the hunt will be restricted to a maximal path depth.
-      match_case: The match has to be case sensitive.
-      **kw: passthrough.
-    """
-
-    self.state.paths = paths
-    self.state.max_depth = max_depth
-    self.state.match_case = match_case
-    self.state.search_string = search_string
-    if not self.state.match_case:
-      self.state.search_string = search_string.lower()
-
-    super(MatchRegistryHunt, self).__init__(**kw)
-
-  @flow.StateHandler()
-  def Start(self, responses):
-    """Start."""
-    client_id = responses.request.client_id
-
-    for path in self.state.paths:
-      request = rdfvalue.FindSpec()
-      request.pathspec.path = path
-      request.pathspec.pathtype = rdfvalue.PathSpec.PathType.REGISTRY
-
-      if self.state.max_depth:
-        request.max_depth = self.state.max_depth
-
-      # Hard coded limit so this does not get too big.
-      request.iterator.number = 10000
-      self.CallClient("Find", request, client_id=client_id,
-                      next_state="StoreResults")
-
-  def Match(self, s):
-    if not self.state.match_case:
-      s = s.lower()
-    return self.state.search_string in s
-
-  @flow.StateHandler()
-  def StoreResults(self, responses):
-    """Stores the responses."""
-    client_id = responses.request.client_id
-    if responses.success:
-      for response in responses:
-        pathspec = response.hit.pathspec
-        if stat.S_ISDIR(response.hit.st_mode):
-          continue
-        vfs_urn = aff4.AFF4Object.VFSGRRClient.PathspecToURN(
-            pathspec, client_id)
-        data = utils.SmartStr(response.hit.registry_data.GetValue())
-        fd = aff4.FACTORY.Create(vfs_urn, "VFSFile", mode="w", token=self.token)
-        fd.Set(fd.Schema.STAT(response.hit))
-        fd.Set(fd.Schema.PATHSPEC(response.hit.pathspec))
-        fd.Close(sync=False)
-        if not self.state.search_string:
-          self.LogResult(client_id, "Registry key downloaded.", vfs_urn)
-        else:
-          if self.Match(data):
-            self.LogResult(client_id, "Matching registry key.", vfs_urn)
-          else:
-            self.LogResult(client_id, "Registry key not matched.", vfs_urn)
-    else:
-      self.LogClientError(client_id, log_message=utils.SmartStr(
-          responses.status))
-
-    self.MarkClientDone(client_id)
-
-  def FindString(self, search_term, match_case=True):
-    """Finds a string in the downloaded registry keys."""
-
-    hunt = aff4.FACTORY.Open("aff4:/hunts/%s" % self.session_id,
-                             age=aff4.ALL_TIMES, token=self.token)
-
-    log = hunt.GetValuesForAttribute(hunt.Schema.LOG)
-
-    urns = []
-    for log_entry in log:
-      urns.append(log_entry.urn)
-
-    if not match_case:
-      search_term = search_term.lower()
-
-    for key in aff4.FACTORY.MultiOpen(urns, token=self.token):
-      value = utils.SmartStr(key.Get(key.Schema.STAT).registry_data.GetValue())
-      if not match_case:
-        value = value.lower()
-      if search_term in value:
-        print "Match: %s: %s" % (key, value)
-
-
-class RunKeysHunt(implementation.GRRHunt):
-  """A hunt for the RunKey collection."""
-
-  @flow.StateHandler(next_state="StoreResults")
-  def Start(self, responses):
-    client_id = responses.request.client_id
-    self.CallFlow("CollectRunKeys", next_state="StoreResults",
-                  client_id=client_id)
-
-  @flow.StateHandler()
-  def StoreResults(self, responses):
-    """Stores the responses."""
-    client_id = responses.request.client_id
-    if responses.success:
-      self.LogResult(client_id, "Downloaded RunKeys",
-                     aff4.ROOT_URN.Add(client_id).Add("analysis/RunKeys"))
-    else:
-      self.LogClientError(client_id, log_message=utils.SmartStr(
-          responses.status))
-
-    self.MarkClientDone(client_id)
-
-  def Histogram(self):
-    """Creates a histogram of all the filenames found in the RunKeys."""
-
-    hist = {}
-
-    hunt = aff4.FACTORY.Open("aff4:/hunts/%s" % self.session_id,
-                             age=aff4.ALL_TIMES, token=self.token)
-
-    log = hunt.GetValuesForAttribute(hunt.Schema.LOG)
-
-    client_ids = [l.client_id for l in log]
-
-    to_read = []
-
-    while client_ids:
-      clients = aff4.FACTORY.MultiOpen(
-          ["aff4:/%s" % client_id for client_id in client_ids[:1000]])
-      client_ids = client_ids[1000:]
-
-      for client in clients:
-        for user in client.Get(client.Schema.USER):
-          to_read.append("aff4:/%s/analysis/RunKeys/%s/RunOnce" %
-                         (client.client_id, user.username))
-          to_read.append("aff4:/%s/analysis/RunKeys/%s/Run" %
-                         (client.client_id, user.username))
-        to_read.append("aff4:/%s/analysis/RunKeys/System/RunOnce" %
-                       client.client_id)
-        to_read.append("aff4:/%s/analysis/RunKeys/System/Run" %
-                       client.client_id)
-
-    print "Processing %d collections." % len(to_read)
-    collections_done = 0
-
-    while to_read:
-      # Only do 1000 at a time.
-      collections_done += len(to_read[:1000])
-      collections = aff4.FACTORY.MultiOpen(to_read[:1000], token=self.token)
-      to_read = to_read[1000:]
-
-      for collection in collections:
-        try:
-          for runkey in collection:
-            key = runkey.filepath.replace("\"", "")
-            key = re.sub(r"Users\\[^\\]+\\", r"Users\\USER\\", key)
-            hist.setdefault(key, set()).add(str(collection.urn)[6:6+18])
-        except AttributeError:
-          pass
-
-      print "%d collections done." % collections_done
-
-    rk_list = sorted(hist.iteritems(), reverse=True, key=lambda (k, v): len(v))
-    for rk, freq in rk_list:
-      print "%d  %s" % (len(freq), rk)
-
-    return rk_list
-
-
 class HuntResultsMetadata(aff4.AFF4Object):
   """Metadata AFF4 object used by CronHuntOutputFlow."""
 
@@ -594,20 +346,12 @@ class HuntResultsMetadata(aff4.AFF4Object):
         "Number of hunt results already processed by the cron job.",
         versioned=False, default=0)
 
-    COLLECTION_RAW_OFFSET = aff4.Attribute(
-        "aff4:collection_raw_position", rdfvalue.RDFInteger,
-        "Effectively, number of bytes occuppied by NUM_PROCESSED_RESULTS "
-        "processed results in the results collection. Used to optimize "
-        "results collection access and not to iterate over all previously "
-        "processes results all the time.",
-        versioned=False, default=0)
-
     OUTPUT_PLUGINS = aff4.Attribute(
-        "aff4:output_plugins_state", rdfvalue.FlowState,
-        "Piclked output plugins.", versioned=False)
+        "aff4:output_plugins_state", rdf_flows.FlowState,
+        "Pickled output plugins.", versioned=False)
 
 
-class ProcessHuntResultsCronFlowArgs(rdfvalue.RDFProtoStruct):
+class ProcessHuntResultsCronFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ProcessHuntResultsCronFlowArgs
 
 
@@ -619,10 +363,94 @@ class ProcessHuntResultsCronFlow(cronjobs.SystemCronFlow):
   args_type = ProcessHuntResultsCronFlowArgs
 
   DEFAULT_BATCH_SIZE = 1000
+  MAX_REVERSED_RESULTS = 500000
 
-  def ProcessHunt(self, session_id):
-    metadata_urn = session_id.Add("ResultsMetadata")
-    last_exception = None
+  def CheckIfRunningTooLong(self):
+    if self.state.args.max_running_time:
+      elapsed = (rdfvalue.RDFDatetime().Now().AsSecondsFromEpoch() -
+                 self.start_time.AsSecondsFromEpoch())
+      if elapsed > self.state.args.max_running_time:
+        return True
+
+    return False
+
+  def StatusCollectionUrn(self, hunt_urn):
+    return hunt_urn.Add("OutputPluginsStatus")
+
+  def ErrorsCollectionUrn(self, hunt_urn):
+    return hunt_urn.Add("OutputPluginsErrors")
+
+  def ApplyPluginsToBatch(self, hunt_urn, plugins, batch, batch_index):
+    exceptions_by_plugin = {}
+    for plugin_def, plugin in plugins:
+      logging.debug("Processing hunt %s with %s, batch %d", hunt_urn,
+                    plugin_def.plugin_name, batch_index)
+
+      try:
+        plugin.ProcessResponses(batch)
+
+        stats.STATS.IncrementCounter("hunt_results_ran_through_plugin",
+                                     delta=len(batch),
+                                     fields=[plugin_def.plugin_name])
+
+        plugin_status = OutputPluginBatchProcessingStatus(
+            plugin_descriptor=plugin_def,
+            status="SUCCESS",
+            batch_index=batch_index,
+            batch_size=len(batch))
+      except Exception as e:  # pylint: disable=broad-except
+        stats.STATS.IncrementCounter("hunt_output_plugin_errors",
+                                     fields=[plugin_def.plugin_name])
+
+        plugin_status = OutputPluginBatchProcessingStatus(
+            plugin_descriptor=plugin_def,
+            status="ERROR",
+            summary=utils.SmartStr(e),
+            batch_index=batch_index,
+            batch_size=len(batch))
+
+        logging.exception("Error processing hunt results: hunt %s, "
+                          "plugin %s, batch %d", hunt_urn,
+                          plugin_def.plugin_name, batch_index)
+        self.Log("Error processing hunt results (hunt %s, "
+                 "plugin %s, batch %d): %s" %
+                 (hunt_urn, plugin_def.plugin_name, batch_index, e))
+        exceptions_by_plugin[plugin_def] = e
+
+      collections.PackedVersionedCollection.AddToCollection(
+          self.StatusCollectionUrn(hunt_urn),
+          [plugin_status], sync=False, token=self.token)
+      if plugin_status.status == plugin_status.Status.ERROR:
+        collections.PackedVersionedCollection.AddToCollection(
+            self.ErrorsCollectionUrn(hunt_urn),
+            [plugin_status], sync=False, token=self.token)
+
+    return exceptions_by_plugin
+
+  def FlushPlugins(self, hunt_urn, plugins):
+    flush_exceptions = {}
+    for plugin_def, plugin in plugins:
+      try:
+        plugin.Flush()
+      except Exception as e:  # pylint: disable=broad-except
+        logging.exception("Error flushing hunt results: hunt %s, "
+                          "plugin %s", hunt_urn, str(plugin))
+        self.Log("Error processing hunt results (hunt %s, "
+                 "plugin %s): %s" % (hunt_urn, str(plugin), e))
+        flush_exceptions[plugin_def] = e
+
+    return flush_exceptions
+
+  def ProcessHuntResults(self, results, freeze_timestamp):
+    plugins_exceptions = {}
+
+    hunt_urn = results.Get(results.Schema.RESULTS_SOURCE)
+    metadata_urn = hunt_urn.Add("ResultsMetadata")
+
+    batch_size = self.state.args.batch_size or self.DEFAULT_BATCH_SIZE
+    batches = utils.Grouper(results.GenerateUncompactedItems(
+        max_reversed_results=self.MAX_REVERSED_RESULTS,
+        timestamp=freeze_timestamp), batch_size)
 
     with aff4.FACTORY.Open(
         metadata_urn, mode="rw", token=self.token) as metadata_obj:
@@ -630,70 +458,49 @@ class ProcessHuntResultsCronFlow(cronjobs.SystemCronFlow):
       output_plugins = metadata_obj.Get(metadata_obj.Schema.OUTPUT_PLUGINS)
       num_processed = int(metadata_obj.Get(
           metadata_obj.Schema.NUM_PROCESSED_RESULTS))
-      raw_offset = int(metadata_obj.Get(
-          metadata_obj.Schema.COLLECTION_RAW_OFFSET))
-      results = aff4.FACTORY.Open(session_id.Add("Results"), mode="r",
-                                  token=self.token)
 
-      batch_size = self.state.args.batch_size or self.DEFAULT_BATCH_SIZE
-      batches = utils.Grouper(results.GenerateItems(offset=raw_offset),
-                              batch_size)
-
-      used_plugins = {}
+      used_plugins = []
       for batch_index, batch in enumerate(batches):
-        if not used_plugins:
-          for plugin_name, (plugin_def,
-                            state) in output_plugins.data.iteritems():
-            used_plugins[plugin_name] = plugin_def.GetPluginForState(state)
-
-        # If this flow is working for more than max_running_time - stop
-        # processing.
-        if self.state.args.max_running_time:
-          elapsed = (rdfvalue.RDFDatetime().Now().AsSecondsFromEpoch() -
-                     self.start_time.AsSecondsFromEpoch())
-          if elapsed > self.state.args.max_running_time:
-            self.Log("Running for too long, skipping rest of batches for %s.",
-                     session_id)
-            break
-
         batch = list(batch)
         num_processed += len(batch)
 
-        for plugin_name, plugin in used_plugins.iteritems():
-          logging.info("Processing hunt %s with %s, batch %d", session_id,
-                       plugin_name, batch_index)
+        if not used_plugins:
+          for _, (plugin_def, state) in output_plugins.data.iteritems():
+            # TODO(user): Remove as soon as migration to new-style
+            # output plugins is completed.
+            if not hasattr(plugin_def, "GetPluginForState"):
+              logging.error("Invalid plugin_def: %s", plugin_def)
+              continue
 
-          try:
-            plugin.ProcessResponses(batch)
-          except Exception as e:  # pylint: disable=broad-except
-            logging.exception("Error processing hunt results: hunt %s, "
-                              "plugin %s, batch %d", session_id, plugin_name,
-                              batch_index)
-            self.Log("Error processing hunt results (hunt %s, "
-                     "plugin %s, batch %d): %s" %
-                     (session_id, plugin_name, batch_index, e))
-            last_exception = e
+            used_plugins.append((plugin_def,
+                                 plugin_def.GetPluginForState(state)))
+
+        batch_exceptions = self.ApplyPluginsToBatch(hunt_urn, used_plugins,
+                                                    batch, batch_index)
+        if batch_exceptions:
+          for key, value in batch_exceptions.items():
+            plugins_exceptions.setdefault(key, []).append(value)
+
         self.HeartBeat()
 
-      for plugin in used_plugins.itervalues():
-        try:
-          plugin.Flush()
-        except Exception as e:  # pylint: disable=broad-except
-          logging.exception("Error flushing hunt results: hunt %s, "
-                            "plugin %s", session_id, str(plugin))
-          self.Log("Error processing hunt results (hunt %s, "
-                   "plugin %s): %s" % (session_id, str(plugin), e))
-          last_exception = e
+        # If this flow is working for more than max_running_time - stop
+        # processing.
+        if self.CheckIfRunningTooLong():
+          self.Log("Running for too long, skipping rest of batches for %s",
+                   hunt_urn)
+          break
+
+      if not used_plugins:
+        logging.debug("Got notification, but no results were processed for %s.",
+                      hunt_urn)
+
+      flush_exceptions = self.FlushPlugins(hunt_urn, used_plugins)
+      plugins_exceptions.update(flush_exceptions)
 
       metadata_obj.Set(metadata_obj.Schema.OUTPUT_PLUGINS(output_plugins))
       metadata_obj.Set(metadata_obj.Schema.NUM_PROCESSED_RESULTS(num_processed))
-      metadata_obj.Set(metadata_obj.Schema.COLLECTION_RAW_OFFSET(
-          results.current_offset))
 
-      # TODO(user): throw proper exception which will contain all the
-      # exceptions that were raised while processing this hunt.
-      if last_exception:
-        raise last_exception  # pylint: disable=raising-bad-type
+      return plugins_exceptions
 
   @flow.StateHandler()
   def Start(self):
@@ -704,48 +511,59 @@ class ProcessHuntResultsCronFlow(cronjobs.SystemCronFlow):
       self.state.args.max_running_time = rdfvalue.Duration(
           "%ds" % int(ProcessHuntResultsCronFlow.lifetime.seconds * 0.6))
 
-    last_exception = None
     self.start_time = rdfvalue.RDFDatetime().Now()
-    for session_id, timestamp, _ in data_store.DB.ResolveRegex(
-        GenericHunt.RESULTS_QUEUE, ".*", token=self.token):
 
-      logging.info("Found new results for hunt %s.", session_id)
+    exceptions_by_hunt = {}
+    freeze_timestamp = rdfvalue.RDFDatetime().Now()
+    for results_urn in aff4.ResultsOutputCollection.QueryNotifications(
+        timestamp=freeze_timestamp, token=self.token):
+
+      aff4.ResultsOutputCollection.DeleteNotifications(
+          [results_urn], end=results_urn.age, token=self.token)
+
+      # Feed the results to output plugins
       try:
-        self.ProcessHunt(rdfvalue.RDFURN(session_id))
-        self.HeartBeat()
+        results = aff4.FACTORY.Open(
+            results_urn, aff4_type="ResultsOutputCollection", token=self.token)
+      except aff4.InstantiationError:  # Collection does not exist.
+        continue
 
-      except Exception as e:  # pylint: disable=broad-except
-        last_exception = e
+      exceptions_by_plugin = self.ProcessHuntResults(results, freeze_timestamp)
+      if exceptions_by_plugin:
+        hunt_urn = results.Get(results.Schema.RESULTS_SOURCE)
+        exceptions_by_hunt[hunt_urn] = exceptions_by_plugin
 
-      # We will delete hunt's results notification even if ProcessHunt has
-      # failed
-      finally:
-        results = data_store.DB.ResolveRegex(
-            GenericHunt.RESULTS_QUEUE, session_id, token=self.token)
-        if results and len(results) == 1:
-          _, latest_timestamp, _ = results[0]
-        else:
-          logging.warning("Inconsistent state in hunt results queue for "
-                          "hunt %s", session_id)
-          latest_timestamp = None
+      lease_time = config_lib.CONFIG["Worker.compaction_lease_time"]
+      try:
+        with aff4.FACTORY.OpenWithLock(results_urn, blocking=False,
+                                       aff4_type="ResultsOutputCollection",
+                                       lease_time=lease_time,
+                                       token=self.token) as results:
+          num_compacted = results.Compact(callback=self.HeartBeat,
+                                          timestamp=freeze_timestamp)
+          stats.STATS.IncrementCounter("hunt_results_compacted",
+                                       delta=num_compacted)
+          logging.debug("Compacted %d results in %s.", num_compacted,
+                        results_urn)
+      except aff4.LockError:
+        logging.error("Trying to compact a collection that's already "
+                      "locked: %s", results_urn)
+        stats.STATS.IncrementCounter("hunt_results_compaction_locking_errors")
 
-        # We don't want to delete notification that was written after we
-        # started processing.
-        if latest_timestamp and latest_timestamp > timestamp:
-          logging.info("Not deleting results notification: it was written "
-                       "after processing has started.")
-        else:
-          data_store.DB.DeleteAttributes(GenericHunt.RESULTS_QUEUE,
-                                         [session_id], sync=True,
-                                         token=self.token)
+      if self.CheckIfRunningTooLong():
+        self.Log("Running for too long, skipping rest of hunts.")
+        break
 
-    # TODO(user): throw proper exception which will contain all the
-    # exceptions that were raised while processing the hunts.
-    if last_exception:
-      raise last_exception  # pylint: disable=raising-bad-type
+    if exceptions_by_hunt:
+      e = ResultsProcessingError()
+      for hunt_urn, exceptions_by_plugin in exceptions_by_hunt.items():
+        for plugin_name, exceptions in exceptions_by_plugin.items():
+          for exception in exceptions:
+            e.RegisterSubException(hunt_urn, plugin_name, exception)
+      raise e
 
 
-class GenericHuntArgs(rdfvalue.RDFProtoStruct):
+class GenericHuntArgs(rdf_structs.RDFProtoStruct):
   """Arguments to the generic hunt."""
   protobuf = flows_pb2.GenericHuntArgs
 
@@ -769,51 +587,50 @@ class GenericHunt(implementation.GRRHunt):
 
   args_type = GenericHuntArgs
 
-  RESULTS_QUEUE = rdfvalue.RDFURN("HR")
-
-  def Initialize(self):
-    super(GenericHunt, self).Initialize()
-    self.processed_responses = False
+  @property
+  def started_flows_collection_urn(self):
+    return self.urn.Add("StartedFlows")
 
   @flow.StateHandler()
   def Start(self):
-    """Initializes this hunt from arguments."""
-    self.state.context.Register("results_metadata_urn",
-                                self.urn.Add("ResultsMetadata"))
-    self.state.context.Register("results_collection_urn",
-                                self.urn.Add("Results"))
+    super(GenericHunt, self).Start()
 
-    with aff4.FACTORY.Create(
-        self.state.context.results_metadata_urn, "HuntResultsMetadata",
-        mode="rw", token=self.token) as results_metadata:
-
-      state = rdfvalue.FlowState()
-      plugins = self.state.args.output_plugins or []
-      for index, plugin in enumerate(plugins):
-        plugin_obj = plugin.GetPluginForHunt(self)
-        state.Register("%s_%d" % (plugin.plugin_name, index),
-                       (plugin, plugin_obj.state))
-
-      results_metadata.Set(results_metadata.Schema.OUTPUT_PLUGINS(state))
-
-    with aff4.FACTORY.Create(
-        self.state.context.results_collection_urn, "RDFValueCollection",
-        mode="rw", token=self.token) as results_collection:
-      results_collection.SetChunksize(1024 * 1024)
-      self.state.context.Register("results_collection", results_collection)
-
-    self.SetDescription()
-
-  def SetDescription(self):
-    self.state.context.description = self.state.args.flow_runner_args.flow_name
+    with aff4.FACTORY.Create(self.started_flows_collection_urn,
+                             "PackedVersionedCollection",
+                             mode="w", token=self.token):
+      pass
 
   @flow.StateHandler(next_state=["MarkDone"])
   def RunClient(self, responses):
+    started_flows = []
     # Just run the flow on this client.
     for client_id in responses:
-      self.CallFlow(args=self.state.args.flow_args, client_id=client_id,
-                    next_state="MarkDone", sync=False,
-                    runner_args=self.state.args.flow_runner_args)
+      flow_urn = self.CallFlow(
+          args=self.state.args.flow_args, client_id=client_id,
+          next_state="MarkDone", sync=False,
+          runner_args=self.state.args.flow_runner_args)
+      started_flows.append(flow_urn)
+
+    collections.PackedVersionedCollection.AddToCollection(
+        self.started_flows_collection_urn, started_flows, sync=False,
+        token=self.token)
+
+  def Stop(self):
+    super(GenericHunt, self).Stop()
+
+    started_flows = aff4.FACTORY.Create(self.started_flows_collection_urn,
+                                        "PackedVersionedCollection",
+                                        mode="r", token=self.token)
+
+    self.Log("Hunt stop. Terminating all the started flows.")
+    num_terminated_flows = 0
+    for started_flow in started_flows:
+      flow.GRRFlow.MarkForTermination(started_flow,
+                                      reason="Parent hunt stopped.",
+                                      token=self.token)
+      num_terminated_flows += 1
+
+    self.Log("%d flows terminated.", num_terminated_flows)
 
   def GetLaunchedFlows(self, flow_type="outstanding"):
     """Returns the session IDs of all the flows we launched.
@@ -826,8 +643,8 @@ class GenericHunt(implementation.GRRHunt):
       A list of flow URNs.
     """
     result = None
-    all_clients = set(self.GetValuesForAttribute(self.Schema.CLIENTS))
-    finished_clients = set(self.GetValuesForAttribute(self.Schema.FINISHED))
+    all_clients = set(self.ListAllClients())
+    finished_clients = set(self.ListFinishedClients())
     outstanding_clients = all_clients - finished_clients
 
     if flow_type == "all":
@@ -843,26 +660,12 @@ class GenericHunt(implementation.GRRHunt):
 
     return [x[0] for _, x in flows]
 
-  def Save(self):
-    if self.state and self.processed_responses:
-      with self.lock:
-        self.state.context.results_collection.Flush(sync=True)
-        data_store.DB.Set(self.RESULTS_QUEUE, self.urn,
-                          rdfvalue.RDFDatetime().Now(),
-                          replace=True, token=self.token)
-
-    super(GenericHunt, self).Save()
-
-  @flow.StateHandler()
-  def MarkDone(self, responses):
-    """Mark a client as done."""
-    client_id = responses.request.client_id
-
-    # Open child flow and account its' reported resource usage
+  def StoreResourceUsage(self, responses, client_id):
+    """Open child flow and account its' reported resource usage."""
     flow_path = responses.status.child_session_id
     status = responses.status
 
-    resources = rdfvalue.ClientResources()
+    resources = rdf_client.ClientResources()
     resources.client_id = client_id
     resources.session_id = flow_path
     resources.cpu_usage.user_cpu_time = status.cpu_time_used.user_cpu_time
@@ -870,24 +673,16 @@ class GenericHunt(implementation.GRRHunt):
     resources.network_bytes_sent = status.network_bytes_sent
     self.state.context.usage_stats.RegisterResources(resources)
 
-    if responses.success:
-      msg = "Flow %s completed." % self.state.context.description,
-      self.LogResult(client_id, msg)
-
-      with self.lock:
-        self.processed_responses = True
-        msgs = [rdfvalue.GrrMessage(payload=response, source=client_id)
-                for response in responses]
-        self.state.context.results_collection.AddAll(msgs)
-
-    else:
-      self.LogClientError(client_id, log_message=utils.SmartStr(
-          responses.status))
-
+  @flow.StateHandler()
+  def MarkDone(self, responses):
+    """Mark a client as done."""
+    client_id = responses.request.client_id
+    self.StoreResourceUsage(responses, client_id)
+    self.AddResultsToCollection(responses, client_id)
     self.MarkClientDone(client_id)
 
 
-class FlowRequest(rdfvalue.RDFProtoStruct):
+class FlowRequest(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.FlowRequest
 
   def GetFlowArgsClass(self):
@@ -901,7 +696,7 @@ class FlowRequest(rdfvalue.RDFProtoStruct):
       return flow_cls.args_type
 
 
-class VariableGenericHuntArgs(rdfvalue.RDFProtoStruct):
+class VariableGenericHuntArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.VariableGenericHuntArgs
 
 
@@ -910,30 +705,183 @@ class VariableGenericHunt(GenericHunt):
 
   args_type = VariableGenericHuntArgs
 
-  def SetDescription(self):
-    self.state.context.description = "Variable Generic Hunt"
+  def SetDescription(self, description=None):
+    self.state.context.args.description = description or "Variable Generic Hunt"
 
   @flow.StateHandler(next_state=["MarkDone"])
   def RunClient(self, responses):
+    started_flows = []
+
     for client_id in responses:
       for flow_request in self.state.args.flows:
         for requested_client_id in flow_request.client_ids:
           if requested_client_id == client_id:
-            self.CallFlow(
+            flow_urn = self.CallFlow(
                 args=flow_request.args,
                 runner_args=flow_request.runner_args,
                 next_state="MarkDone", client_id=client_id)
+            started_flows.append(flow_urn)
 
-  def ManuallyScheduleClients(self):
+    collections.PackedVersionedCollection.AddToCollection(
+        self.started_flows_collection_urn, started_flows, sync=False,
+        token=self.token)
+
+  def ManuallyScheduleClients(self, token=None):
     """Schedule all flows without using the Foreman.
 
     Since we know all the client ids to run on we might as well just schedule
     all the flows and wait for the results.
+
+    Args:
+      token: A datastore access token.
     """
     client_ids = set()
     for flow_request in self.state.args.flows:
       for client_id in flow_request.client_ids:
         client_ids.add(client_id)
 
-    for client_id in client_ids:
-      self.StartClient(self.session_id, client_id)
+    self.StartClients(self.session_id, client_ids, token=token)
+
+
+class StatsHunt(implementation.GRRHunt):
+  """A Hunt to continuously collect stats from all clients.
+
+  This hunt is very unusual, it doesn't call any flows, instead using CallClient
+  directly.  This is done to minimise the message handling and server load
+  caused by collecting this information with a short time period.
+
+  TODO(user): implement a aff4 object cleanup cron that we can use to
+  automatically delete the collections generated by this hunt.
+  """
+
+  args_type = GenericHuntArgs
+  client_list = None
+  client_list_lock = None
+
+  def Start(self, **kwargs):
+    super(StatsHunt, self).Start(**kwargs)
+
+    # Force all client communication to be LOW_PRIORITY. This ensures that
+    # clients do not switch to fast poll mode when returning stats messages.
+    self.runner.args.priority = "LOW_PRIORITY"
+    self.runner.args.require_fastpoll = False
+
+    # The first time we're loaded we create these variables here.  After we are
+    # sent to storage we recreate them in the Load method.
+    self._MakeLock()
+
+  def _MakeLock(self):
+    if self.client_list is None:
+      self.client_list = []
+    if self.client_list_lock is None:
+      self.client_list_lock = threading.RLock()
+
+  def Load(self):
+    super(StatsHunt, self).Load()
+    self._MakeLock()
+
+  def Save(self):
+    # Make sure we call any remaining clients before we are saved
+    with self.client_list_lock:
+      call_list, self.client_list = self.client_list, None
+
+    self._CallClients(call_list)
+
+    super(StatsHunt, self).Save()
+
+  @flow.StateHandler()
+  def RunClient(self, responses):
+    client_call_list = self._GetCallClientList(responses)
+    self._CallClients(client_call_list)
+
+  def _GetCallClientList(self, client_ids):
+    """Use self.client_list to determine clients that need calling.
+
+    Batch calls into StatsHunt.ClientBatchSize (or larger) chunks.
+
+    Args:
+      client_ids: list of client ids
+    Returns:
+      list of client IDs that should be called with callclient.
+    """
+    call_list = []
+    with self.client_list_lock:
+      self.client_list.extend(client_ids)
+
+      if len(self.client_list) >= config_lib.CONFIG[
+          "StatsHunt.ClientBatchSize"]:
+        # We have enough clients ready to process, take a copy of the list so we
+        # can release the lock.
+        call_list, self.client_list = self.client_list, []
+    return call_list
+
+  def _CallClients(self, client_id_list):
+    now = rdfvalue.RDFDatetime().Now()
+    due = now + rdfvalue.Duration(
+        config_lib.CONFIG["StatsHunt.CollectionInterval"])
+
+    for client in aff4.FACTORY.MultiOpen(client_id_list,
+                                         token=self.token):
+
+      if client.Get(client.SchemaCls.SYSTEM) == "Windows":
+        wmi_query = ("Select * from Win32_NetworkAdapterConfiguration where"
+                     " IPEnabled=1")
+        self.CallClient("WmiQuery", query=wmi_query,
+                        next_state="StoreResults", client_id=client.urn,
+                        start_time=due)
+      else:
+        self.CallClient("EnumerateInterfaces", next_state="StoreResults",
+                        client_id=client.urn, start_time=due)
+
+  def ProcessInterface(self, response):
+    """Filter out localhost interfaces."""
+    if response.mac_address != "000000000000" and response.ifname != "lo":
+      return response
+
+  @flow.StateHandler()
+  def StoreResults(self, responses):
+    """Stores the responses."""
+    client_id = responses.request.client_id
+    # TODO(user): Should we record client usage stats?
+    processed_responses = []
+    wmi_interface_parser = wmi_parser.WMIInterfacesParser()
+
+    for response in responses:
+      if isinstance(response, rdf_client.Interface):
+        processed_responses.extend(
+            filter(None, [self.ProcessInterface(response)]))
+      elif isinstance(response, rdf_protodict.Dict):
+        # This is a result from the WMIQuery call
+        processed_responses.extend(list(
+            wmi_interface_parser.Parse(None, response, None)))
+
+    new_responses = flow.FakeResponses(processed_responses,
+                                       responses.request_data)
+    new_responses.success = responses.success
+    new_responses.status = responses.status
+    self.AddResultsToCollection(new_responses, client_id)
+
+    # Respect both the expiry and pause controls, since this will otherwise run
+    # forever. Pausing will effectively stop this hunt, and a new one will need
+    # to be created.
+    if self.runner.IsHuntStarted():
+      # Re-issue the request to the client for the next collection.
+      client_call_list = self._GetCallClientList([client_id])
+      if client_call_list:
+        self._CallClients(client_call_list)
+    else:
+      self.MarkClientDone(client_id)
+
+
+class StandardHuntInitHook(registry.InitHook):
+
+  pre = ["StatsInit"]
+
+  def RunOnce(self):
+    """Register standard hunt-related stats."""
+    stats.STATS.RegisterCounterMetric("hunt_output_plugin_errors",
+                                      fields=[("plugin", str)])
+    stats.STATS.RegisterCounterMetric("hunt_results_ran_through_plugin",
+                                      fields=[("plugin", str)])
+    stats.STATS.RegisterCounterMetric("hunt_results_compacted")
+    stats.STATS.RegisterCounterMetric("hunt_results_compaction_locking_errors")

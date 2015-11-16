@@ -6,6 +6,38 @@ var grr = window.grr || {};
 grr.artifact_view = {};
 
 
+grr.Renderer('ArtifactRDFValueRenderer', {
+  Layout: function(state) {
+    var unique = state.unique;
+    var artifact_str = state.artifact_str;
+
+    var description_element = unique + '_artifact_description';
+    var artifact_obj = JSON.parse(artifact_str);
+    grr.artifact_view.renderArtifactFromObject(artifact_obj,
+                                               description_element);
+    // Remove heading to clean up display.
+    $('div[name=artifact_name]').hide();
+  }
+});
+
+
+grr.Renderer('ArtifactManagerToolbar', {
+  Layout: function(state) {
+    var unique = state.unique;
+
+    $('#upload_dialog_' + unique).on('show.bs.modal', function() {
+      grr.layout('ArtifactJsonUploadView',
+                 'upload_dialog_body_' + unique);
+    });
+
+    $('#delete_confirm_dialog_' + unique).on('show.bs.modal', function() {
+      grr.layout('DeleteArtifactsConfirmationDialog',
+                 'delete_confirm_dialog_' + unique);
+    });
+  }
+});
+
+
 grr.Renderer('ArtifactListRenderer', {
   Layout: function(state) {
     // Populate the artifact manager.
@@ -183,7 +215,7 @@ grr.artifact_view.renderArtifactFromObject = function(artifact, element) {
       processor_row = '<tr><td>Parser<td>' + processor.name + '</tr>';
       processor_row += '<tr><td>Output types<td>' + processor.output_types +
           '</tr>';
-      processor_row += '<tr><td>Description<td>' + processor.description +
+      processor_row += '<tr><td>Description<td>' + processor.doc +
           '</tr>';
       processor_row += '<tr><td></tr>';
       $(processor_element).append(processor_row);
@@ -192,19 +224,23 @@ grr.artifact_view.renderArtifactFromObject = function(artifact, element) {
     $(processor_element).append('<tr><td>None</td></tr>');
   }
 
-  var collector_element = '#' + element + ' table[name=artifact_collectors]';
-  $(collector_element + ' tr').remove();
-  if (artifact.collectors.length > 0) {
-    $.each(artifact.collectors, function(index, collector) {
-      collector_row = '<tr><td>Action<td>' + collector.action + '</tr>';
-      $.each(collector.args, function(name, value) {
-        collector_row += '<tr><td>arg:' + name + '<td>' + value + '</tr>';
+  var source_element = '#' + element + ' table[name=artifact_sources]';
+  $(source_element + ' tr').remove();
+  if (artifact.sources.length > 0) {
+    $.each(artifact.sources, function(index, source) {
+      source_row = '<tr><td>Type<td>' + source.type +
+        '</tr>';
+      $.each(source.attributes, function(name, value) {
+        if ($.isArray(value)) {
+          value = value.join('<br>');
+        }
+        source_row += '<tr><td>arg:' + name + '<td>' + value + '</tr>';
       });
-      collector_row += '<tr><td></tr>';
-      $(collector_element).append(collector_row);
+      source_row += '<tr><td></tr>';
+      $(source_element).append(source_row);
     });
   } else {
-    $(collector_element).append('<tr><td>None</tr>');
+    $(source_element).append('<tr><td>None</tr>');
   }
 
   $('#' + element + ' td:first-child').addClass('proto_key');

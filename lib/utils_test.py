@@ -1,16 +1,20 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """Tests for utility classes."""
 
+
+import os
+import StringIO
+import subprocess
+import tarfile
 import time
+import zipfile
 
 
 from grr.lib import flags
-from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib import utils
 
-
+# Test method names dont conform with Google style
 # pylint: disable=g-bad-name
 
 
@@ -60,6 +64,7 @@ class StoreTests(test_lib.GRRBaseTest):
     results = []
 
     class TestStore(utils.FastStore):
+
       def KillObject(self, obj):
         results.append(obj)
 
@@ -111,7 +116,7 @@ class UtilsTest(test_lib.GRRBaseTest):
         ("../foo/bar", "/foo/bar"),
         ("./foo/bar", "/foo/bar"),
         ("/", "/"),
-        ]
+    ]
 
     for test, expected in data:
       self.assertEqual(expected, utils.NormalizePath(test))
@@ -141,7 +146,6 @@ class UtilsTest(test_lib.GRRBaseTest):
       self.assertNotEqual(xor_arr, test_arr)
       utils.XorByteArray(xor_arr, key)
       self.assertEqual(xor_arr, test_arr)
-
 
   def LinkedListTest(self):
 
@@ -274,6 +278,206 @@ class UtilsTest(test_lib.GRRBaseTest):
 
     for in_str, result in fixture:
       self.assertTrue(result in g(in_str))
+
+  def testGuessWindowsFileNameFromStringHandlesRunDllCaseCorrectly(self):
+    g = utils.GuessWindowsFileNameFromString
+    fixture = [
+        (r"rundll32.exe C:\Windows\system32\advpack.dll,DelNodeRunDLL32",
+         r"rundll32.exe"),
+        (r"rundll32.exe C:\Windows\system32\advpack.dll,DelNodeRunDLL32",
+         r"C:\Windows\system32\advpack.dll"),
+        (r"rundll32.exe 'C:\Program Files\Realtek\Audio\blah.exe',blah",
+         r"rundll32.exe"),
+        (r"rundll32.exe 'C:\Program Files\Realtek\Audio\blah.exe',blah",
+         r"C:\Program Files\Realtek\Audio\blah.exe"),
+        (r"'rundll32.exe' 'C:\Program Files\Realtek\Audio\blah.exe',blah",
+         r"rundll32.exe"),
+        (r"'rundll32.exe' 'C:\Program Files\Realtek\Audio\blah.exe',blah",
+         r"C:\Program Files\Realtek\Audio\blah.exe")]
+
+    for in_str, result in fixture:
+      self.assertTrue(result in g(in_str))
+
+  def testZipFileWithOneFile(self):
+    """Test the zipfile implementation."""
+    compressions = [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
+    for compression in compressions:
+      outfd = StringIO.StringIO()
+
+      # Write the zip into a file like object.
+      infd = StringIO.StringIO("this is a test string")
+      with utils.StreamingZipWriter(outfd, compression=compression) as writer:
+        writer.WriteFromFD(infd, "test.txt")
+
+      test_zip = zipfile.ZipFile(outfd, "r")
+      test_zip.testzip()
+
+      self.assertEqual(test_zip.namelist(), ["test.txt"])
+      self.assertEqual(test_zip.read("test.txt"), infd.getvalue())
+
+  def testTarFileWithOneFile(self):
+    infd = StringIO.StringIO("this is a test string")
+    st = os.stat_result((0644, 0, 0, 0, 0, 0, len(infd.getvalue()), 0, 0, 0))
+
+    # Write the zip into a file like object.
+    outfd = StringIO.StringIO()
+    with utils.StreamingTarWriter(outfd, mode="w:gz") as writer:
+      writer.WriteFromFD(infd, "test.txt", st=st)
+
+    test_tar = tarfile.open(fileobj=StringIO.StringIO(outfd.getvalue()),
+                            mode="r")
+    tinfos = list(test_tar.getmembers())
+
+    self.assertEqual(len(tinfos), 1)
+    self.assertEqual(tinfos[0].name, "test.txt")
+
+    fd = test_tar.extractfile(tinfos[0])
+    self.assertEqual(fd.read(1024), infd.getvalue())
+
+  def testZipFileWithMultipleFiles(self):
+    """Test the zipfile implementation."""
+    compressions = [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
+    for compression in compressions:
+      outfd = StringIO.StringIO()
+
+      # Write the zip into a file like object.
+      infd1 = StringIO.StringIO("this is a test string")
+      infd2 = StringIO.StringIO("this is another test string")
+      with utils.StreamingZipWriter(outfd, compression=compression) as writer:
+        writer.WriteFromFD(infd1, "test1.txt")
+        writer.WriteFromFD(infd2, "test2.txt")
+
+      test_zip = zipfile.ZipFile(outfd, "r")
+      test_zip.testzip()
+
+      self.assertEqual(sorted(test_zip.namelist()), ["test1.txt", "test2.txt"])
+      self.assertEqual(test_zip.read("test1.txt"), infd1.getvalue())
+
+      self.assertEqual(sorted(test_zip.namelist()), ["test1.txt", "test2.txt"])
+      self.assertEqual(test_zip.read("test2.txt"), infd2.getvalue())
+
+  def testTarFileWithMultipleFiles(self):
+    outfd = StringIO.StringIO()
+
+    infd1 = StringIO.StringIO("this is a test string")
+    st1 = os.stat_result((0644, 0, 0, 0, 0, 0, len(infd1.getvalue()), 0, 0, 0))
+
+    infd2 = StringIO.StringIO("this is another test string")
+    st2 = os.stat_result((0644, 0, 0, 0, 0, 0, len(infd2.getvalue()), 0, 0, 0))
+
+    # Write the zip into a file like object.
+    with utils.StreamingTarWriter(outfd, mode="w:gz") as writer:
+      writer.WriteFromFD(infd1, "test1.txt", st=st1)
+      writer.WriteFromFD(infd2, "subdir/test2.txt", st=st2)
+
+    test_tar = tarfile.open(fileobj=StringIO.StringIO(outfd.getvalue()),
+                            mode="r")
+    tinfos = sorted(test_tar.getmembers(), key=lambda tinfo: tinfo.name)
+
+    self.assertEqual(len(tinfos), 2)
+    self.assertEqual(tinfos[0].name, "subdir/test2.txt")
+    self.assertEqual(tinfos[1].name, "test1.txt")
+
+    fd = test_tar.extractfile(tinfos[0])
+    self.assertEqual(fd.read(1024), infd2.getvalue())
+
+    fd = test_tar.extractfile(tinfos[1])
+    self.assertEqual(fd.read(1024), infd1.getvalue())
+
+  def testZipFileWithSymlink(self):
+    """Test that symlinks are preserved when unpacking generated zips."""
+
+    compressions = [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]
+    for compression in compressions:
+      outfd = StringIO.StringIO()
+
+      infd1 = StringIO.StringIO("this is a test string")
+      infd2 = StringIO.StringIO("this is another test string")
+      with utils.StreamingZipWriter(outfd, compression=compression) as writer:
+        writer.WriteFromFD(infd1, "test1.txt")
+        writer.WriteFromFD(infd2, "subdir/test2.txt")
+
+        writer.WriteSymlink("test1.txt", "test1.txt.link")
+        writer.WriteSymlink("subdir/test2.txt", "test2.txt.link")
+
+      with utils.TempDirectory() as temp_dir:
+        zip_path = os.path.join(temp_dir, "archive.zip")
+        with open(zip_path, "w") as fd:
+          fd.write(outfd.getvalue())
+
+        # Builtin python ZipFile implementation doesn't support symlinks,
+        # so we have to extract the files with command line tool.
+        subprocess.check_call(["unzip", "-x", zip_path, "-d", temp_dir])
+
+        link_path = os.path.join(temp_dir, "test1.txt.link")
+        self.assertTrue(os.path.islink(link_path))
+        self.assertEqual(os.readlink(link_path), "test1.txt")
+
+        link_path = os.path.join(temp_dir, "test2.txt.link")
+        self.assertTrue(os.path.islink(link_path))
+        self.assertEqual(os.readlink(link_path), "subdir/test2.txt")
+
+  def testTarFileWithSymlink(self):
+    outfd = StringIO.StringIO()
+
+    infd1 = StringIO.StringIO("this is a test string")
+    st1 = os.stat_result((0644, 0, 0, 0, 0, 0, len(infd1.getvalue()), 0, 0, 0))
+
+    infd2 = StringIO.StringIO("this is another test string")
+    st2 = os.stat_result((0644, 0, 0, 0, 0, 0, len(infd2.getvalue()), 0, 0, 0))
+
+    # Write the zip into a file like object.
+    with utils.StreamingTarWriter(outfd, mode="w:gz") as writer:
+      writer.WriteFromFD(infd1, "test1.txt", st=st1)
+      writer.WriteFromFD(infd2, "subdir/test2.txt", st=st2)
+
+      writer.WriteSymlink("test1.txt", "test1.txt.link")
+      writer.WriteSymlink("subdir/test2.txt", "test2.txt.link")
+
+    with utils.TempDirectory() as temp_dir:
+      tar_path = os.path.join(temp_dir, "archive.tar.gz")
+      with open(tar_path, "w") as fd:
+        fd.write(outfd.getvalue())
+
+      # Builtin python ZipFile implementation doesn't support symlinks,
+      # so we have to extract the files with command line tool.
+      subprocess.check_call(["tar", "-xzf", tar_path, "-C", temp_dir])
+
+      link_path = os.path.join(temp_dir, "test1.txt.link")
+      self.assertTrue(os.path.islink(link_path))
+      self.assertEqual(os.readlink(link_path), "test1.txt")
+
+      link_path = os.path.join(temp_dir, "test2.txt.link")
+      self.assertTrue(os.path.islink(link_path))
+      self.assertEqual(os.readlink(link_path), "subdir/test2.txt")
+
+  def testMemoize(self):
+    class Concat(object):
+      append_count = 0
+
+      @utils.Memoize()
+      def concat(self, prefix, suffix):
+        Concat.append_count += 1
+        return prefix + "," + suffix
+
+    for _ in range(5):
+      self.assertEqual(Concat().concat(prefix="a", suffix="b"), "a,b")
+    self.assertEqual(Concat.append_count, 1)
+
+    class Fibber(object):
+      fib_count = 0
+
+      @utils.Memoize()
+      def fib(self, x):
+        Fibber.fib_count += 1
+        if x < 2:
+          return x
+        return self.fib(x - 1) + self.fib(x - 2)
+
+    self.assertEqual(Fibber().fib(20), 6765)
+    # Memoized fibbonaci runs once per value of x used, naive fibbonaci runs
+    # proportionaly to the output value.
+    self.assertEqual(Fibber.fib_count, 21)
 
 
 def main(argv):

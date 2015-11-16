@@ -2,11 +2,8 @@
 """Tests for export utils functions."""
 
 import os
+import stat
 
-
-# pylint: disable=unused-import,g-bad-import-order
-from grr.lib import server_plugins
-# pylint: enable=unused-import,g-bad-import-order
 
 from grr.lib import aff4
 from grr.lib import export_utils
@@ -14,6 +11,8 @@ from grr.lib import flags
 from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib import utils
+from grr.lib.flows.general import file_finder
+from grr.lib.rdfvalues import client as rdf_client
 
 
 class TestExports(test_lib.FlowTestsBaseclass):
@@ -25,6 +24,7 @@ class TestExports(test_lib.FlowTestsBaseclass):
     self.out = self.client_id.Add("fs/os")
     self.CreateFile("testfile1")
     self.CreateFile("testfile2")
+    self.CreateFile("testfile5")
     self.CreateDir("testdir1")
     self.CreateFile("testdir1/testfile3")
     self.CreateDir("testdir1/testdir2")
@@ -51,12 +51,14 @@ class TestExports(test_lib.FlowTestsBaseclass):
       self.assertTrue("testfile1" in os.listdir(expected_outdir))
 
   def testDownloadCollection(self):
-    """Check we can export a file without errors."""
+    """Check we can download files references in RDFValueCollection."""
     # Create a collection with URNs to some files.
     fd = aff4.FACTORY.Create("aff4:/testcoll", "RDFValueCollection",
                              token=self.token)
     fd.Add(rdfvalue.RDFURN(self.out.Add("testfile1")))
-    fd.Add(rdfvalue.StatEntry(aff4path=self.out.Add("testfile2")))
+    fd.Add(rdf_client.StatEntry(aff4path=self.out.Add("testfile2")))
+    fd.Add(file_finder.FileFinderResult(
+        stat_entry=rdf_client.StatEntry(aff4path=self.out.Add("testfile5"))))
     fd.Close()
 
     with utils.TempDirectory() as tmpdir:
@@ -68,10 +70,60 @@ class TestExports(test_lib.FlowTestsBaseclass):
       # Check we found both files.
       self.assertTrue("testfile1" in os.listdir(expected_outdir))
       self.assertTrue("testfile2" in os.listdir(expected_outdir))
+      self.assertTrue("testfile5" in os.listdir(expected_outdir))
 
       # Check we dumped a YAML file to the root of the client.
       expected_rootdir = os.path.join(tmpdir, self.client_id.Basename())
       self.assertTrue("client_info.yaml" in os.listdir(expected_rootdir))
+
+  def testDownloadCollectionWithFlattenOption(self):
+    """Check we can download files references in RDFValueCollection."""
+    # Create a collection with URNs to some files.
+    fd = aff4.FACTORY.Create("aff4:/testcoll", "RDFValueCollection",
+                             token=self.token)
+    fd.Add(rdfvalue.RDFURN(self.out.Add("testfile1")))
+    fd.Add(rdf_client.StatEntry(aff4path=self.out.Add("testfile2")))
+    fd.Add(file_finder.FileFinderResult(
+        stat_entry=rdf_client.StatEntry(aff4path=self.out.Add("testfile5"))))
+    fd.Close()
+
+    with utils.TempDirectory() as tmpdir:
+      export_utils.DownloadCollection("aff4:/testcoll", tmpdir, overwrite=True,
+                                      dump_client_info=True, flatten=True,
+                                      token=self.token, max_threads=2)
+
+      # Check that "files" folder is filled with symlinks to downloaded files.
+      symlinks = os.listdir(os.path.join(tmpdir, "files"))
+      self.assertEqual(len(symlinks), 3)
+      self.assertListEqual(sorted(symlinks),
+                           ["C.1000000000000000_fs_os_testfile1",
+                            "C.1000000000000000_fs_os_testfile2",
+                            "C.1000000000000000_fs_os_testfile5"])
+      self.assertEqual(os.readlink(
+          os.path.join(tmpdir, "files", "C.1000000000000000_fs_os_testfile1")),
+                       os.path.join(tmpdir, "C.1000000000000000", "fs", "os",
+                                    "testfile1"))
+
+  def testDownloadCollectionWithFoldersEntries(self):
+    """Check we can download RDFValueCollection that also references folders."""
+    fd = aff4.FACTORY.Create("aff4:/testcoll", "RDFValueCollection",
+                             token=self.token)
+    fd.Add(file_finder.FileFinderResult(
+        stat_entry=rdf_client.StatEntry(aff4path=self.out.Add("testfile5"))))
+    fd.Add(file_finder.FileFinderResult(
+        stat_entry=rdf_client.StatEntry(aff4path=self.out.Add("testdir1"),
+                                        st_mode=stat.S_IFDIR)))
+    fd.Close()
+
+    with utils.TempDirectory() as tmpdir:
+      export_utils.DownloadCollection("aff4:/testcoll", tmpdir, overwrite=True,
+                                      dump_client_info=True, token=self.token,
+                                      max_threads=2)
+      expected_outdir = os.path.join(tmpdir, self.out.Path()[1:])
+
+      # Check we found both files.
+      self.assertTrue("testfile5" in os.listdir(expected_outdir))
+      self.assertTrue("testdir1" in os.listdir(expected_outdir))
 
   def testRecursiveDownload(self):
     """Check we can export a file without errors."""

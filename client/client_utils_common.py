@@ -27,7 +27,8 @@ def HandleAlarm(process):
     pass
 
 
-def Execute(cmd, args, time_limit=-1, bypass_whitelist=False, daemon=False):
+def Execute(cmd, args, time_limit=-1, bypass_whitelist=False, daemon=False,
+            use_client_context=False):
   """Executes commands on the client.
 
   This function is the only place where commands will be executed
@@ -42,11 +43,13 @@ def Execute(cmd, args, time_limit=-1, bypass_whitelist=False, daemon=False):
         Note that this should only ever be called on a binary that passes the
         VerifySignedBlob check.
     daemon: Start the new process in the background.
+    use_client_context: Run this script in the client's context. Defaults to
+                        system context.
 
   Returns:
     A tuple of stdout, stderr, return value and time taken.
   """
-  if not IsExecutionWhitelisted(cmd, args) and not bypass_whitelist:
+  if not bypass_whitelist and not IsExecutionWhitelisted(cmd, args):
     # Whitelist doesn't contain this cmd/arg pair
     logging.info("Execution disallowed by whitelist: %s %s.", cmd,
                  " ".join(args))
@@ -64,18 +67,28 @@ def Execute(cmd, args, time_limit=-1, bypass_whitelist=False, daemon=False):
       except OSError:
         # This only works if the process is running as root.
         pass
-      _Execute(cmd, args, time_limit)
+      _Execute(cmd, args, time_limit, use_client_context=use_client_context)
       os._exit(0)  # pylint: disable=protected-access
   else:
-    return _Execute(cmd, args, time_limit)
+    return _Execute(cmd, args, time_limit,
+                    use_client_context=use_client_context)
 
 
-def _Execute(cmd, args, time_limit=-1):
+def _Execute(cmd, args, time_limit=-1, use_client_context=False):
+  """Executes cmd."""
   run = [cmd]
   run.extend(args)
-  logging.info("Executing %s", " ".join(run))
-  p = subprocess.Popen(run, stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  env = os.environ.copy()
+  if use_client_context:
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("PYTHON_PATH", None)
+    context = "client"
+  else:
+    context = "system"
+  logging.info("Executing %s in %s context.", " ".join(run), context)
+  p = subprocess.Popen(
+      run, stdin=subprocess.PIPE,
+      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 
   alarm = None
   if time_limit > 0:
@@ -123,7 +136,7 @@ def IsExecutionWhitelisted(cmd, args):
         ("tasklist.exe", ["/SVC"]),
         ("tasklist.exe", ["/v"]),
         ("driverquery.exe", ["/v"]),
-        ]
+    ]
   elif platform.system() == "Linux":
     whitelist = [
         ("/bin/sleep", ["10"]),
@@ -134,15 +147,25 @@ def IsExecutionWhitelisted(cmd, args):
         ("/sbin/auditctl", ["-l"]),
         ("/sbin/ifconfig", ["-a"]),
         ("/bin/df", []),
-        ]
+        ("/usr/sbin/dmidecode", ["-q"]),
+        ("/usr/sbin/sshd", ["-T"]),
+        ("/usr/bin/who", []),
+        ("/usr/bin/last", []),
+        ("/sbin/lsmod", []),
+        ("/usr/bin/yum", ["list", "installed", "-q"]),
+        ("/usr/bin/yum", ["repolist", "-v", "-q"]),
+    ]
   elif platform.system() == "Darwin":
     whitelist = [
         ("/bin/launchctl", ["unload",
-                            config_lib.CONFIG["Client.launchctl_plist"]]),
+                            config_lib.CONFIG["Client.plist_path"]]),
         ("/bin/echo", ["1"]),
-        ("/usr/sbin/screencapture", ["-x", "-t", "jpg", "/tmp/ss.dat"]),
-        ("/bin/rm", ["-f", "/tmp/ss.dat"])
-        ]
+        ("/usr/sbin/system_profiler", ["-xml", "SPHardwareDataType"]),
+        ("/usr/bin/who", []),
+        ("/usr/bin/last", []),
+        ("/usr/sbin/kextstat", []),
+        ("/usr/bin/hdiutil", ["info"]),
+    ]
   else:
     whitelist = []
 
@@ -153,7 +176,7 @@ def IsExecutionWhitelisted(cmd, args):
   return False
 
 
-LOG_THROTTLE_CACHE = utils.TimeBasedCache(max_size=10, max_age=60*60)
+LOG_THROTTLE_CACHE = utils.TimeBasedCache(max_size=10, max_age=60 * 60)
 
 
 def ErrorOnceAnHour(msg, *args, **kwargs):

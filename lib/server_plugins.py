@@ -12,22 +12,25 @@ modules that have been customized for your deployment.
 """
 # pylint: disable=unused-import,g-import-not-at-top
 
-from grr import artifacts
-from grr import parsers
-
 # Server code needs to know about client actions as well.
 from grr.client import client_plugins
 
 from grr.lib import access_control
-from grr.lib import aff4_objects
 from grr.lib import client_compatibility
 from grr.lib import config_lib
-from grr.lib import data_stores
 from grr.lib import flow
 from grr.lib import hunts
+from grr.lib import ip_resolver
 from grr.lib import local
+from grr.lib import master
+from grr.lib import output_plugin
+from grr.lib import output_plugins
 from grr.lib import stats
-from grr.lib import stats_store
-from grr.lib.flows import general
+from grr.lib.aff4_objects import registry_init
+from grr.lib.data_stores import registry_init
+from grr.lib.flows.cron import registry_init
+from grr.lib.flows.general import registry_init
+
+from grr.parsers import registry_init
 
 from grr.server import server_plugins

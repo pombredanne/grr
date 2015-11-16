@@ -5,11 +5,12 @@ import re
 
 import logging
 
-from grr.lib import artifact_lib
+from grr.lib import artifact_utils
 from grr.lib import parsers
 from grr.lib import rdfvalue
 from grr.lib import type_info
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
 
 
 SID_RE = re.compile(r"^S-\d-\d+-(\d+-){1,14}\d+$")
@@ -24,6 +25,7 @@ class CurrentControlSetKBParser(parsers.RegistryValueParser):
   def Parse(self, stat, unused_knowledge_base):
     """Parse the key currentcontrolset output."""
     value = stat.registry_data.GetValue()
+
     if not str(value).isdigit() or int(value) > 999 or int(value) < 0:
       raise parsers.ParseError("Invalid value for CurrentControlSet key %s" %
                                value)
@@ -38,16 +40,52 @@ class WinEnvironmentParser(parsers.RegistryValueParser):
   supported_artifacts = ["WinPathEnvironmentVariable",
                          "WinDirEnvironmentVariable", "TempEnvironmentVariable",
                          "AllUsersAppDataEnvironmentVariable"]
+  # Required for environment variable expansion
+  knowledgebase_dependencies = ["environ_systemdrive", "environ_systemroot"]
 
   def Parse(self, stat, knowledge_base):
     """Parse the key currentcontrolset output."""
     value = stat.registry_data.GetValue()
     if not value:
       raise parsers.ParseError("Invalid value for key %s" % stat.pathspec.path)
-    value = artifact_lib.ExpandWindowsEnvironmentVariables(value,
-                                                           knowledge_base)
+    value = artifact_utils.ExpandWindowsEnvironmentVariables(value,
+                                                             knowledge_base)
     if value:
       yield rdfvalue.RDFString(value)
+
+
+class WinSystemDriveParser(parsers.RegistryValueParser):
+  """Parser for SystemDrive environment variable."""
+
+  output_types = ["RDFString"]
+  supported_artifacts = ["SystemDriveEnvironmentVariable"]
+
+  def Parse(self, stat, _):
+    """Parse the key currentcontrolset output."""
+    value = stat.registry_data.GetValue()
+    if not value:
+      raise parsers.ParseError("Invalid value for key %s" % stat.pathspec.path)
+
+    systemdrive = value[0:2]
+    if re.match(r"^[A-Za-z]:$", systemdrive):
+      yield rdfvalue.RDFString(systemdrive)
+    else:
+      raise parsers.ParseError(
+          "Bad drive letter for key %s" % stat.pathspec.path)
+
+
+class WinSystemRootParser(parsers.RegistryValueParser):
+  """Parser for SystemRoot environment variables."""
+
+  output_types = ["RDFString"]
+  supported_artifacts = ["SystemRoot"]
+
+  def Parse(self, stat, _):
+    value = stat.registry_data.GetValue()
+    if value:
+      yield rdfvalue.RDFString(value)
+    else:
+      raise parsers.ParseError("Invalid value for key %s" % stat.pathspec.path)
 
 
 class CodepageParser(parsers.RegistryValueParser):
@@ -70,12 +108,14 @@ class AllUsersProfileEnvironmentVariable(parsers.RegistryParser):
   """
   output_types = ["RDFString"]
   supported_artifacts = ["AllUsersProfileEnvironmentVariable"]
+  # Required for environment variable expansion
+  knowledgebase_dependencies = ["environ_systemdrive", "environ_systemroot"]
   process_together = True
 
   def ParseMultiple(self, stats, knowledge_base):
     """Parse each returned registry variable."""
     prof_directory = r"%SystemDrive%\Documents and Settings"
-    all_users = "All Users"    # Default value.
+    all_users = "All Users"  # Default value.
     for stat in stats:
       value = stat.registry_data.GetValue()
       if stat.pathspec.Basename() == "ProfilesDirectory" and value:
@@ -84,7 +124,7 @@ class AllUsersProfileEnvironmentVariable(parsers.RegistryParser):
         all_users = value
 
     all_users_dir = r"%s\%s" % (prof_directory, all_users)
-    all_users_dir = artifact_lib.ExpandWindowsEnvironmentVariables(
+    all_users_dir = artifact_utils.ExpandWindowsEnvironmentVariables(
         all_users_dir, knowledge_base)
     yield rdfvalue.RDFString(all_users_dir)
 
@@ -104,10 +144,15 @@ class WinUserSids(parsers.RegistryParser):
     sid_str = stat.pathspec.Dirname().Basename()
 
     if SID_RE.match(sid_str):
-      kb_user = rdfvalue.KnowledgeBaseUser()
+      kb_user = rdf_client.KnowledgeBaseUser()
       kb_user.sid = sid_str
       if stat.pathspec.Basename() == "ProfileImagePath":
-        kb_user.homedir = stat.registry_data.GetValue()
+        if stat.resident:
+          # Support old clients.
+          kb_user.homedir = utils.SmartUnicode(stat.resident)
+        else:
+          kb_user.homedir = stat.registry_data.GetValue()
+
         kb_user.userprofile = kb_user.homedir
         try:
           # Assume username is the last component of the path. This is not
@@ -133,6 +178,9 @@ class WinUserSpecialDirs(parsers.RegistryParser):
   output_types = ["KnowledgeBaseUser"]
   supported_artifacts = ["UserShellFolders"]
   process_together = True
+  # Required for environment variable expansion
+  knowledgebase_dependencies = ["environ_systemdrive", "environ_systemroot",
+                                "users.userprofile"]
 
   key_var_mapping = {
       "Shell Folders": {
@@ -145,10 +193,13 @@ class WinUserSpecialDirs(parsers.RegistryParser):
           "Recent": "recent",
           "Startup": "startup",
           "Personal": "personal",
-          },
+      },
       "Environment": {
           "TEMP": "temp",
-          },
+      },
+      "Volatile Environment": {
+          "USERDOMAIN": "userdomain",
+      },
   }
 
   def ParseMultiple(self, stats, knowledge_base):
@@ -159,7 +210,7 @@ class WinUserSpecialDirs(parsers.RegistryParser):
       sid_str = stat.pathspec.path.split("/", 3)[2]
       if SID_RE.match(sid_str):
         if sid_str not in user_dict:
-          user_dict[sid_str] = rdfvalue.KnowledgeBaseUser(sid=sid_str)
+          user_dict[sid_str] = rdf_client.KnowledgeBaseUser(sid=sid_str)
 
         if stat.registry_data.GetValue():
           # Look up in the mapping if we can use this entry to populate a user
@@ -170,9 +221,9 @@ class WinUserSpecialDirs(parsers.RegistryParser):
             reg_key = stat.pathspec.Basename()
             kb_attr = map_dict.get(reg_key)
             if kb_attr:
-              value = artifact_lib.ExpandWindowsEnvironmentVariables(
+              value = artifact_utils.ExpandWindowsEnvironmentVariables(
                   stat.registry_data.GetValue(), knowledge_base)
-              value = artifact_lib.ExpandWindowsUserEnvironmentVariables(
+              value = artifact_utils.ExpandWindowsUserEnvironmentVariables(
                   value, knowledge_base, sid=sid_str)
               user_dict[sid_str].Set(kb_attr, value)
 
@@ -187,23 +238,25 @@ class WinServicesParser(parsers.RegistryValueParser):
     http://support.microsoft.com/kb/103000
   """
 
-  output_types = ["ServiceInformation"]
+  output_types = ["WindowsServiceInformation"]
   supported_artifacts = ["WindowsServices"]
   process_together = True
 
   def __init__(self):
+    # The key can be "services" or "Services" on different versions of windows.
     self.service_re = re.compile(
-        r".*HKEY_LOCAL_MACHINE/SYSTEM/[^/]+/services/([^/]+)(/(.*))?$")
+        r".*HKEY_LOCAL_MACHINE/SYSTEM/[^/]+/services/([^/]+)(/(.*))?$",
+        re.IGNORECASE)
     super(WinServicesParser, self).__init__()
 
   def _GetServiceName(self, path):
     return self.service_re.match(path).group(1)
 
   def _GetKeyName(self, path):
-    return self.service_re.match(path).group(3)
+    return self.service_re.match(path).group(3).lower()
 
   def ParseMultiple(self, stats, knowledge_base):
-    """Parse Service registry keys and return ServiceInformation objects."""
+    """Parse Service registry keys and return WindowsServiceInformation."""
     _ = knowledge_base
     services = {}
     field_map = {"Description": "description",
@@ -217,6 +270,10 @@ class WinServicesParser(parsers.RegistryValueParser):
                  "Type": "service_type",
                  "Parameters/ServiceDLL": "service_dll"}
 
+    # Field map key should be converted to lowercase because key aquired through
+    # self._GetKeyName could have some  characters in different case than the
+    # field map, e.g. ServiceDLL and ServiceDll.
+    field_map = {k.lower(): v for k, v in field_map.items()}
     for stat in stats:
 
       # Ignore subkeys
@@ -225,9 +282,9 @@ class WinServicesParser(parsers.RegistryValueParser):
 
       service_name = self._GetServiceName(stat.pathspec.path)
       reg_key = stat.aff4path.Dirname()
-      services.setdefault(service_name,
-                          rdfvalue.ServiceInformation(name=service_name,
-                                                      registry_key=reg_key))
+      service_info = rdf_client.WindowsServiceInformation(name=service_name,
+                                                          registry_key=reg_key)
+      services.setdefault(service_name, service_info)
 
       key = self._GetKeyName(stat.pathspec.path)
 
@@ -238,7 +295,8 @@ class WinServicesParser(parsers.RegistryValueParser):
         except type_info.TypeValueError:
 
           # Flatten multi strings into a simple string
-          if stat.registry_type == rdfvalue.StatEntry.RegistryType.REG_MULTI_SZ:
+          if (stat.registry_type ==
+              rdf_client.StatEntry.RegistryType.REG_MULTI_SZ):
             services[service_name].Set(field_map[key],
                                        utils.SmartUnicode(
                                            stat.registry_data.GetValue()))
@@ -265,8 +323,8 @@ class WinTimezoneParser(parsers.RegistryValueParser):
     value = stat.registry_data.GetValue()
     result = ZONE_LIST.get(value.strip())
     if not result:
-      raise parsers.ParseError("Unknown value for TimeZoneKeyName key %s" %
-                               value)
+      yield rdfvalue.RDFString("Unknown (%s)" % value.strip())
+
     yield rdfvalue.RDFString(result)
 
 

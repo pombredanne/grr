@@ -1,11 +1,14 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
-
 """Test the connections listing module."""
 
+
 from grr.lib import aff4
-from grr.lib import rdfvalue
+from grr.lib import flags
 from grr.lib import test_lib
+# pylint: disable=unused-import
+from grr.lib.flows.general import network
+# pylint: enable=unused-import
+from grr.lib.rdfvalues import client as rdf_client
 
 
 class NetstatTest(test_lib.FlowTestsBaseclass):
@@ -15,25 +18,27 @@ class NetstatTest(test_lib.FlowTestsBaseclass):
     """Test that the Netstat flow works."""
 
     class ClientMock(object):
+
       def Netstat(self, _):
-        conn1 = rdfvalue.NetworkConnection(
-            state=rdfvalue.NetworkConnection.State.LISTEN,
-            type=rdfvalue.NetworkConnection.Type.SOCK_STREAM,
-            local_address=rdfvalue.NetworkEndpoint(
+        """Returns fake connections."""
+        conn1 = rdf_client.NetworkConnection(
+            state=rdf_client.NetworkConnection.State.LISTEN,
+            type=rdf_client.NetworkConnection.Type.SOCK_STREAM,
+            local_address=rdf_client.NetworkEndpoint(
                 ip="0.0.0.0",
                 port=22),
-            remote_address=rdfvalue.NetworkEndpoint(
+            remote_address=rdf_client.NetworkEndpoint(
                 ip="0.0.0.0",
                 port=0),
             pid=2136,
             ctime=0)
-        conn2 = rdfvalue.NetworkConnection(
-            state=rdfvalue.NetworkConnection.State.LISTEN,
-            type=rdfvalue.NetworkConnection.Type.SOCK_STREAM,
-            local_address=rdfvalue.NetworkEndpoint(
+        conn2 = rdf_client.NetworkConnection(
+            state=rdf_client.NetworkConnection.State.LISTEN,
+            type=rdf_client.NetworkConnection.Type.SOCK_STREAM,
+            local_address=rdf_client.NetworkEndpoint(
                 ip="192.168.1.1",
                 port=31337),
-            remote_address=rdfvalue.NetworkEndpoint(
+            remote_address=rdf_client.NetworkEndpoint(
                 ip="1.2.3.4",
                 port=6667),
             pid=1,
@@ -62,3 +67,11 @@ class NetstatTest(test_lib.FlowTestsBaseclass):
     self.assertEqual(conns[1].local_address.ip, "192.168.1.1")
     self.assertEqual(conns[1].pid, 1)
     self.assertEqual(conns[1].remote_address.port, 6667)
+
+
+def main(argv):
+  # Run the full test suite
+  test_lib.GrrTestProgram(argv=argv)
+
+if __name__ == "__main__":
+  flags.StartMain(main)

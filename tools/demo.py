@@ -2,6 +2,7 @@
 """This is a single binary demo program."""
 
 
+import os
 import threading
 
 
@@ -16,22 +17,26 @@ from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import startup
 from grr.tools import http_server
-from grr.worker import enroller
 from grr.worker import worker
-
-BASE_DIR = "grr/"
 
 
 def main(argv):
   """Sets up all the component in their own threads."""
-  # For testing we use the test config file.
   flags.FLAGS.config = config_lib.CONFIG["Test.config"]
 
   config_lib.CONFIG.AddContext(
       "Demo Context",
       "The demo runs all functions in a single process using the "
       "in memory data store.")
-  startup.TestInit()
+
+  config_lib.CONFIG.AddContext(
+      "Test Context", "Context applied when we run tests.")
+
+  flags.FLAGS.config = config_lib.CONFIG["Test.config"]
+  flags.FLAGS.secondary_configs = [
+      os.path.join(config_lib.CONFIG["Test.data_dir"], "grr_test.yaml")]
+
+  startup.Init()
 
   # pylint: disable=unused-import,unused-variable,g-import-not-at-top
   from grr.gui import gui_plugins
@@ -42,12 +47,6 @@ def main(argv):
                                    name="Worker")
   worker_thread.daemon = True
   worker_thread.start()
-
-  # This is the enroller thread.
-  enroller_thread = threading.Thread(target=enroller.main, args=[argv],
-                                     name="Enroller")
-  enroller_thread.daemon = True
-  enroller_thread.start()
 
   # This is the http server Frontend that clients communicate with.
   http_thread = threading.Thread(target=http_server.main, args=[argv],

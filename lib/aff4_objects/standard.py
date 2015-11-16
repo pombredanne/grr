@@ -10,6 +10,8 @@ from grr.lib import data_store
 from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 class VFSDirectory(aff4.AFF4Volume):
@@ -42,49 +44,25 @@ class VFSDirectory(aff4.AFF4Volume):
     # client id is the first path element
     client_id = self.urn.Split()[0]
 
-    if attribute == self.Schema.CONTAINS:
+    if attribute == "CONTAINS":
       # Get the pathspec for this object
-      pathspec = self.Get(self.Schema.PATHSPEC)
-
-      stripped_components = []
-      parent = self
-
-      while not pathspec and len(parent.urn.Split()) > 1:
-        # We try to recurse up the tree to get a real pathspec.
-        # These directories are created automatically without pathspecs when a
-        # deep directory is listed without listing the parents.
-        # Note /fs/os or /fs/tsk won't be updateable so we will raise IOError
-        # if we try.
-        stripped_components.append(parent.urn.Basename())
-        pathspec = parent.Get(parent.Schema.PATHSPEC)
-        parent = aff4.FACTORY.Open(parent.urn.Dirname(), token=self.token)
-
-      if pathspec:
-        if stripped_components:
-          # We stripped pieces of the URL, time to add them back at the deepest
-          # nested path.
-          new_path = utils.JoinPath(pathspec.last.path,
-                                    *stripped_components[:-1])
-          pathspec.last.path = new_path
-
-        flow_id = flow.GRRFlow.StartFlow(client_id=client_id,
-                                         flow_name="ListDirectory",
-                                         pathspec=pathspec, priority=priority,
-                                         notify_to_user=False,
-                                         token=self.token)
-      else:
-        raise IOError("Item has no pathspec.")
+      flow_id = flow.GRRFlow.StartFlow(client_id=client_id,
+                                       flow_name="ListDirectory",
+                                       pathspec=self.real_pathspec,
+                                       priority=priority,
+                                       notify_to_user=False,
+                                       token=self.token)
 
       return flow_id
 
   class SchemaCls(aff4.AFF4Volume.SchemaCls):
     """Attributes specific to VFSDirectory."""
-    STAT = aff4.Attribute("aff4:stat", rdfvalue.StatEntry,
-                          "A StatResponse protobuf describing this file.",
+    STAT = aff4.Attribute("aff4:stat", rdf_client.StatEntry,
+                          "A StatEntry describing this file.",
                           "stat")
 
     PATHSPEC = aff4.Attribute(
-        "aff4:pathspec", rdfvalue.PathSpec,
+        "aff4:pathspec", rdf_paths.PathSpec,
         "The pathspec used to retrieve this object from the client.",
         "pathspec")
 
@@ -170,6 +148,9 @@ class BlobImage(aff4.AFF4Image):
         # Put back into the cache
         self.chunk_cache.Put(readahead[fd.urn], fd)
 
+    if result is None:
+      raise IOError("Chunk '%s' not found for reading!" % chunk)
+
     return result
 
   def FromBlobImage(self, fd):
@@ -245,12 +226,13 @@ class BlobImage(aff4.AFF4Image):
     """The schema for Blob Images."""
     STAT = aff4.AFF4Object.VFSDirectory.SchemaCls.STAT
 
-    HASHES = aff4.Attribute("aff4:hashes", rdfvalue.HashList,
+    HASHES = aff4.Attribute("aff4:hashes", HashList,
                             "List of hashes of each chunk in this file.")
 
     FINGERPRINT = aff4.Attribute("aff4:fingerprint",
-                                 rdfvalue.FingerprintResponse,
-                                 "Protodict containing arrays of hashes.")
+                                 rdf_client.FingerprintResponse,
+                                 "DEPRECATED protodict containing arrays of "
+                                 " hashes. Use AFF4Stream.HASH instead.")
 
     FINALIZED = aff4.Attribute("aff4:finalized",
                                rdfvalue.RDFBool,
@@ -353,125 +335,322 @@ class HashImage(aff4.AFF4Image):
         "updating this object.")
 
     FINGERPRINT = aff4.Attribute("aff4:fingerprint",
-                                 rdfvalue.FingerprintResponse,
-                                 "Protodict containing arrays of hashes.")
+                                 rdf_client.FingerprintResponse,
+                                 "DEPRECATED protodict containing arrays of "
+                                 " hashes. Use AFF4Stream.HASH instead.")
 
 
-class AFF4Index(aff4.AFF4Object):
-  """An aff4 object which manages access to an index.
+class AFF4SparseImage(BlobImage):
+  """A class to store partial files."""
 
-  This object has no actual attributes, it simply manages the index.
+  class SchemaCls(aff4.BlobImage.SchemaCls):
+    PATHSPEC = VFSDirectory.SchemaCls.PATHSPEC
+
+  def Initialize(self):
+    super(AFF4SparseImage, self).Initialize()
+    self._OpenIndex()
+
+  def _OpenIndex(self):
+    """Create the index if it doesn't exist, otherwise open it."""
+    index_urn = self.urn.Add("index")
+    self.index = aff4.FACTORY.Create(index_urn, "AFF4SparseIndex", mode="rw",
+                                     token=self.token)
+
+  def Truncate(self, offset=0):
+    if offset != 0:
+      raise IOError("Non-zero truncation not supported for AFF4SparseImage")
+    super(AFF4SparseImage, self).Truncate(0)
+    self._OpenIndex()
+    self.finalized = False
+
+  def Read(self, length):
+    result = []
+
+    while length > 0:
+      data = self._ReadPartial(length)
+      if not data:
+        break
+      length -= len(data)
+      result.append(data)
+
+    return "".join(result)
+
+  def _GetChunkForReading(self, chunk):
+    """Retrieve the relevant blob from the AFF4 data store or cache."""
+    result = None
+    offset = chunk * self._HASH_SIZE
+    self.index.seek(offset)
+    chunk_name = self.index.read(self._HASH_SIZE)
+    try:
+      result = self.chunk_cache.Get(chunk_name)
+      # Cache hit, so we're done.
+      return result
+    except KeyError:
+      # Read ahead a few chunks.
+      self.index.seek(offset)
+      readahead = {}
+
+      # Read all the hashes in one go, then split up the result.
+      chunks = self.index.read(self._HASH_SIZE * self._READAHEAD)
+      chunk_names = [chunks[i:i + self._HASH_SIZE]
+                     for i in xrange(0, len(chunks), self._HASH_SIZE)]
+
+      for name in chunk_names:
+        # Try and read ahead a few chunks from the datastore and add them to the
+        # cache. If the chunks ahead aren't there, that's okay, we just can't
+        # cache them. We still keep reading to see if chunks after them are
+        # there, since the image is sparse.
+        try:
+          if name not in self.chunk_cache:
+            urn = aff4.ROOT_URN.Add("blobs").Add(name.encode("hex"))
+            readahead[urn] = name
+        except aff4.ChunkNotFoundError:
+          pass
+
+      fds = aff4.FACTORY.MultiOpen(readahead, mode="r", token=self.token)
+      for fd in fds:
+        name = readahead[fd.urn]
+
+        # Remember the right fd
+        if name == chunk_name:
+          result = fd
+
+        # Put back into the cache
+        self.chunk_cache.Put(readahead[fd.urn], fd)
+
+      if result is None:
+        raise aff4.ChunkNotFoundError("Chunk '%s' (urn: %s) not "
+                                      "found for reading!"
+                                      % (chunk, chunk_name))
+
+    return result
+
+  def _ReadPartial(self, length):
+    """Read as much as possible, but not more than length."""
+    chunk = self.offset / self.chunksize
+    chunk_offset = self.offset % self.chunksize
+
+    # If we're past the end of the file, we don't have a chunk to read from, so
+    # we can't read anymore. We return the empty string here so we can read off
+    # the end of a file without raising, and get as much data as is there.
+    if chunk > self.index.last_chunk:
+      return ""
+
+    available_to_read = min(length, self.chunksize - chunk_offset)
+
+    fd = self._GetChunkForReading(chunk)
+
+    fd.Seek(chunk_offset)
+
+    result = fd.Read(available_to_read)
+    self.offset += len(result)
+
+    return result
+
+  def AddBlob(self, blob_hash, length, chunk_number):
+    """Add another blob to this image using its hash."""
+
+    # TODO(user) Allow the index's chunksize to be > self._HASH_SIZE.
+    # This will reduce the number of rows we need to store in the datastore.
+    # We'll fill chunks with 0s when we don't have enough information to write
+    # to them fully, and ignore 0s when we're reading chunks.
+
+    # There's one hash in the index for each chunk in the file.
+    offset = chunk_number * self.index.chunksize
+    self.index.Seek(offset)
+
+    # If we're adding a new blob, we should increase the size. If we're just
+    # updating an existing blob, the size should stay the same.
+    # That is, if we read the index at the right offset and no hash is there, we
+    # must not have seen this blob before, so we say we're adding a new one and
+    # increase in size.
+    if not self.index.ChunkExists(chunk_number):
+      # We say that we've increased in size by the size of the blob,
+      # but really we only store its hash in the AFF4SparseImage.
+      self.size += length
+
+    # Seek back in case we've read past the offset we're meant to write to.
+    self.index.Seek(offset)
+    self.index.Write(blob_hash)
+
+    self._dirty = True
+
+  def Flush(self, sync=True):
+    if self._dirty:
+      self.index.Flush(sync=sync)
+    super(AFF4SparseImage, self).Flush(sync=sync)
+
+
+class AFF4SparseIndex(aff4.AFF4Image):
+  """A sparse index for AFF4SparseImage."""
+
+  # TODO(user) Allow for a bigger chunk size. At the moment, the
+  # chunksize must be exactly the hash size.
+
+  chunksize = 32
+
+  class SchemaCls(aff4.AFF4Image.SchemaCls):
+    _CHUNKSIZE = aff4.Attribute("aff4:chunksize", rdfvalue.RDFInteger,
+                                "Total size of each chunk.", default=32)
+    LAST_CHUNK = aff4.Attribute("aff4:lastchunk", rdfvalue.RDFInteger,
+                                "The highest numbered chunk in this object.",
+                                default=-1)
+
+  def Initialize(self):
+    # The rightmost chunk we've seen so far. We'll use this to keep track of
+    # what the biggest possible size this file could be is.
+    self.last_chunk = self.Get(self.Schema.LAST_CHUNK)
+    super(AFF4SparseIndex, self).Initialize()
+
+  def _GetChunkForWriting(self, chunk):
+    """Look in the datastore for a chunk, and create it if it isn't there."""
+    chunk_name = self.urn.Add(self.CHUNK_ID_TEMPLATE % chunk)
+    try:
+      fd = self.chunk_cache.Get(chunk_name)
+    except KeyError:
+      # Try and get a lock on the chunk.
+      fd = aff4.FACTORY.OpenWithLock(chunk_name, token=self.token)
+      # If the chunk didn't exist in the datastore, create it.
+      if fd.Get(fd.Schema.LAST) is None:
+        # Each time we create a new chunk, we grow in size.
+        self.size += self.chunksize
+        self._dirty = True
+        fd = aff4.FACTORY.Create(chunk_name, "AFF4MemoryStream", mode="rw",
+                                 token=self.token)
+      self.chunk_cache.Put(chunk_name, fd)
+
+      # Keep track of the biggest chunk_number we've seen so far.
+      if chunk > self.last_chunk:
+        self.last_chunk = chunk
+        self._dirty = True
+
+    return fd
+
+  def ChunkExists(self, chunk_number):
+    """Do we have this chunk in the index?"""
+    try:
+      self._GetChunkForReading(chunk_number)
+      return True
+    except aff4.ChunkNotFoundError:
+      return False
+
+  def Write(self, data):
+    """Write data to the file."""
+    self._dirty = True
+    if not isinstance(data, bytes):
+      raise IOError("Cannot write unencoded string.")
+    while data:
+      data = self._WritePartial(data)
+
+  def Read(self, length):
+    """Read a block of data from the file."""
+    result = ""
+
+    # The total available size in the file
+    length = int(length)
+    # Make sure we don't read past the "end" of the file. We say the end is the
+    # end of the last chunk. If we do try and read past the end, we should
+    # return an empty string.
+    # The end of the file is the *end* of the last chunk, so we add one here.
+    length = min(length,
+                 ((self.last_chunk + 1) * self.chunksize) - self.offset)
+
+    while length > 0:
+      data = self._ReadPartial(length)
+      if not data:
+        break
+
+      length -= len(data)
+      result += data
+
+    return result
+
+  def Flush(self, sync=True):
+    if self._dirty:
+      self.Set(self.Schema.LAST_CHUNK, rdfvalue.RDFInteger(self.last_chunk))
+    super(AFF4SparseIndex, self).Flush(sync=sync)
+
+
+class LabelSet(aff4.AFF4Object):
+  """An aff4 object which manages a set of labels.
+
+  This object has no actual attributes, it simply manages the set.
   """
 
-  # Value to put in the cell for index hits.
+  # We expect the set to be quite small, so we simply store it as a collection
+  # attributes of the form "index:label_<label>" all unversioned (ts = 0).
+
   PLACEHOLDER_VALUE = "X"
 
-  def __init__(self, urn, **kwargs):
-    # Never read anything directly from the table by forcing an empty clone.
-    kwargs["clone"] = {}
-    super(AFF4Index, self).__init__(urn, **kwargs)
+  ATTRIBUTE_PREFIX = "index:label_"
+  ATTRIBUTE_PATTERN = "index:label_%s"
 
-    # We collect index data here until we flush.
+  # Location of the default set of labels, used to keep tract of active labels
+  # for clients.
+  CLIENT_LABELS_URN = "aff4:/index/labels/client_set"
+
+  def __init__(self, urn, **kwargs):
+    super(LabelSet, self).__init__(urn=self.CLIENT_LABELS_URN, **kwargs)
+
     self.to_set = set()
     self.to_delete = set()
 
   def Flush(self, sync=False):
     """Flush the data to the index."""
-    super(AFF4Index, self).Flush(sync=sync)
+    super(LabelSet, self).Flush(sync=sync)
 
-    # Remove entries from deletion set that are going to be added anyway.
     self.to_delete = self.to_delete.difference(self.to_set)
 
-    # Convert sets into dicts that MultiSet handles.
-    to_delete = dict(zip(self.to_delete,
-                         self.PLACEHOLDER_VALUE*len(self.to_delete)))
-    to_set = dict(zip(self.to_set, self.PLACEHOLDER_VALUE*len(self.to_set)))
+    to_set = dict(zip(self.to_set, self.PLACEHOLDER_VALUE * len(self.to_set)))
 
-    data_store.DB.MultiSet(self.urn, to_set, to_delete=to_delete,
-                           token=self.token, replace=True, sync=sync)
+    if to_set or self.to_delete:
+      data_store.DB.MultiSet(self.urn,
+                             to_set,
+                             to_delete=list(self.to_delete),
+                             timestamp=0,
+                             token=self.token,
+                             replace=True,
+                             sync=sync)
     self.to_set = set()
     self.to_delete = set()
 
   def Close(self, sync=False):
     self.Flush(sync=sync)
-    super(AFF4Index, self).Close(sync=sync)
+    super(LabelSet, self).Close(sync=sync)
 
-  def Add(self, urn, attribute, value):
-    """Add the attribute of an AFF4 object to the index.
+  def Add(self, label):
+    self.to_set.add(self.ATTRIBUTE_PATTERN % label)
 
-    Args:
-      urn: The URN of the AFF4 object this attribute belongs to.
-      attribute: The attribute to add to the index.
-      value: The value of the attribute to index.
+  def Remove(self, label):
+    self.to_delete.add(self.ATTRIBUTE_PATTERN % label)
 
-    Raises:
-      RuntimeError: If a bad URN is passed in.
-    """
-    if not isinstance(urn, rdfvalue.RDFURN):
-      raise RuntimeError("Bad urn parameter for index addition.")
-    column_name = "index:%s:%s:%s" % (
-        attribute.predicate, value.lower(), urn)
-    self.to_set.add(column_name)
-
-  def Query(self, attributes, regex, limit=100):
-    """Query the index for the attribute.
-
-    Args:
-      attributes: A list of attributes to query for.
-      regex: The regex to search this attribute.
-      limit: A (start, length) tuple of integers representing subjects to
-          return. Useful for paging. If its a single integer we take it as the
-          length limit (start=0).
-    Returns:
-      A list of RDFURNs which match the index search.
-    """
-    # Make the regular expressions.
-    regexes = ["index:%s:%s:.*" % (a.predicate, regex.lower())
-               for a in attributes]
-    start = 0
-    try:
-      start, length = limit
-    except TypeError:
-      length = limit
-
-    # Get all the hits
-
-    index_hits = set()
-    for col, _, _ in data_store.DB.ResolveRegex(
-        self.urn, regexes, token=self.token,
-        timestamp=data_store.DB.ALL_TIMESTAMPS):
-      # Extract URN from the column_name.
-      index_hits.add(rdfvalue.RDFURN(col.rsplit("aff4:/", 1)[1]))
-
-    hits = []
-    for i, hit in enumerate(index_hits):
-      if i < start: continue
-      hits.append(hit)
-
-      if i >= start + length - 1:
-        break
-
-    return hits
-
-  def _QueryRaw(self, regex):
-    return set([(x, y) for (y, x, _) in data_store.DB.ResolveRegex(
-        self.urn, regex, token=self.token,
-        timestamp=data_store.DB.ALL_TIMESTAMPS)])
-
-  def DeleteAttributeIndexesForURN(self, attribute, value, urn):
-    """Remove all entries for a given attribute referring to a specific urn."""
-    if not isinstance(urn, rdfvalue.RDFURN):
-      raise RuntimeError("Bad urn parameter for index deletion.")
-    column_name = "index:%s:%s:%s" % (
-        attribute.predicate, value.lower(), urn)
-    self.to_delete.add(column_name)
+  def ListLabels(self):
+    # Flush, so that any pending changes are visible.
+    if self.to_set or self.to_delete:
+      self.Flush(sync=True)
+    result = []
+    for attribute, _, _ in data_store.DB.ResolvePrefix(self.urn,
+                                                       self.ATTRIBUTE_PREFIX,
+                                                       token=self.token):
+      result.append(attribute[len(self.ATTRIBUTE_PREFIX):])
+    return sorted(result)
 
 
-class TempFile(aff4.AFF4MemoryStream):
-  """A temporary file (with a random URN) to store an RDFValue."""
+class TempMemoryFile(aff4.AFF4MemoryStream):
+  """A temporary AFF4MemoryStream-based file with a random URN."""
 
   def __init__(self, urn, **kwargs):
     if urn is None:
       urn = rdfvalue.RDFURN("aff4:/tmp").Add("%X" % utils.PRNG.GetULong())
 
-    super(TempFile, self).__init__(urn, **kwargs)
+    super(TempMemoryFile, self).__init__(urn, **kwargs)
+
+
+class TempImageFile(aff4.AFF4Image):
+  """A temporary file AFF4Image-based file with a random URN."""
+
+  def __init__(self, urn, **kwargs):
+    if urn is None:
+      urn = rdfvalue.RDFURN("aff4:/tmp").Add("%X" % utils.PRNG.GetULong())
+
+    super(TempImageFile, self).__init__(urn, **kwargs)

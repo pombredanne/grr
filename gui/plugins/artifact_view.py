@@ -1,24 +1,17 @@
 #!/usr/bin/env python
 """This plugin adds artifact functionality to the UI."""
 
-import itertools
-import StringIO
-
 from grr.gui import renderers
-from grr.gui.plugins import fileview
 from grr.gui.plugins import forms
 from grr.gui.plugins import semantic
-from grr.lib import aff4
-from grr.lib import artifact
-from grr.lib import artifact_lib
+from grr.lib import artifact_registry
 from grr.lib import parsers
-from grr.lib import rdfvalue
 
 
 class ArtifactListRenderer(forms.MultiSelectListRenderer):
   """Renderer for listing the available Artifacts."""
 
-  type = rdfvalue.ArtifactName
+  type = artifact_registry.ArtifactName
 
   artifact_template = ("""
           <div id='{{unique|escape}}_artifact_description'>
@@ -32,8 +25,8 @@ class ArtifactListRenderer(forms.MultiSelectListRenderer):
               <tr><td>Links<td><div name='artifact_links'/></tr>
               <tr><td>Output Type<td><div name='artifact_output_type'/></tr>
             </table>
-            <h5>Artifact Collectors</h5>
-            <table name='artifact_collectors'>
+            <h5>Artifact Sources</h5>
+            <table name='artifact_sources'>
               <tbody></tbody>
             </table>
             <h5>Artifact Processors</h5>
@@ -43,7 +36,7 @@ class ArtifactListRenderer(forms.MultiSelectListRenderer):
           </div>""")
 
   layout_template = (
-      """<div class="control-group">"""
+      """<div class="form-group">"""
       + forms.TypeDescriptorFormRenderer.default_description_view + """
   <div id='{{unique|escape}}_artifact_renderer' class="controls">
   <div>
@@ -87,35 +80,34 @@ class ArtifactListRenderer(forms.MultiSelectListRenderer):
   def Layout(self, request, response):
     """Get available artifact information for display."""
     # Get all artifacts that aren't Bootstrap and aren't the base class.
-    self.artifacts = {}
-    artifact.LoadArtifactsFromDatastore(token=request.token)
-    for arifact_name, artifact_cls in artifact_lib.Artifact.classes.items():
-      if artifact_cls is not artifact_lib.Artifact.top_level_class:
-        if set(["Bootstrap"]).isdisjoint(artifact_cls.LABELS):
-          self.artifacts[arifact_name] = artifact_cls
-    self.labels = artifact_lib.ARTIFACT_LABELS
+    self.labels = artifact_registry.Artifact.ARTIFACT_LABELS
+    artifact_dict = {}
 
     # Convert artifacts into a dict usable from javascript.
-    artifact_dict = {}
-    for artifact_name, artifact_cls in self.artifacts.items():
-      if artifact_name == "Artifact":
+    for art in artifact_registry.REGISTRY.GetArtifacts(
+        reload_datastore_artifacts=True):
+      if "Bootstrap" in art.labels:
         continue
-      artifact_dict[artifact_name] = artifact_cls.ToExtendedDict()
+
+      art_dict = art.ToExtendedDict()
+      # We don't use art.name here since it isn't JSON serializable, the name
+      # inside the extended dict has already been converted, so use that.
+      art_name = art_dict["name"]
+      artifact_dict[art_name] = art_dict
       processors = []
-      for processor in parsers.Parser.GetClassesByArtifact(artifact_name):
+      for processor in parsers.Parser.GetClassesByArtifact(art_name):
         processors.append({"name": processor.__name__,
                            "output_types": processor.output_types,
                            "doc": processor.GetDescription()})
-      artifact_dict[artifact_name]["processors"] = processors
+      artifact_dict[art_name]["processors"] = processors
 
     # Skip the our parent and call the TypeDescriptorFormRenderer direct.
     response = renderers.TypeDescriptorFormRenderer.Layout(self, request,
                                                            response)
-    return self.CallJavascript(response, "ArtifactListRenderer.Layout",
-                               prefix=self.prefix,
-                               artifacts=artifact_dict,
-                               supported_os=artifact_lib.SUPPORTED_OS_LIST,
-                               labels=self.labels)
+    return self.CallJavascript(
+        response, "ArtifactListRenderer.Layout", prefix=self.prefix,
+        artifacts=artifact_dict, labels=self.labels,
+        supported_os=artifact_registry.Artifact.SUPPORTED_OS_LIST)
 
 
 class ArtifactRDFValueRenderer(semantic.RDFValueRenderer):
@@ -128,17 +120,13 @@ class ArtifactRDFValueRenderer(semantic.RDFValueRenderer):
 <div id={{unique|escape}}_artifact_description>"""
       + ArtifactListRenderer.artifact_template + """
 </div>
-<script>
-  var description_element = "{{unique|escapejs}}_artifact_description";
-  var artifact_obj = JSON.parse("{{this.artifact_str|escapejs}}");
-  grr.artifact_view.renderArtifactFromObject(artifact_obj, description_element);
-  $('div[name=artifact_name]').hide();   // Remove heading to clean up display.
-</script>
 """)
 
   def Layout(self, request, response):
     self.artifact_str = self.proxy.ToPrettyJson()
-    super(ArtifactRDFValueRenderer, self).Layout(request, response)
+    response = super(ArtifactRDFValueRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "ArtifactRDFValueRenderer.Layout",
+                               artifact_str=self.artifact_str)
 
 
 class ArtifactRawRDFValueRenderer(semantic.RDFValueRenderer):
@@ -154,118 +142,11 @@ class ArtifactRawRDFValueRenderer(semantic.RDFValueRenderer):
     super(ArtifactRawRDFValueRenderer, self).Layout(request, response)
 
 
-class ArtifactManagerView(renderers.TableRenderer):
+class ArtifactManagerView(renderers.AngularDirectiveRenderer):
   """Artifact Manager table with toolbar."""
 
   description = "Artifact Manager"
   behaviours = frozenset(["Configuration"])
   order = 50
 
-  toolbar = "ArtifactManagerToolbar"
-
-  def __init__(self, **kwargs):
-    super(ArtifactManagerView, self).__init__(**kwargs)
-    self.AddColumn(semantic.RDFValueColumn("Artifact Name", width="5%"))
-    self.AddColumn(semantic.RDFValueColumn(
-        "Artifact Details", width="50%", renderer=ArtifactRDFValueRenderer))
-    self.AddColumn(semantic.RDFValueColumn(
-        "Artifact Raw", width="40%", renderer=ArtifactRawRDFValueRenderer))
-
-  def BuildTable(self, start_row, end_row, request):
-    """Builds table artifacts."""
-    artifact_urn = rdfvalue.RDFURN("aff4:/artifact_store")
-    try:
-      collection = aff4.FACTORY.Open(artifact_urn,
-                                     aff4_type="RDFValueCollection",
-                                     token=request.token)
-    except IOError:
-      return
-
-    self.size = len(collection)
-    row_index = start_row
-    for value in itertools.islice(collection, start_row, end_row):
-      self.AddCell(row_index, "Artifact Name", value.name)
-      self.AddCell(row_index, "Artifact Details", value)
-      self.AddCell(row_index, "Artifact Raw", value)
-      row_index += 1
-
-  def Layout(self, request, response):
-    """Populate the table state with the request."""
-    if self.toolbar:
-      tb_cls = renderers.Renderer.classes[self.toolbar]
-      tb_cls().Layout(request, response)
-    return super(ArtifactManagerView, self).Layout(request, response)
-
-
-class ArtifactManagerToolbar(renderers.TemplateRenderer):
-  """A navigation enhancing toolbar.
-
-  Internal State:
-    - aff4_path: The path we are viewing now in the table.
-  """
-  post_parameters = ["aff4_path"]
-  event_queue = "file_select"
-
-  layout_template = renderers.Template("""
-<ul id="toolbar_{{unique|escape}}" class="breadcrumb">
-  <li>
-    <button id='{{unique|escape}}_upload' class="btn"
-      title="Upload Artifacts as JSON"
-      data-toggle="modal" data-target="#upload_dialog_{{unique|escape}}">
-      <img src='/static/images/upload.png' class='toolbar_icon'>
-    </button>
-  </li>
-</ul>
-
-<div id="upload_dialog_{{unique|escape}}" class="modal hide" tabindex="-1"
-  role="dialog" aria-hidden="true">
-  <div class="modal-header">
-    <button id="upload_artifact_btn_{{unique|escape}}" type="button"
-    class="close" data-dismiss="modal" aria-hidden="true">
-      x</button>
-    <h3>Upload File</h3>
-  </div>
-  <div class="modal-body" id="upload_dialog_body_{{unique|escape}}"></div>
-  <div class="modal-footer">
-    <button id="upload_artifact_close_btn_{{unique|escape}}" class="btn"
-    data-dismiss="modal" aria-hidden="true">Close</button>
-  </div>
-</div>
-
-<script>
-
-$("#upload_dialog_{{unique|escapejs}}").on("show", function () {
-  grr.layout("ArtifactJsonUploadView",
-    "upload_dialog_body_{{unique|escapejs}}");
-});
-
-</script>
-""")
-
-
-class ArtifactJsonUploadView(fileview.UploadView):
-  """Renders a binary upload page."""
-  post_parameters = []
-  upload_handler = "ArtifactUploadHandler"
-  storage_path = "aff4:/artifact_store"
-
-
-class ArtifactUploadHandler(fileview.UploadHandler):
-  """Handles upload of a binary config file such as a driver."""
-
-  def RenderAjax(self, request, response):
-    """Handle the upload via ajax."""
-    try:
-      self.uploaded_file = request.FILES.items()[0][1]
-      content = StringIO.StringIO()
-      for chunk in self.uploaded_file.chunks():
-        content.write(chunk)
-      self.dest_path = artifact.UploadArtifactJsonFile(
-          content.getvalue(), token=request.token)
-
-      return renderers.TemplateRenderer.Layout(self, request, response,
-                                               self.success_template)
-    except (IOError, artifact_lib.ArtifactDefinitionError) as e:
-      self.error = "Could not write artifact to database %s" % e
-    return renderers.TemplateRenderer.Layout(self, request, response,
-                                             self.error_template)
+  directive = "grr-artifact-manager-view"

@@ -3,16 +3,20 @@
 
 import re
 
-from grr.lib import artifact_lib
+from grr.lib import artifact_utils
 from grr.lib import parsers
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import standard as rdf_standard
 
 
 class WindowsPersistenceMechanismsParser(parsers.ArtifactFilesParser):
   """Turn various persistence objects into PersistenceFiles."""
   output_types = ["PersistenceFile"]
   supported_artifacts = ["WindowsPersistenceMechanisms"]
+  # Required for environment variable expansion
+  knowledgebase_dependencies = ["environ_systemdrive", "environ_systemroot"]
 
   def __init__(self):
     # Service keys have peculiar ways of specifying systemroot, these regexes
@@ -39,8 +43,8 @@ class WindowsPersistenceMechanismsParser(parsers.ArtifactFilesParser):
                     path, count=1)
       path = re.sub(self.system32_re, r"%systemroot%\\system32",
                     path, count=1)
-      full_path = artifact_lib.ExpandWindowsEnvironmentVariables(path, kb)
-      pathspecs.append(rdfvalue.PathSpec(
+      full_path = artifact_utils.ExpandWindowsEnvironmentVariables(path, kb)
+      pathspecs.append(rdf_paths.PathSpec(
           path=full_path, pathtype=pathtype))
 
     return pathspecs
@@ -50,7 +54,7 @@ class WindowsPersistenceMechanismsParser(parsers.ArtifactFilesParser):
     pathspecs = []
     source_urn = None
 
-    if isinstance(persistence, rdfvalue.ServiceInformation):
+    if isinstance(persistence, rdf_client.WindowsServiceInformation):
       if persistence.HasField("registry_key"):
         source_urn = persistence.registry_key
       if persistence.HasField("binary"):
@@ -60,14 +64,12 @@ class WindowsPersistenceMechanismsParser(parsers.ArtifactFilesParser):
                                        download_pathtype, knowledge_base)
       # TODO(user): handle empty image_path driver default
 
-    if isinstance(persistence, rdfvalue.StatEntry) and persistence.HasField(
+    if isinstance(persistence, rdf_client.StatEntry) and persistence.HasField(
         "registry_type"):
       pathspecs = self._GetFilePaths(persistence.registry_data.string,
                                      download_pathtype, knowledge_base)
       source_urn = persistence.aff4path
 
     for pathspec in pathspecs:
-      yield rdfvalue.PersistenceFile(pathspec=pathspec,
-                                     source_urn=source_urn)
-
-
+      yield rdf_standard.PersistenceFile(pathspec=pathspec,
+                                         source_urn=source_urn)

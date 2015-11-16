@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
+"""OSX specific actions.
 
-"""OSX specific actions."""
-
+Most of these actions share an interface (in/out rdfvalues) with linux actions
+of the same name. OSX-only actions are registered with the server via
+libs/server_stubs.py
+"""
 
 
 import ctypes
@@ -22,11 +24,11 @@ from grr.client import client_utils_common
 from grr.client import client_utils_osx
 from grr.client.client_actions import standard
 from grr.client.osx.objc import ServiceManagement
-from grr.client.vfs_handlers import memory
 
 from grr.lib import config_lib
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import protodict as rdf_protodict
 from grr.parsers import osx_launchd
 
 
@@ -48,9 +50,11 @@ class UnsupportedOSVersionError(Error):
 #       u_char  sdl_slen;       /* link layer selector length */
 #       char    sdl_data[12];   /* minimum work area, can be larger;
 #                                  contains both if name and ll address */
-#       u_short sdl_rcf;        /* source routing control */
-#       u_short sdl_route[16];  /* source routing information */
 # };
+
+
+# Interfaces can have names up to 15 chars long and sdl_data contains name + mac
+# but no separators - we need to make sdl_data at least 15+6 bytes.
 
 
 class Sockaddrdl(ctypes.Structure):
@@ -63,10 +67,8 @@ class Sockaddrdl(ctypes.Structure):
       ("sdl_nlen", ctypes.c_ubyte),
       ("sdl_alen", ctypes.c_ubyte),
       ("sdl_slen", ctypes.c_ubyte),
-      ("sdl_data", ctypes.c_char * 12),
-      ("sdl_rcf", ctypes.c_ushort),
-      ("sdl_route", ctypes.c_char * 16)
-      ]
+      ("sdl_data", ctypes.c_ubyte * 24),
+  ]
 
 # struct sockaddr_in {
 #         __uint8_t       sin_len;
@@ -85,7 +87,7 @@ class Sockaddrin(ctypes.Structure):
       ("sin_port", ctypes.c_ushort),
       ("sin_addr", ctypes.c_ubyte * 4),
       ("sin_zero", ctypes.c_char * 8)
-      ]
+  ]
 
 # struct sockaddr_in6 {
 #         __uint8_t       sin6_len;       /* length of this struct */
@@ -106,7 +108,7 @@ class Sockaddrin6(ctypes.Structure):
       ("sin6_flowinfo", ctypes.c_ubyte * 4),
       ("sin6_addr", ctypes.c_ubyte * 16),
       ("sin6_scope_id", ctypes.c_ubyte * 4)
-      ]
+  ]
 
 
 # struct ifaddrs   *ifa_next;         /* Pointer to next struct */
@@ -131,12 +133,12 @@ setattr(Ifaddrs, "_fields_", [
     ("ifa_broadaddr", ctypes.POINTER(ctypes.c_char)),
     ("ifa_destaddr", ctypes.POINTER(ctypes.c_char)),
     ("ifa_data", ctypes.POINTER(ctypes.c_char))
-    ])
+])
 
 
 class EnumerateInterfaces(actions.ActionPlugin):
   """Enumerate all MAC addresses of all NICs."""
-  out_rdfvalue = rdfvalue.Interface
+  out_rdfvalue = rdf_client.Interface
 
   def Run(self, unused_args):
     """Enumerate all MAC addresses."""
@@ -158,23 +160,24 @@ class EnumerateInterfaces(actions.ActionPlugin):
         if iffamily == 0x2:     # AF_INET
           data = ctypes.cast(m.contents.ifa_addr, ctypes.POINTER(Sockaddrin))
           ip4 = "".join(map(chr, data.contents.sin_addr))
-          address_type = rdfvalue.NetworkAddress.Family.INET
-          address = rdfvalue.NetworkAddress(address_type=address_type,
-                                            packed_bytes=ip4)
+          address_type = rdf_client.NetworkAddress.Family.INET
+          address = rdf_client.NetworkAddress(address_type=address_type,
+                                              packed_bytes=ip4)
           addresses.setdefault(ifname, []).append(address)
 
         if iffamily == 0x12:    # AF_LINK
           data = ctypes.cast(m.contents.ifa_addr, ctypes.POINTER(Sockaddrdl))
           iflen = data.contents.sdl_nlen
           addlen = data.contents.sdl_alen
-          macs[ifname] = data.contents.sdl_data[iflen:iflen+addlen]
+          macs[ifname] = "".join(
+              map(chr, data.contents.sdl_data[iflen:iflen + addlen]))
 
         if iffamily == 0x1E:     # AF_INET6
           data = ctypes.cast(m.contents.ifa_addr, ctypes.POINTER(Sockaddrin6))
           ip6 = "".join(map(chr, data.contents.sin6_addr))
-          address_type = rdfvalue.NetworkAddress.Family.INET6
-          address = rdfvalue.NetworkAddress(address_type=address_type,
-                                            packed_bytes=ip6)
+          address_type = rdf_client.NetworkAddress.Family.INET6
+          address = rdf_client.NetworkAddress(address_type=address_type,
+                                              packed_bytes=ip6)
           addresses.setdefault(ifname, []).append(address)
       except ValueError:
         # Some interfaces don't have a iffamily and will raise a null pointer
@@ -198,7 +201,7 @@ class EnumerateInterfaces(actions.ActionPlugin):
 
 class GetInstallDate(actions.ActionPlugin):
   """Estimate the install date of this system."""
-  out_rdfvalue = rdfvalue.DataBlob
+  out_rdfvalue = rdf_protodict.DataBlob
 
   def Run(self, unused_args):
     for f in ["/var/log/CDIS.custom", "/var", "/private"]:
@@ -211,23 +214,9 @@ class GetInstallDate(actions.ActionPlugin):
     self.SendReply(integer=0)
 
 
-class EnumerateUsers(actions.ActionPlugin):
-  """Enumerates all the users on this system."""
-  out_rdfvalue = rdfvalue.User
-
-  def Run(self, unused_args):
-    """Enumerate all users on this machine."""
-    # TODO(user): Add /var/run/utmpx parsing as per linux
-    blacklist = ["Shared"]
-    for user in os.listdir("/Users"):
-      userdir = "/Users/{0}".format(user)
-      if user not in blacklist and os.path.isdir(userdir):
-        self.SendReply(username=user, homedir=userdir)
-
-
 class EnumerateFilesystems(actions.ActionPlugin):
   """Enumerate all unique filesystems local to the system."""
-  out_rdfvalue = rdfvalue.Filesystem
+  out_rdfvalue = rdf_client.Filesystem
 
   def Run(self, unused_args):
     """List all local filesystems mounted on this system."""
@@ -259,10 +248,10 @@ class EnumerateFilesystems(actions.ActionPlugin):
         continue
 
 
-class EnumerateRunningServices(actions.ActionPlugin):
+class OSXEnumerateRunningServices(actions.ActionPlugin):
   """Enumerate all running launchd jobs."""
   in_rdfvalue = None
-  out_rdfvalue = rdfvalue.Service
+  out_rdfvalue = rdf_client.OSXServiceInformation
 
   def GetRunningLaunchDaemons(self):
     """Get running launchd jobs from objc ServiceManagement framework."""
@@ -276,13 +265,13 @@ class EnumerateRunningServices(actions.ActionPlugin):
     Raises:
       UnsupportedOSVersionError: for OS X earlier than 10.6
     """
+    osxversion = client_utils_osx.OSXVersion()
+    version_array = osxversion.VersionAsMajorMinor()
 
-    self.osversion = client_utils_osx.OSXVersion().VersionAsFloat()
-
-    if self.osversion < 10.6:
+    if version_array[:2] < [10, 6]:
       raise UnsupportedOSVersionError(
-          "ServiceManagment API unsupported on < 10.6. This"
-          " client is %s" % self.osversion)
+          "ServiceManagment API unsupported on < 10.6. This client is %s" %
+          osxversion.VersionString())
 
     launchd_list = self.GetRunningLaunchDaemons()
 
@@ -295,37 +284,27 @@ class EnumerateRunningServices(actions.ActionPlugin):
     """Create the Service protobuf.
 
     Args:
-      job: Launcdjobdict from servicemanagement framework.
+      job: Launchdjobdict from servicemanagement framework.
     Returns:
-      sysinfo_pb2.Service proto
+      sysinfo_pb2.OSXServiceInformation proto
     """
-    rdf_job = rdfvalue.LaunchdJob(sessiontype=
-                                  job.get("LimitLoadToSessionType", ""),
-                                  lastexitstatus=job["LastExitStatus"].value,
-                                  timeout=job["TimeOut"].value,
-                                  ondemand=job["OnDemand"].value)
+    service = rdf_client.OSXServiceInformation(
+        label=job.get("Label"), program=job.get("Program"),
+        sessiontype=job.get("LimitLoadToSessionType"),
+        lastexitstatus=int(job["LastExitStatus"]),
+        timeout=int(job["TimeOut"]), ondemand=bool(job["OnDemand"]))
 
-    # Returns CFArray of CFStrings
-    args = job.get("ProgramArguments", "", stringify=False)
-    arg_values = []
-    if args:
-      for arg in args:
-        # Need to get .value so unicode is handled properly
-        arg_values.append(arg.value)
-      args = " ".join(arg_values)
+    for arg in job.get("ProgramArguments", "", stringify=False):
+      # Returns CFArray of CFStrings
+      service.args.Append(unicode(arg))
 
     mach_dict = job.get("MachServices", {}, stringify=False)
     for key, value in mach_dict.iteritems():
-      rdf_job.machservice.Append("%s:%s" % (key, value))
+      service.machservice.Append("%s:%s" % (key, value))
 
     job_mach_dict = job.get("PerJobMachServices", {}, stringify=False)
     for key, value in job_mach_dict.iteritems():
-      rdf_job.perjobmachservice.Append("%s:%s" % (key, value))
-
-    service = rdfvalue.Service(label=job.get("Label", ""),
-                               program=job.get("Program", ""),
-                               args=args,
-                               osx_launchd=rdf_job)
+      service.perjobmachservice.Append("%s:%s" % (key, value))
 
     if "PID" in job:
       service.pid = job["PID"].value
@@ -335,7 +314,7 @@ class EnumerateRunningServices(actions.ActionPlugin):
 
 class Uninstall(actions.ActionPlugin):
   """Remove the service that starts us at startup."""
-  out_rdfvalue = rdfvalue.DataBlob
+  out_rdfvalue = rdf_protodict.DataBlob
 
   def Run(self, unused_arg):
     """This kills us with no cleanups."""
@@ -376,7 +355,7 @@ class InstallDriver(actions.ActionPlugin):
   Note that only drivers with a signature that validates with
   client_config.DRIVER_SIGNING_CERT can be loaded.
   """
-  in_rdfvalue = rdfvalue.DriverInstallTemplate
+  in_rdfvalue = rdf_client.DriverInstallTemplate
 
   def _FindKext(self, path):
     """Find the .kext directory under path.
@@ -416,33 +395,8 @@ class InstallDriver(actions.ActionPlugin):
       driver_archive.extractall(kext_tmp_dir)
       # Now load it.
       kext_path = self._FindKext(kext_tmp_dir)
-      logging.debug("Loading kext {0}".format(kext_path))
+      logging.debug("Loading kext %s", kext_path)
       client_utils_osx.InstallDriver(kext_path)
-
-
-class GetMemoryInformation(actions.ActionPlugin):
-  """Loads the driver for memory access and returns a Stat for the device."""
-
-  in_rdfvalue = rdfvalue.PathSpec
-  out_rdfvalue = rdfvalue.MemoryInformation
-
-  def Run(self, args):
-    """Run."""
-    # This action might crash the box so we need to flush the transaction log.
-    self.SyncTransactionLog()
-
-    # Do any initialization we need to do.
-    logging.debug("Querying device %s", args.path)
-    mem_dev = open(args.path, "rb")
-
-    result = rdfvalue.MemoryInformation(
-        cr3=memory.OSXMemory.GetCR3(mem_dev),
-        device=rdfvalue.PathSpec(
-            path=args.path,
-            pathtype=rdfvalue.PathSpec.PathType.MEMORY))
-    for start, length in memory.OSXMemory.GetMemoryMap(mem_dev):
-      result.runs.Append(offset=start, length=length)
-    self.SendReply(result)
 
 
 class UninstallDriver(actions.ActionPlugin):
@@ -451,7 +405,7 @@ class UninstallDriver(actions.ActionPlugin):
   Only if the request contains a valid signature the driver will be uninstalled.
   """
 
-  in_rdfvalue = rdfvalue.DriverInstallTemplate
+  in_rdfvalue = rdf_client.DriverInstallTemplate
 
   def Run(self, args):
     """Unloads a driver."""
@@ -465,16 +419,7 @@ class UninstallDriver(actions.ActionPlugin):
 class UpdateAgent(standard.ExecuteBinaryCommand):
   """Updates the GRR agent to a new version."""
 
-  in_rdfvalue = rdfvalue.ExecuteBinaryRequest
-  out_rdfvalue = rdfvalue.ExecuteBinaryResponse
-
-  def Run(self, args):
-    """Run."""
-    pub_key = config_lib.CONFIG["Client.executable_signing_public_key"]
-    if not args.executable.Verify(pub_key):
-      raise OSError("Executable signing failure.")
-
-    path = self.WriteBlobToFile(args.executable, args.write_path, ".pkg")
+  def ProcessFile(self, path, args):
 
     cmd = "/usr/sbin/installer"
     cmd_args = ["-pkg", path, "-target", "/"]
@@ -484,15 +429,13 @@ class UpdateAgent(standard.ExecuteBinaryCommand):
                                       bypass_whitelist=True)
     (stdout, stderr, status, time_used) = res
 
-    self.CleanUp(path)
-
     # Limit output to 10MB so our response doesn't get too big.
     stdout = stdout[:10 * 1024 * 1024]
     stderr = stderr[:10 * 1024 * 1024]
 
-    result = rdfvalue.ExecuteBinaryResponse(stdout=stdout,
-                                            stderr=stderr,
-                                            exit_status=status,
-                                            # We have to return microseconds.
-                                            time_used=int(1e6 * time_used))
+    result = rdf_client.ExecuteBinaryResponse(stdout=stdout,
+                                              stderr=stderr,
+                                              exit_status=status,
+                                              # We have to return microseconds.
+                                              time_used=int(1e6 * time_used))
     self.SendReply(result)

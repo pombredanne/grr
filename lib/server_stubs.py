@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """Stubs of client actions which can not be loaded on the server.
 
 For example, some client actions require modules which only exist on the client
@@ -9,16 +8,17 @@ server.)
 
 
 from grr.client import actions
-from grr.lib import rdfvalue
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import protodict as rdf_protodict
 
 
 class WmiQuery(actions.ActionPlugin):
   """Runs a WMI query and returns the results to a server callback."""
-  in_rdfvalue = rdfvalue.WMIRequest
-  out_rdfvalue = rdfvalue.Dict
+  in_rdfvalue = rdf_client.WMIRequest
+  out_rdfvalue = rdf_protodict.Dict
 
 
-# The following are deprecated client actions which have been removed.
-class GetConfig(actions.ActionPlugin):
-  """Get configuration - DEPRECATED."""
-  out_rdfvalue = rdfvalue.GRRConfig
+class OSXEnumerateRunningServices(actions.ActionPlugin):
+  """Enumerate all running launchd jobs."""
+  in_rdfvalue = None
+  out_rdfvalue = rdf_client.OSXServiceInformation

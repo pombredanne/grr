@@ -18,7 +18,7 @@ LOGGER = None
 
 
 class GrrApplicationLogger(object):
-  """Code to emit DataAccessLogProto records.
+  """The GRR application logger.
 
   These records are used for machine readable authentication logging of security
   critical events.
@@ -46,7 +46,9 @@ class GrrApplicationLogger(object):
     return "%s:%s:%s" % (event_time, socket.gethostname(), os.getpid())
 
 
-class MemoryHandler(handlers.MemoryHandler):
+class PreLoggingMemoryHandler(handlers.BufferingHandler):
+  """Handler used before logging subsystem is initialized."""
+
   def shouldFlush(self, record):
     return len(self.buffer) >= self.capacity
 
@@ -56,9 +58,7 @@ class MemoryHandler(handlers.MemoryHandler):
     This is called when the buffer is really full, we just just drop one oldest
     message.
     """
-    if self.buffer and self.target:
-      message = self.buffer.pop(0)
-      self.target.handle(message)
+    self.buffer = self.buffer[-self.capacity:]
 
 
 class RobustSysLogHandler(handlers.SysLogHandler):
@@ -80,14 +80,14 @@ BASE_LOG_LEVELS = {
     "NTEventLogHandler": logging.CRITICAL,
     "StreamHandler": logging.ERROR,
     "RobustSysLogHandler": logging.CRITICAL,
-    }
+}
 
 VERBOSE_LOG_LEVELS = {
     "FileHandler": logging.DEBUG,
     "NTEventLogHandler": logging.INFO,
     "StreamHandler": logging.DEBUG,
     "RobustSysLogHandler": logging.INFO,
-    }
+}
 
 
 def SetLogLevels():
@@ -156,7 +156,7 @@ def LogInit():
   logging.debug("Initializing Logging subsystem.")
 
   if flags.FLAGS.verbose:
-  # verbose flag just sets the logging verbosity level.
+    # verbose flag just sets the logging verbosity level.
     config_lib.CONFIG.AddContext(
         "Debug Context",
         "This context is to allow verbose and debug output from "
@@ -164,16 +164,16 @@ def LogInit():
 
   # The root logger.
   logger = logging.getLogger()
-  memory_handler = [m for m in logger.handlers if
-                    m.__class__.__name__ == "MemoryHandler"]
+  memory_handlers = [m for m in logger.handlers
+                     if m.__class__.__name__ == "PreLoggingMemoryHandler"]
 
   # Clear all handers.
   logger.handlers = list(GetLogHandlers())
   SetLogLevels()
 
   # Now flush the old messages into the log files.
-  if memory_handler:
-    for record in memory_handler[0].buffer:
+  for handler in memory_handlers:
+    for record in handler.buffer:
       logger.handle(record)
 
 
@@ -193,6 +193,6 @@ def AppLogInit():
 # the logs into that. This ensures we do not lose any log messages during early
 # program start up.
 root_logger = logging.root
-root_logger.handlers = [MemoryHandler(capacity=1000)]
+root_logger.handlers = [PreLoggingMemoryHandler(1000)]
 root_logger.setLevel(logging.DEBUG)
 logging.info("Starting GRR Prelogging buffer.")

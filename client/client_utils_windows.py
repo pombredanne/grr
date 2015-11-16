@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Windows specific utils."""
 
 
@@ -19,8 +18,9 @@ import win32security
 from google.protobuf import message
 
 from grr.lib import config_lib
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 DACL_PRESENT = 1
@@ -49,7 +49,7 @@ def CanonicalPathToLocalPath(path):
   path = path.replace("/", "\\")
   m = re.match(r"\\([a-zA-Z]):(.*)$", path)
   if m:
-    path = "%s:\\%s" % (m.group(1), m.group(2))
+    path = "%s:\\%s" % (m.group(1), m.group(2).lstrip("\\"))
 
   return path
 
@@ -158,7 +158,7 @@ def WinFindProxies():
           # Per-protocol settings
           for p in proxy_server.split(";"):
             protocol, address = p.split("=", 1)
-                  # See if address has a type:// prefix
+            # See if address has a type:// prefix
 
             if not re.match("^([^/:]+)://", address):
               address = "%s://%s" % (protocol, address)
@@ -208,7 +208,9 @@ def WinGetRawDevice(path):
     raise IOError("No mountpoint for path: %s", path)
 
   if not path.startswith(mount_point):
-    raise IOError("path %s is not mounted under %s?" % (path, mount_point))
+    stripped_mp = mount_point.rstrip("\\")
+    if not path.startswith(stripped_mp):
+      raise IOError("path %s is not mounted under %s" % (path, mount_point))
 
   corrected_path = LocalPathToCanonicalPath(path[len(mount_point):])
   corrected_path = utils.NormalizePath(corrected_path)
@@ -217,9 +219,9 @@ def WinGetRawDevice(path):
   volume = LocalPathToCanonicalPath(volume)
 
   # The pathspec for the raw volume
-  result = rdfvalue.PathSpec(path=volume,
-                             pathtype=rdfvalue.PathSpec.PathType.OS,
-                             mount_point=mount_point.rstrip("\\"))
+  result = rdf_paths.PathSpec(path=volume,
+                              pathtype=rdf_paths.PathSpec.PathType.OS,
+                              mount_point=mount_point.rstrip("\\"))
 
   return result, corrected_path
 
@@ -294,7 +296,7 @@ class NannyController(object):
       return
 
     try:
-      return rdfvalue.GrrMessage(value)
+      return rdf_flows.GrrMessage(value)
     except message.Error:
       return
 
@@ -347,3 +349,65 @@ def KeepAlive():
 
   kernel32 = Kernel32().kernel32
   kernel32.SetThreadExecutionState(ctypes.c_int(es_system_required))
+
+
+def RtlGetVersion(os_version_info_struct):
+  """Wraps the lowlevel RtlGetVersion routine.
+
+  Args:
+    os_version_info_struct: instance of either a RTL_OSVERSIONINFOW structure
+                            or a RTL_OSVERSIONINFOEXW structure,
+                            ctypes.Structure-wrapped, with the
+                            dwOSVersionInfoSize field preset to
+                            ctypes.sizeof(self).
+
+  Raises:
+    WindowsError: if the underlaying routine fails.
+
+  See: https://msdn.microsoft.com/en-us/library/
+  windows/hardware/ff561910(v=vs.85).aspx .
+  """
+  rc = ctypes.windll.Ntdll.RtlGetVersion(ctypes.byref(os_version_info_struct))
+  if rc != 0:
+    raise exceptions.WindowsError("Getting Windows version failed.")
+
+
+class RtlOSVersionInfoExw(ctypes.Structure):
+  """Wraps the lowlevel RTL_OSVERSIONINFOEXW struct.
+
+  See: https://msdn.microsoft.com/en-us/library/
+  windows/hardware/ff563620(v=vs.85).aspx .
+  """
+  _fields_ = [("dwOSVersionInfoSize", ctypes.c_ulong),
+              ("dwMajorVersion", ctypes.c_ulong),
+              ("dwMinorVersion", ctypes.c_ulong),
+              ("dwBuildNumber", ctypes.c_ulong),
+              ("dwPlatformId", ctypes.c_ulong),
+              ("szCSDVersion", ctypes.c_wchar*128),
+              ("wServicePackMajor", ctypes.c_ushort),
+              ("wServicePackMinor", ctypes.c_ushort),
+              ("wSuiteMask", ctypes.c_ushort),
+              ("wProductType", ctypes.c_byte),
+              ("wReserved", ctypes.c_byte)]
+
+  def __init__(self, **kwargs):
+    kwargs["dwOSVersionInfoSize"] = ctypes.sizeof(self)
+    super(RtlOSVersionInfoExw, self).__init__(**kwargs)
+
+
+def KernelVersion():
+  """Gets the kernel version as string, eg. "5.1.2600".
+
+  Returns:
+    The kernel version, or "unknown" in the case of failure.
+  """
+  rtl_osversioninfoexw = RtlOSVersionInfoExw()
+  try:
+    RtlGetVersion(rtl_osversioninfoexw)
+  except exceptions.WindowsError:
+    return "unknown"
+
+  return "%d.%d.%d" % (rtl_osversioninfoexw.dwMajorVersion,
+                       rtl_osversioninfoexw.dwMinorVersion,
+                       rtl_osversioninfoexw.dwBuildNumber)
+

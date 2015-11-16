@@ -1,9 +1,10 @@
 #!/usr/bin/env python
-# Copyright 2013 Google Inc. All Rights Reserved.
 """Queries a Windows client for Volume Shadow Copy information."""
 from grr.lib import aff4
 from grr.lib import flow
-from grr.lib import rdfvalue
+from grr.lib.flows.general import filesystem
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 class ListVolumeShadowCopies(flow.GRRFlow):
@@ -37,11 +38,11 @@ class ListVolumeShadowCopies(flow.GRRFlow):
         #  \\.\HarddiskVolumeShadowCopy1 to the ListDirectory flow
         device_object = r"\\." + device_object[len(global_root):]
 
-        path_spec = rdfvalue.PathSpec(
+        path_spec = rdf_paths.PathSpec(
             path=device_object,
-            pathtype=rdfvalue.PathSpec.PathType.OS)
+            pathtype=rdf_paths.PathSpec.PathType.OS)
 
-        path_spec.Append(path="/", pathtype=rdfvalue.PathSpec.PathType.TSK)
+        path_spec.Append(path="/", pathtype=rdf_paths.PathSpec.PathType.TSK)
 
         self.Log("Listing Volume Shadow Copy device: %s.", device_object)
         self.CallClient("ListDirectory", pathspec=path_spec,
@@ -55,16 +56,21 @@ class ListVolumeShadowCopies(flow.GRRFlow):
 
   @flow.StateHandler()
   def ProcessListDirectory(self, responses):
+    """Processes the results of the ListDirectory client action.
+
+    Args:
+      responses: a flow Responses object.
+    """
+    if not responses.success:
+      raise flow.FlowError("Unable to list directory.")
+
     for response in responses:
-      urn = aff4.AFF4Object.VFSGRRClient.PathspecToURN(
-          response.pathspec, self.client_id)
-      fd = aff4.FACTORY.Create(urn, "VFSDirectory", mode="w",
-                               token=self.token)
+      stat_entry = rdf_client.StatEntry(response)
+      filesystem.CreateAFF4Object(
+          stat_entry, self.client_id, self.token, sync=False)
+      self.SendReply(stat_entry)
 
-      fd.Set(fd.Schema.PATHSPEC(response.pathspec))
-      fd.Set(fd.Schema.STAT(response))
-
-      fd.Close(sync=False)
+      aff4.FACTORY.Flush()
 
   @flow.StateHandler()
   def End(self):

@@ -8,6 +8,7 @@ Google proto implementation, and generate Semantic proto descriptors.
 This file contains interoperability code with the Google protocol buffer
 library.
 """
+
 import logging
 
 from grr.lib import rdfvalue
@@ -52,7 +53,7 @@ _SEMANTIC_PRIMITIVE_TO_FIELD_TYPE = dict(
     string=TYPE_STRING,
     integer=TYPE_INT64,
     unsigned_integer=TYPE_UINT64,
-    )
+)
 
 
 def DefineFromProtobuf(cls, protobuf):
@@ -76,6 +77,8 @@ def DefineFromProtobuf(cls, protobuf):
   # Support message descriptions
   if semantic_options.description and not cls.__doc__:
     cls.__doc__ = semantic_options.description
+
+  cls.union_field = semantic_options.union_field or None
 
   # We search through all the field descriptors and build type info
   # descriptors from them.
@@ -162,7 +165,7 @@ def DefineFromProtobuf(cls, protobuf):
       # TODO(user): support late binding here.
       if type_descriptor.type:
         # This traps the following problem:
-        # class Certificate(rdfvalue.RDFValueArray):
+        # class Certificate(rdf_protodict.RDFValueArray):
         #    protobuf = jobs_pb2.BlobArray
         #
 
@@ -189,16 +192,31 @@ def DefineFromProtobuf(cls, protobuf):
         if semantic_protobuf_primitive != field.message_type.name:
           raise rdfvalue.InitializeError(
               ("%s.%s: Conflicting primitive (%s) and semantic protobuf %s "
-               "which implements primitive protobuf (%s)") %(
+               "which implements primitive protobuf (%s)") % (
                    cls.__name__, field.name, field.message_type.name,
                    type_descriptor.type.__name__, semantic_protobuf_primitive))
 
     elif field.enum_type:  # It is an enum.
       enum_desc = field.enum_type
+      enum_dict = {}
+      enum_descriptions = {}
+      enum_labels = {}
+
+      for enum_value in enum_desc.values:
+        enum_dict[enum_value.name] = enum_value.number
+        description = enum_value.GetOptions().Extensions[
+            semantic_pb2.description]
+        enum_descriptions[enum_value.name] = description
+        labels = [label for label in
+                  enum_value.GetOptions().Extensions[semantic_pb2.label]]
+        enum_labels[enum_value.name] = labels
+
       enum_dict = dict((x.name, x.number) for x in enum_desc.values)
 
       type_descriptor = type_info.ProtoEnum(
-          enum_name=enum_desc.name, enum=enum_dict, **kwargs)
+          enum_name=enum_desc.name, enum=enum_dict,
+          enum_descriptions=enum_descriptions,
+          enum_labels=enum_labels, **kwargs)
 
       # Attach the enum container to the class for easy reference:
       setattr(cls, enum_desc.name, type_descriptor.enum_container)
@@ -207,7 +225,9 @@ def DefineFromProtobuf(cls, protobuf):
     if type_descriptor is not None:
       # If the field is repeated, wrap it in a ProtoList.
       if field.label == LABEL_REPEATED:
-        type_descriptor = type_info.ProtoList(type_descriptor)
+        options = field.GetOptions().Extensions[semantic_pb2.sem_type]
+        type_descriptor = type_info.ProtoList(type_descriptor,
+                                              labels=list(options.label))
 
       try:
         cls.AddDescriptor(type_descriptor)

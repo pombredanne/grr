@@ -2,6 +2,7 @@
 """Main Django renderer."""
 
 
+import importlib
 import os
 import pdb
 import time
@@ -11,21 +12,20 @@ from django import http
 from django import shortcuts
 from django import template
 from django.views.decorators import csrf
+import psutil
 import logging
 
-from grr import gui
+from grr.gui import http_api
 from grr.gui import renderers
+from grr.gui import urls
 from grr.gui import webauth
 from grr.lib import access_control
 from grr.lib import aff4
+from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import rdfvalue
 from grr.lib import registry
 from grr.lib import stats
-
-
-SERVER_NAME = "GRR Admin Console"
-DOCUMENT_ROOT = os.path.join(os.path.dirname(gui.__file__), "static")
 
 
 class ViewsInit(registry.InitHook):
@@ -59,10 +59,20 @@ def Homepage(request):
   renderers_js_files = set()
   for cls in renderers.Renderer.classes.values():
     if aff4.issubclass(cls, renderers.Renderer) and cls.__module__:
-      renderers_js_files.add(cls.__module__.split(".")[-1] + ".js")
+      module_components = cls.__module__.split(".")
+      # Only include files corresponding to renderers in "plugins" package.
+      if module_components[-2] == "plugins":
+        renderers_js_files.add(module_components[-1] + ".js")
 
-  context = {"title": SERVER_NAME,
-             "renderers_js": renderers_js_files}
+  create_time = psutil.Process(os.getpid()).create_time()
+  context = {"page_title": config_lib.CONFIG["AdminUI.page_title"],
+             "heading": config_lib.CONFIG["AdminUI.heading"],
+             "report_url": config_lib.CONFIG["AdminUI.report_url"],
+             "help_url": config_lib.CONFIG["AdminUI.help_url"],
+             "use_precompiled_js": config_lib.CONFIG[
+                 "AdminUI.use_precompiled_js"],
+             "renderers_js": renderers_js_files,
+             "timestamp": create_time}
   return shortcuts.render_to_response(
       "base.html", context, context_instance=template.RequestContext(request))
 
@@ -74,6 +84,7 @@ def RenderBinaryDownload(request):
   if not path or not filename:
     return AccessDenied("Error: Invalid path.")
   request.REQ = request.REQUEST
+
   def Generator():
     with aff4.FACTORY.Open(aff4_path, aff4_type="GRRSignedBlob",
                            token=BuildToken(request, 60)) as fd:
@@ -92,6 +103,13 @@ def RenderBinaryDownload(request):
                                content_type="binary/octet-stream")
   response["Content-Disposition"] = ("attachment; filename=%s" % filename)
   return response
+
+
+@webauth.SecurityCheck
+@renderers.ErrorHandler()
+def RenderApi(request):
+  """Handler for the /api/ requests."""
+  return http_api.RenderHttpResponse(request)
 
 
 @webauth.SecurityCheck
@@ -123,6 +141,8 @@ def RenderGenericRenderer(request):
 
   # Build the security token for this request
   request.token = BuildToken(request, renderer.max_execution_time)
+
+  request.canary_mode = "canary_mode" in request.COOKIES
 
   # Allow the renderer to check its own ACLs.
   renderer.CheckAccess(request)
@@ -156,12 +176,59 @@ def RenderGenericRenderer(request):
   if not isinstance(result, http.HttpResponse):
     raise RuntimeError("Renderer returned invalid response %r" % result)
 
-  # Prepend bad json to break json script inclusion attacks.
-  content_type = result.get("Content-Type", 0)
-  if content_type and "json" in content_type.lower():
-    result.content = ")]}\n" + result.content
-
   return result
+
+
+def RedirectToRemoteHelp(path):
+  """Redirect to GitHub-hosted documentation."""
+  target_path = os.path.join(config_lib.CONFIG["AdminUI.github_docs_location"],
+                             path.replace(".html", ".adoc"))
+
+  # We have to redirect via JavaScript to have access to and to preserve the
+  # URL hash. We don't know the hash part of the url on the server.
+  response = http.HttpResponse()
+  response.write("""
+<script>
+var friendly_hash = window.location.hash.replace('#_', '#').replace(/_/g, '-');
+window.location = '%s' + friendly_hash;
+</script>
+""" % target_path)
+  return response
+
+
+@webauth.SecurityCheck
+def RenderHelp(request, path, document_root=None, content_type=None):
+  """Either serves local help files or redirects to the remote ones."""
+  _ = document_root
+  _ = content_type
+
+  request.REQ = request.REQUEST
+
+  help_path = request.path.split("/", 2)[-1]
+  if not help_path:
+    return AccessDenied("Error: Invalid help path.")
+
+  try:
+    user_record = aff4.FACTORY.Open(
+        aff4.ROOT_URN.Add("users").Add(request.user), "GRRUser",
+        token=BuildToken(request, 60))
+
+    settings = user_record.Get(user_record.Schema.GUI_SETTINGS)
+  except IOError:
+    settings = aff4.GRRUser.SchemaCls.GUI_SETTINGS()
+
+  if settings.docs_location == settings.DocsLocation.REMOTE:
+    # Proxy remote documentation.
+    return RedirectToRemoteHelp(help_path)
+  else:
+    # Serve prebuilt docs using static handler. To do that we have
+    # to resolve static handler's name to an actual function object.
+    static_handler_components = urls.static_handler.split(".")
+    static_handler_module = importlib.import_module(".".join(
+        static_handler_components[0:-1]))
+    static_handler = getattr(static_handler_module,
+                             static_handler_components[-1])
+    return static_handler(request, path, document_root=urls.help_root)
 
 
 def BuildToken(request, execution_time):

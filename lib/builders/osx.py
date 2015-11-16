@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """An implementation of an OSX client builder."""
+import getpass
 import os
 import shutil
 import subprocess
@@ -15,22 +16,26 @@ class DarwinClientBuilder(build.ClientBuilder):
     """Initialize the Mac OS X client builder."""
     super(DarwinClientBuilder, self).__init__(context=context)
     self.context.append("Target:Darwin")
-    self.build_src_dir = config_lib.CONFIG.Get("ClientBuilder.build_src_dir",
-                                               context=self.context)
+    self.build_src_dir = os.path.join(config_lib.CONFIG.Get(
+        "ClientBuilder.source", context=self.context), "grr")
+    self.pkg_dir = config_lib.CONFIG.Get(
+        "ClientBuilder.package_dir", context=self.context)
 
-  def MakeExecutableTemplate(self):
-    """Create the executable template.
-
-    This technique allows the client build to be carried out once on the
-    supported platform (e.g. windows with MSVS), but the deployable installer
-    can be build on any platform which supports python.
-    """
+  def MakeExecutableTemplate(self, output_file=None):
+    """Create the executable template."""
+    super(DarwinClientBuilder, self).MakeExecutableTemplate(
+        output_file=output_file)
     self.MakeBuildDirectory()
     self.BuildWithPyInstaller()
-    self.BuildInstallerPkg()
+    self.CopyMissingModules()
+    self.BuildInstallerPkg(self.template_file)
+
+  def MakeBuildDirectory(self):
+    super(DarwinClientBuilder, self).MakeBuildDirectory()
+    self.CleanDirectory(self.pkg_dir)
 
   # WARNING: change with care since the PackageMaker files are fragile!
-  def BuildInstallerPkg(self):
+  def BuildInstallerPkg(self, output_file):
     """Builds a package (.pkg) using PackageMaker."""
     build_files_dir = os.path.join(self.build_src_dir,
                                    "config", "macosx", "client")
@@ -119,25 +124,26 @@ class DarwinClientBuilder(build.ClientBuilder):
         config_lib.CONFIG.Get("Client.name", context=self.context),
         config_lib.CONFIG.Get("Client.version_string", context=self.context))
 
-    output_pkg_path = os.path.join(config_lib.CONFIG.Get(
-        "ClientBuilder.package_dir", context=self.context), pkg)
+    output_pkg_path = os.path.join(self.pkg_dir, pkg)
     command = [
         config_lib.CONFIG.Get("ClientBuilder.package_maker_path",
                               context=self.context),
         "--doc", out_pmdoc_dir, "--out", output_pkg_path]
 
     print "Running: %s " % " ".join(command)
-    subprocess.call(command)
+    ret = subprocess.call(command)
+    if ret != 0:
+      msg = "PackageMaker returned an error (%d)." % ret
+      print msg
+      raise RuntimeError(msg)
 
-    output_tmpl_path = config_lib.CONFIG.Get("ClientBuilder.template_path",
-                                             context=self.context)
     print "Copying output to templates location: %s -> %s" % (output_pkg_path,
-                                                              output_tmpl_path)
-    self.EnsureDirExists(os.path.dirname(output_tmpl_path))
-    shutil.copyfile(output_pkg_path, output_tmpl_path)
+                                                              output_file)
+    self.EnsureDirExists(os.path.dirname(output_file))
+    shutil.copyfile(output_pkg_path, output_file)
 
     # Change the owner, group and permissions of the binaries back.
     command = ["sudo", "/usr/sbin/chown", "-R",
-               "grr-build:staff", self.build_dir]
+               "%s:staff" % getpass.getuser(), self.build_dir]
     print "Running: %s" % " ".join(command)
     subprocess.call(command)

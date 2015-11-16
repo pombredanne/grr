@@ -1,0 +1,45 @@
+check_id: 'SW-CHECK'
+match: 'ANY'
+method:
+  - match: 'ANY'
+    target:
+      os: ['Linux']
+    hint:
+      problem: 'l337 software installed'
+      format: '{name} {version} is installed'
+    probe:
+      - artifact: 'DebianPackagesStatus'
+        mode: 'PARALLEL'
+        filters:
+          - type: 'ObjectFilter'
+            expression: 'name contains "netcat"'
+          - type: 'ObjectFilter'
+            expression: 'name contains "ncat"'
+  - match: 'ANY'
+    target:
+      os: ['Windows']
+    hint:
+      problem: 'Malicious software.'
+      format: '{name} {version} is installed'
+    probe:
+      - artifact: 'WMIInstalledSoftware'
+        filters:
+          - type: 'ObjectFilter'
+            expression: 'name contains "Java"'
+        hint:
+          problem: 'Old Java installation.'
+      - artifact: 'WMIInstalledSoftware'
+        filters:
+          - type: 'ObjectFilter'
+            expression: 'name contains "Adware"'
+  - match: 'ANY'
+    target:
+      label: ['foo']
+    hint:
+      problem: 'Sudo not installed'
+    probe:
+      - artifact: 'DebianPackagesStatus'
+        match: 'NONE'
+        filters:
+          - type: 'ObjectFilter'
+            expression: 'name contains "sudo"'

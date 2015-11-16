@@ -4,6 +4,8 @@
 
 
 import codecs
+import datetime
+import email
 import functools
 import itertools
 import os
@@ -16,58 +18,89 @@ import StringIO
 import subprocess
 import sys
 import tempfile
-import threading
 import time
+import types
 import unittest
+import urlparse
 
 
 from M2Crypto import X509
+import mock
 
 from selenium.common import exceptions
+from selenium.webdriver.common import action_chains
 from selenium.webdriver.common import keys
 from selenium.webdriver.support import select
 
 import logging
 import unittest
+# pylint: disable=unused-import
+from grr import config as _
+# pylint: enable=unused-import
 
 from grr.client import actions
-from grr.client import client_stats
 from grr.client import comms
+# pylint: disable=unused-import
+from grr.client import local as _
+# pylint: enable=unused-import
 from grr.client import vfs
+from grr.client.client_actions import standard
+from grr.client.vfs_handlers import files
 
 from grr.lib import access_control
+from grr.lib import action_mocks
 from grr.lib import aff4
+from grr.lib import artifact_registry
+from grr.lib import client_index
 from grr.lib import config_lib
-
 from grr.lib import data_store
 from grr.lib import email_alerts
 from grr.lib import flags
-
 from grr.lib import flow
-
+# pylint: disable=unused-import
+from grr.lib import local as _
+# pylint: enable=unused-import
 from grr.lib import maintenance_utils
 from grr.lib import queue_manager
+from grr.lib import queues as queue_config
 from grr.lib import rdfvalue
 from grr.lib import registry
-
-# Server components must also be imported even when the client code is tested.
-# pylint: disable=unused-import
-from grr.lib import server_plugins
-# pylint: enable=unused-import
+from grr.lib import rekall_profile_server
 from grr.lib import startup
+from grr.lib import stats
 from grr.lib import utils
 from grr.lib import worker
-# pylint: disable=unused-import
-from grr.lib.flows.caenroll import ca_enroller
-# pylint: enable=unused-import
-from grr.proto import flows_pb2
+from grr.lib import worker_mocks
 
+from grr.lib.aff4_objects import aff4_grr
+from grr.lib.aff4_objects import filestore
+from grr.lib.aff4_objects import user_managers
+from grr.lib.aff4_objects import users
+
+# pylint: disable=unused-import
+from grr.lib.data_stores import fake_data_store as _
+
+# Importing administrative to import ClientCrashHandler flow that
+# handles ClientCrash events triggered by CrashClientMock.
+from grr.lib.flows.general import administrative as _
+from grr.lib.flows.general import ca_enroller as _
+from grr.lib.flows.general import filesystem as _
+# pylint: enable=unused-import
+
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import crypto as rdf_crypto
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import protodict as rdf_protodict
+from grr.lib.rdfvalues import rekall_types as rdf_rekall_types
+from grr.lib.rdfvalues import structs as rdf_structs
+
+from grr.proto import tests_pb2
 from grr.test_data import client_fixture
 
 flags.DEFINE_list("tests", None,
                   help=("Test module to run. If not specified we run"
                         "All modules in the test suite."))
-
 flags.DEFINE_list("labels", ["small"],
                   "A list of test labels to run. (e.g. benchmarks,small).")
 
@@ -78,6 +111,29 @@ class Error(Exception):
 
 class TimeoutError(Error):
   """Used when command line invocations time out."""
+
+
+class ClientActionRunnerArgs(rdf_structs.RDFProtoStruct):
+  protobuf = tests_pb2.ClientActionRunnerArgs
+
+
+class ClientActionRunner(flow.GRRFlow):
+  """Just call the specified client action directly.
+  """
+  args_type = ClientActionRunnerArgs
+  action_args = {}
+
+  @flow.StateHandler(next_state="End")
+  def Start(self):
+    self.CallClient(self.args.action, next_state="End", **self.action_args)
+
+
+class FlowWithOneClientRequest(flow.GRRFlow):
+  """Test flow that does one client request in Start() state."""
+
+  @flow.StateHandler(next_state="End")
+  def Start(self, unused_message=None):
+    self.CallClient("Test", data="test", next_state="End")
 
 
 class FlowOrderTest(flow.GRRFlow):
@@ -101,8 +157,8 @@ class FlowOrderTest(flow.GRRFlow):
       self.messages.append(responses.message.response_id)
 
 
-class SendingFlowArgs(rdfvalue.RDFProtoStruct):
-  protobuf = flows_pb2.SendingFlowArgs
+class SendingFlowArgs(rdf_structs.RDFProtoStruct):
+  protobuf = tests_pb2.SendingFlowArgs
 
 
 class SendingFlow(flow.GRRFlow):
@@ -116,6 +172,14 @@ class SendingFlow(flow.GRRFlow):
       self.CallClient("ReadBuffer", offset=0, length=100, next_state="Process")
 
 
+class RaiseOnStart(flow.GRRFlow):
+  """A broken flow that raises in the Start method."""
+
+  @flow.StateHandler(next_state="End")
+  def Start(self, unused_message=None):
+    raise Exception("Broken Start")
+
+
 class BrokenFlow(flow.GRRFlow):
   """A flow which does things wrongly."""
 
@@ -125,9 +189,43 @@ class BrokenFlow(flow.GRRFlow):
     self.CallClient("ReadBuffer", next_state="WrongProcess")
 
 
+class DummyLogFlow(flow.GRRFlow):
+  """Just emit logs."""
+
+  @flow.StateHandler(next_state="Done")
+  def Start(self, unused_response=None):
+    """Log."""
+    self.Log("First")
+    self.CallFlow("DummyLogFlowChild", next_state="Done")
+    self.Log("Second")
+
+  @flow.StateHandler()
+  def Done(self, unused_response=None):
+    self.Log("Third")
+    self.Log("Fourth")
+
+
+class DummyLogFlowChild(flow.GRRFlow):
+  """Just emit logs."""
+
+  @flow.StateHandler(next_state="Done")
+  def Start(self, unused_response=None):
+    """Log."""
+    self.Log("Uno")
+    self.CallState(next_state="Done")
+    self.Log("Dos")
+
+  @flow.StateHandler()
+  def Done(self, unused_response=None):
+    self.Log("Tres")
+    self.Log("Cuatro")
+
+
 class WellKnownSessionTest(flow.WellKnownFlow):
   """Tests the well known flow implementation."""
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/test:TestSessionId")
+  well_known_session_id = rdfvalue.SessionID(queue=rdfvalue.RDFURN("test"),
+                                             flow_name="TestSessionId")
+
   messages = []
 
   def __init__(self, *args, **kwargs):
@@ -135,17 +233,37 @@ class WellKnownSessionTest(flow.WellKnownFlow):
 
   def ProcessMessage(self, message):
     """Record the message id for testing."""
-    self.messages.append(int(message.args))
+    self.messages.append(int(message.payload))
 
 
-class MockSecurityManager(access_control.BaseAccessControlManager):
-  """A simple in memory ACL manager which only enforces the Admin label.
+class MockSecurityManager(user_managers.BasicAccessControlManager):
+  """A simple in memory ACL manager which enforces the Admin label.
 
-  This also guarantees that the correct access token has been passed to the
-  security manager.
+  It also guarantees that the correct access token has been passed to the
+  security manager. It can also optionally limit datastore access for
+  certain access types.
 
   Note: No user management, we assume a single test user.
   """
+
+  def __init__(self, forbidden_datastore_access=""):
+    """Constructor.
+
+    Args:
+      forbidden_datastore_access: String designating datastore
+          permissions. Permissions specified in this argument
+          will not be granted when checking for datastore access.
+
+          Known permissions are:
+            "r" - for reading,
+            "w" - for writing,
+            "q" - for querying.
+          forbidden_datastore_access should be a combination of the above. By
+          default all types of access are permitted.
+    """
+    super(MockSecurityManager, self).__init__()
+
+    self.forbidden_datastore_access = forbidden_datastore_access
 
   def CheckFlowAccess(self, token, flow_name, client_id=None):
     _ = flow_name, client_id
@@ -169,6 +287,12 @@ class MockSecurityManager(access_control.BaseAccessControlManager):
     _ = subjects, requested_access
     if token is None:
       raise RuntimeError("Security Token is not set correctly.")
+
+    for access in requested_access:
+      if access in self.forbidden_datastore_access:
+        raise access_control.UnauthorizedAccess("%s access is is not allowed" %
+                                                access)
+
     return True
 
 
@@ -194,22 +318,20 @@ class GRRBaseTest(unittest.TestCase):
       methodName: The test method to run.
     """
     super(GRRBaseTest, self).__init__(methodName=methodName or "__init__")
+    self.base_path = config_lib.CONFIG["Test.data_dir"]
+    self.token = access_control.ACLToken(username="test",
+                                         reason="Running tests")
 
   def setUp(self):
     super(GRRBaseTest, self).setUp()
 
-    # Make a temporary directory for test files.
-    self.temp_dir = tempfile.mkdtemp(dir=config_lib.CONFIG["Test.tmpdir"])
+    tmpdir = os.environ.get("TEST_TMPDIR") or config_lib.CONFIG["Test.tmpdir"]
 
-    # Reinitialize the config system each time.
-    startup.TestInit()
+    # Make a temporary directory for test files.
+    self.temp_dir = tempfile.mkdtemp(dir=tmpdir)
 
     config_lib.CONFIG.SetWriteBack(
         os.path.join(self.temp_dir, "writeback.yaml"))
-
-    self.base_path = config_lib.CONFIG["Test.data_dir"]
-    self.token = access_control.ACLToken(username="test",
-                                         reason="Running tests")
 
     if self.install_mock_acl:
       # Enforce checking that security tokens are propagated to the data store
@@ -218,12 +340,43 @@ class GRRBaseTest(unittest.TestCase):
 
     logging.info("Starting test: %s.%s",
                  self.__class__.__name__, self._testMethodName)
+    self.last_start_time = time.time()
+
+    try:
+      # Clear() is much faster than init but only supported for FakeDataStore.
+      data_store.DB.Clear()
+    except AttributeError:
+      self.InitDatastore()
+
+    aff4.FACTORY.Flush()
+
+    # Create a Foreman and Filestores, they are used in many tests.
+    aff4_grr.GRRAFF4Init().Run()
+    filestore.FileStoreInit().Run()
+
+    # Stub out the email function
+    self.emails_sent = []
+
+    def SendEmailStub(to_user, from_user, subject, message, **unused_kwargs):
+      self.emails_sent.append((to_user, from_user, subject, message))
+
+    self.mail_stubber = utils.MultiStubber(
+        (email_alerts.EMAIL_ALERTER, "SendEmail", SendEmailStub),
+        (email.utils, "make_msgid", lambda: "<message id stub>"))
+    self.mail_stubber.Start()
 
   def tearDown(self):
-    logging.info("Completed test: %s.%s",
-                 self.__class__.__name__, self._testMethodName)
+    self.mail_stubber.Stop()
 
-    shutil.rmtree(self.temp_dir, True)
+    logging.info("Completed test: %s.%s (%.4fs)",
+                 self.__class__.__name__, self._testMethodName,
+                 time.time() - self.last_start_time)
+
+    # This may fail on filesystems which do not support unicode filenames.
+    try:
+      shutil.rmtree(self.temp_dir, True)
+    except UnicodeError:
+      pass
 
   def shortDescription(self):  # pylint: disable=g-bad-name
     doc = self._testMethodDoc or ""
@@ -233,15 +386,18 @@ class GRRBaseTest(unittest.TestCase):
     return "\n%s.%s - %s\n" % (
         self.__class__.__name__, self._testMethodName, doc)
 
-  def _EnumerateProto(self, protobuf):
-    """Return a sorted list of tuples for the protobuf."""
+  def _EnumerateStruct(self, struct_value, iterate_method=None):
+    """Return a sorted list of tuples for the value using given method."""
+    if not iterate_method:
+      raise ValueError("Method name for listing set fields is not set.")
+
     result = []
-    for desc, value in protobuf.ListFields():
+    for desc, value in getattr(struct_value, iterate_method)():
       if isinstance(value, float):
         value = round(value, 2)
 
       try:
-        value = self._EnumerateProto(value)
+        value = self._EnumerateStruct(value, iterate_method=iterate_method)
       except AttributeError:
         pass
 
@@ -250,9 +406,23 @@ class GRRBaseTest(unittest.TestCase):
     result.sort()
     return result
 
-  def assertProtoEqual(self, x, y):
+  def _EnumerateProto(self, protobuf):
+    return self._EnumerateStruct(protobuf, iterate_method="ListFields")
+
+  def _EnumerateRDFValue(self, value):
+    # If we can't enumerate the value (i.e. if it's a primitive value),
+    # just take it as it is.
+    if not hasattr(value, "ListSetFields"):
+      return [("__value__", value)]
+    else:
+      return self._EnumerateStruct(value, iterate_method="ListSetFields")
+
+  def assertRDFValueEqual(self, x, y):
     """Check that an RDFStruct is equal to a protobuf."""
-    self.assertEqual(self._EnumerateProto(x), self._EnumerateProto(y))
+    self.assertEqual(self._EnumerateRDFValue(x), self._EnumerateRDFValue(y))
+
+  def assertRDFValueEqualToProto(self, x, y):
+    self.assertEqual(self._EnumerateRDFValue(x), self._EnumerateProto(y))
 
   def run(self, result=None):  # pylint: disable=g-bad-name
     """Run the test case.
@@ -266,10 +436,15 @@ class GRRBaseTest(unittest.TestCase):
     """
     if result is None: result = self.defaultTestResult()
     result.startTest(self)
-    testMethod = getattr(self, self._testMethodName)  # pylint: disable=g-bad-name
+    testMethod = getattr(  # pylint: disable=g-bad-name
+        self, self._testMethodName)
     try:
       try:
         self.setUp()
+      except unittest.SkipTest:
+        result.addSkip(self, sys.exc_info())
+        result.stopTest(self)
+        return
       except:
         # Break into interactive debugger on test failure.
         if flags.FLAGS.debug:
@@ -292,6 +467,8 @@ class GRRBaseTest(unittest.TestCase):
         result.addFailure(self, sys.exc_info())
       except KeyboardInterrupt:
         raise
+      except unittest.SkipTest:
+        result.addSkip(self, sys.exc_info())
       except Exception:
         # Break into interactive debugger on test failure.
         if flags.FLAGS.debug:
@@ -316,11 +493,17 @@ class GRRBaseTest(unittest.TestCase):
     finally:
       result.stopTest(self)
 
-  def MakeUserAdmin(self, username):
-    """Makes the test user an admin."""
-    with aff4.FACTORY.Create("aff4:/users/%s" % username, "GRRUser",
-                             token=self.token.SetUID()) as user:
-      user.SetLabels("admin")
+  def CreateUser(self, username):
+    """Creates a user."""
+    user = aff4.FACTORY.Create("aff4:/users/%s" % username, "GRRUser",
+                               token=self.token.SetUID())
+    user.Flush()
+    return user
+
+  def CreateAdminUser(self, username):
+    """Creates a user and makes it an admin."""
+    with self.CreateUser(username) as user:
+      user.SetLabels("admin", owner="GRR")
 
   def GrantClientApproval(self, client_id, token=None):
     token = token or self.token
@@ -329,18 +512,18 @@ class GRRBaseTest(unittest.TestCase):
     flow.GRRFlow.StartFlow(client_id=client_id,
                            flow_name="RequestClientApprovalFlow",
                            reason=token.reason,
-                           subject_urn=rdfvalue.ClientURN(client_id),
+                           subject_urn=rdf_client.ClientURN(client_id),
                            approver="approver",
                            token=token)
 
-    self.MakeUserAdmin("approver")
+    self.CreateAdminUser("approver")
 
     approver_token = access_control.ACLToken(username="approver")
     flow.GRRFlow.StartFlow(client_id=client_id,
                            flow_name="GrantClientApprovalFlow",
                            reason=token.reason,
                            delegate=token.username,
-                           subject_urn=rdfvalue.ClientURN(client_id),
+                           subject_urn=rdf_client.ClientURN(client_id),
                            token=approver_token)
 
   def GrantHuntApproval(self, hunt_urn, token=None):
@@ -353,7 +536,7 @@ class GRRBaseTest(unittest.TestCase):
                            approver="approver",
                            token=token)
 
-    self.MakeUserAdmin("approver")
+    self.CreateAdminUser("approver")
 
     approver_token = access_control.ACLToken(username="approver")
     flow.GRRFlow.StartFlow(flow_name="GrantHuntApprovalFlow",
@@ -372,7 +555,7 @@ class GRRBaseTest(unittest.TestCase):
                            approver="approver",
                            token=token)
 
-    self.MakeUserAdmin("approver")
+    self.CreateAdminUser("approver")
 
     approver_token = access_control.ACLToken(username="approver")
     flow.GRRFlow.StartFlow(flow_name="GrantCronJobApprovalFlow",
@@ -383,28 +566,38 @@ class GRRBaseTest(unittest.TestCase):
 
   def SetupClients(self, nr_clients):
     client_ids = []
-    for i in range(nr_clients):
-      client_id = rdfvalue.ClientURN("C.1%015d" % i)
-      client_ids.append(client_id)
-      fd = aff4.FACTORY.Create(client_id, "VFSGRRClient", token=self.token)
-      cert = rdfvalue.RDFX509Cert(
-          self.ClientCertFromPrivateKey(
-              config_lib.CONFIG["Client.private_key"]).as_pem())
-      fd.Set(fd.Schema.CERT, cert)
+    with aff4.FACTORY.Create(client_index.MAIN_INDEX, aff4_type="ClientIndex",
+                             mode="rw", token=self.token) as index:
 
-      info = fd.Schema.CLIENT_INFO()
-      info.client_name = "GRR Monitor"
-      fd.Set(fd.Schema.CLIENT_INFO, info)
-      fd.Set(fd.Schema.PING, rdfvalue.RDFDatetime().Now())
-      fd.Set(fd.Schema.HOSTNAME("Host-%s" % i))
-      fd.Set(fd.Schema.FQDN("Host-%s.example.com" % i))
-      fd.Set(fd.Schema.MAC_ADDRESS("aabbccddee%02x" % i))
-      fd.Close()
+      for i in range(nr_clients):
+        client_id = rdf_client.ClientURN("C.1%015d" % i)
+        client_ids.append(client_id)
+
+        with aff4.FACTORY.Create(client_id, "VFSGRRClient",
+                                 mode="rw",
+                                 token=self.token) as fd:
+          cert = rdf_crypto.RDFX509Cert(
+              self.ClientCertFromPrivateKey(
+                  config_lib.CONFIG["Client.private_key"]).as_pem())
+          fd.Set(fd.Schema.CERT, cert)
+
+          info = fd.Schema.CLIENT_INFO()
+          info.client_name = "GRR Monitor"
+          fd.Set(fd.Schema.CLIENT_INFO, info)
+          fd.Set(fd.Schema.PING, rdfvalue.RDFDatetime().Now())
+          fd.Set(fd.Schema.HOSTNAME("Host-%s" % i))
+          fd.Set(fd.Schema.FQDN("Host-%s.example.com" % i))
+          fd.Set(
+              fd.Schema.MAC_ADDRESS("aabbccddee%02x\nbbccddeeff%02x" % (i, i)))
+          fd.Set(fd.Schema.HOST_IPS("192.168.0.%d\n2001:abcd::%x" % (i, i)))
+          fd.Flush()
+
+          index.AddClient(fd)
     return client_ids
 
   def DeleteClients(self, nr_clients):
     for i in range(nr_clients):
-      client_id = rdfvalue.ClientURN("C.1%015d" % i)
+      client_id = rdf_client.ClientURN("C.1%015d" % i)
       data_store.DB.DeleteSubject(client_id, token=self.token)
 
   def RunForTimeWithNoExceptions(self, cmd, argv, timeout=10, should_exit=False,
@@ -427,6 +620,7 @@ class GRRBaseTest(unittest.TestCase):
       raise TimeoutError()
 
     exited = False
+    proc = None
     try:
       logging.info("Running : %s", [cmd] + argv)
       proc = subprocess.Popen([cmd] + argv, stdout=subprocess.PIPE,
@@ -447,17 +641,18 @@ class GRRBaseTest(unittest.TestCase):
           break
 
     except TimeoutError:
-      pass   # We expect timeouts.
+      pass  # We expect timeouts.
 
     finally:
       signal.alarm(0)
       try:
-        proc.kill()
+        if proc:
+          proc.kill()
       except OSError:
-        pass   # Could already be dead.
+        pass  # Could already be dead.
 
     proc.stdout.flush()
-    stdout.write(proc.stdout.read())    # Collect any remaining output.
+    stdout.write(proc.stdout.read())  # Collect any remaining output.
 
     if "Traceback (" in stdout.getvalue():
       raise RuntimeError("Exception found in stderr of binary Stderr:\n###\n%s"
@@ -482,7 +677,7 @@ class GRRBaseTest(unittest.TestCase):
     request = X509.load_request_string(csr)
     flow_obj = aff4.FACTORY.Create(None, "CAEnroler", token=self.token)
     subject = request.get_subject()
-    cn = rdfvalue.ClientURN(subject.as_text().split("=")[-1])
+    cn = rdf_client.ClientURN(subject.as_text().split("=")[-1])
     return flow_obj.MakeCert(cn, request)
 
   def CreateSignedDriver(self):
@@ -499,42 +694,66 @@ class EmptyActionTest(GRRBaseTest):
 
   __metaclass__ = registry.MetaclassRegistry
 
-  def RunAction(self, action_name, arg=None):
+  def RunAction(self, action_name, arg=None, grr_worker=None):
+    if arg is None:
+      arg = rdf_flows.GrrMessage()
+
+    self.results = []
+    action = self._GetActionInstantace(action_name, arg=arg,
+                                       grr_worker=grr_worker)
+
+    action.status = rdf_flows.GrrStatus(
+        status=rdf_flows.GrrStatus.ReturnedStatus.OK)
+    action.Run(arg)
+
+    return self.results
+
+  def ExecuteAction(self, action_name, arg=None, grr_worker=None):
+    message = rdf_flows.GrrMessage(name=action_name, payload=arg,
+                                   auth_state="AUTHENTICATED")
+
+    self.results = []
+    action = self._GetActionInstantace(action_name, arg=arg,
+                                       grr_worker=grr_worker)
+
+    action.Execute(message)
+
+    return self.results
+
+  def _GetActionInstantace(self, action_name, arg=None, grr_worker=None):
     """Run an action and generate responses.
+
+    This basically emulates GRRClientWorker.HandleMessage().
 
     Args:
        action_name: The action to run.
        arg: A protobuf to pass the action.
-
+       grr_worker: The GRRClientWorker instance to use. If not provided we make
+         a new one.
     Returns:
       A list of response protobufs.
     """
-    if arg is None:
-      arg = rdfvalue.GrrMessage()
-
-    message = rdfvalue.GrrMessage(name=action_name,
-                                  payload=arg)
-    action_cls = actions.ActionPlugin.classes[message.name]
-    results = []
-
-    # Monkey patch a mock SendReply() method
-    def MockSendReply(self, reply=None, **kwargs):
+    # A mock SendReply() method to collect replies.
+    def MockSendReply(mock_self, reply=None, **kwargs):
       if reply is None:
-        reply = self.out_rdfvalue(**kwargs)
+        reply = mock_self.out_rdfvalue(**kwargs)
 
-      results.append(reply)
+      self.results.append(reply)
 
-    old_sendreply = action_cls.SendReply
+    if grr_worker is None:
+      grr_worker = worker_mocks.FakeClientWorker()
+
     try:
-      action_cls.SendReply = MockSendReply
+      suspended_action_id = arg.iterator.suspended_action
+      action = grr_worker.suspended_actions[suspended_action_id]
 
-      action = action_cls(message=message)
-      action.grr_worker = FakeClientWorker()
-      action.Run(arg)
-    finally:
-      action_cls.SendReply = old_sendreply
+    except (AttributeError, KeyError):
+      action_cls = actions.ActionPlugin.classes[action_name]
+      action = action_cls(grr_worker=grr_worker)
 
-    return results
+    action.SendReply = types.MethodType(MockSendReply, action)
+
+    return action
 
 
 class FlowTestsBaseclass(GRRBaseTest):
@@ -546,10 +765,6 @@ class FlowTestsBaseclass(GRRBaseTest):
     GRRBaseTest.setUp(self)
     client_ids = self.SetupClients(1)
     self.client_id = client_ids[0]
-
-  def tearDown(self):
-    super(FlowTestsBaseclass, self).tearDown()
-    data_store.DB.Clear()
 
   def FlowSetup(self, name):
     session_id = flow.GRRFlow.StartFlow(client_id=self.client_id,
@@ -580,49 +795,167 @@ def SeleniumAction(f):
   return Decorator
 
 
-class ACLChecksDisabledContextManager(object):
+class ConfigOverrider(object):
+  """A context to temporarily change config options."""
+
+  def __init__(self, overrides):
+    self._overrides = overrides
+    self._saved_values = {}
+
   def __enter__(self):
-    self.old_security_manager = data_store.DB.security_manager
-    data_store.DB.security_manager = access_control.NullAccessControlManager()
-    return None
+    self.Start()
+
+  def Start(self):
+    for k, v in self._overrides.iteritems():
+      self._saved_values[k] = config_lib.CONFIG.Get(k)
+      try:
+        config_lib.CONFIG.Set.old_target(k, v)
+      except AttributeError:
+        config_lib.CONFIG.Set(k, v)
 
   def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Stop()
+
+  def Stop(self):
+    for k, v in self._saved_values.iteritems():
+      try:
+        config_lib.CONFIG.Set.old_target(k, v)
+      except AttributeError:
+        config_lib.CONFIG.Set(k, v)
+
+
+class PreserveConfig(object):
+
+  def __enter__(self):
+    self.Start()
+
+  def Start(self):
+    self.old_config = config_lib.CONFIG
+    config_lib.CONFIG = self.old_config.MakeNewConfig()
+    config_lib.CONFIG.initialized = self.old_config.initialized
+    config_lib.CONFIG.SetWriteBack(self.old_config.writeback.filename)
+    config_lib.CONFIG.raw_data = self.old_config.raw_data.copy()
+    config_lib.CONFIG.writeback_data = self.old_config.writeback_data.copy()
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Stop()
+
+  def Stop(self):
+    config_lib.CONFIG = self.old_config
+
+
+class VFSOverrider(object):
+  """A context to temporarily change VFS handlers."""
+
+  def __init__(self, vfs_type, temp_handler):
+    self._vfs_type = vfs_type
+    self._temp_handler = temp_handler
+
+  def __enter__(self):
+    self.Start()
+
+  def Start(self):
+    self._old_handler = vfs.VFS_HANDLERS.get(self._vfs_type)
+    vfs.VFS_HANDLERS[self._vfs_type] = self._temp_handler
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Stop()
+
+  def Stop(self):
+    if self._old_handler:
+      vfs.VFS_HANDLERS[self._vfs_type] = self._old_handler
+    else:
+      del vfs.VFS_HANDLERS[self._vfs_type]
+
+
+class ACLChecksDisabledContextManager(object):
+
+  def __enter__(self):
+    self.Start()
+
+  def Start(self):
+    self.old_security_manager = data_store.DB.security_manager
+    data_store.DB.security_manager = user_managers.NullAccessControlManager()
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Stop()
+
+  def Stop(self):
     data_store.DB.security_manager = self.old_security_manager
 
 
-class Stubber(object):
-  """A context manager for doing simple stubs."""
-
-  def __init__(self, module, target_name, stub):
-    self.target_name = target_name
-    self.module = module
-    self.stub = stub
+class ACLChecksEnabledContextManager(object):
 
   def __enter__(self):
-    self.old_target = getattr(self.module, self.target_name, None)
-    try:
-      self.stub.old_target = self.old_target
-    except AttributeError:
-      pass
-    setattr(self.module, self.target_name, self.stub)
+    self.Start()
+
+  def Start(self):
+    self.old_security_manager = data_store.DB.security_manager
+    data_store.DB.security_manager = access_control.FullAccessControlManager()
 
   def __exit__(self, unused_type, unused_value, unused_traceback):
-    setattr(self.module, self.target_name, self.old_target)
+    self.Stop()
+
+  def Stop(self):
+    data_store.DB.security_manager = self.old_security_manager
 
 
-class MultiStubber(object):
-  """A context manager for doing simple stubs."""
+class FakeTime(object):
+  """A context manager for faking time."""
 
-  def __init__(self, *args):
-    self.stubbers = [Stubber(*x) for x in args]
+  def __init__(self, fake_time, increment=0):
+    if isinstance(fake_time, rdfvalue.RDFDatetime):
+      self.time = fake_time.AsSecondsFromEpoch()
+    else:
+      self.time = fake_time
+    self.increment = increment
 
   def __enter__(self):
-    for x in self.stubbers:
-      x.__enter__()
+    self.old_time = time.time
 
-  def __exit__(self, t, value, traceback):
-    for x in self.stubbers:
-      x.__exit__(t, value, traceback)
+    def Time():
+      self.time += self.increment
+      return self.time
+
+    time.time = Time
+    return self
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    time.time = self.old_time
+
+
+class FakeDateTimeUTC(object):
+  """A context manager for faking time when using datetime.utcnow."""
+
+  def __init__(self, fake_time, increment=0):
+    self.time = fake_time
+    self.increment = increment
+
+  def __enter__(self):
+    self.old_datetime = datetime.datetime
+
+    class FakeDateTime(object):
+
+      def __init__(self, time_val, increment, orig_datetime):
+        self.time = time_val
+        self.increment = increment
+        self.orig_datetime = orig_datetime
+
+      def __getattribute__(self, name):
+        try:
+          return object.__getattribute__(self, name)
+        except AttributeError:
+          return getattr(self.orig_datetime, name)
+
+      def utcnow(self):  # pylint: disable=invalid-name
+        self.time += self.increment
+        return self.orig_datetime.utcfromtimestamp(self.time)
+
+    datetime.datetime = FakeDateTime(self.time, self.increment,
+                                     self.old_datetime)
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    datetime.datetime = self.old_datetime
 
 
 class Instrument(object):
@@ -637,11 +970,13 @@ class Instrument(object):
     def Wrapper(*args, **kwargs):
       self.args.append(args)
       self.kwargs.append(kwargs)
+      self.call_count += 1
       return self.old_target(*args, **kwargs)
 
-    self.stubber = Stubber(module, target_name, Wrapper)
+    self.stubber = utils.Stubber(module, target_name, Wrapper)
     self.args = []
     self.kwargs = []
+    self.call_count = 0
 
   def __enter__(self):
     self.stubber.__enter__()
@@ -666,35 +1001,24 @@ class GRRSeleniumTest(GRRBaseTest):
   # Base url of the Admin UI
   base_url = None
 
-  # Whether InstallACLChecks() was called during the test
-  acl_checks_installed = False
+  # Also indicates whether InstallACLChecks() was called during the test.
+  acl_manager = None
 
   def InstallACLChecks(self):
     """Installs AccessControlManager and stubs out SendEmail."""
-    if self.acl_checks_installed:
+    if self.acl_manager:
       return
 
-    self.old_security_manager = data_store.DB.security_manager
-    data_store.DB.security_manager = access_control.FullAccessControlManager()
-
-    # Stub out the email function
-    self.old_send_email = email_alerts.SendEmail
-    self.emails_sent = []
-
-    def SendEmailStub(from_user, to_user, subject, message, **unused_kwargs):
-      self.emails_sent.append((from_user, to_user, subject, message))
-
-    email_alerts.SendEmail = SendEmailStub
-    self.acl_checks_installed = True
+    self.acl_manager = ACLChecksEnabledContextManager()
+    self.acl_manager.Start()
 
   def UninstallACLChecks(self):
     """Deinstall previously installed ACL checks."""
-    if not self.acl_checks_installed:
+    if not self.acl_manager:
       return
 
-    data_store.DB.security_manager = self.old_security_manager
-    email_alerts.SendEmail = self.old_send_email
-    self.acl_checks_installed = False
+    self.acl_manager.Stop()
+    self.acl_manager = None
 
   def ACLChecksDisabled(self):
     return ACLChecksDisabledContextManager()
@@ -750,6 +1074,8 @@ class GRRSeleniumTest(GRRBaseTest):
     if selector_type == "css":
       elems = self.driver.execute_script(
           "return $(\"" + effective_selector.replace("\"", "\\\"") + "\");")
+      elems = [e for e in elems if e.is_displayed()]
+
       if not elems:
         raise exceptions.NoSuchElementException()
       else:
@@ -782,6 +1108,19 @@ class GRRSeleniumTest(GRRBaseTest):
   @SeleniumAction
   def Open(self, url):
     self.driver.get(self.base_url + url)
+
+    # Sometimes page doesn't get refreshed if url's path and query haven't
+    # changed, even if fragments part (part after '#' symbol) of the url has
+    # changed. We have to explicitly call Refresh() in such cases.
+    prev_parsed_url = urlparse.urlparse(self.driver.current_url)
+    new_parsed_url = urlparse.urlparse(url)
+    if (prev_parsed_url.path == new_parsed_url.path and
+        prev_parsed_url.query == new_parsed_url.query):
+      self.Refresh()
+
+  @SeleniumAction
+  def Refresh(self):
+    self.driver.refresh()
 
   def WaitUntilNot(self, condition_cb, *args):
     self.WaitUntil(lambda: not condition_cb(*args))
@@ -823,6 +1162,14 @@ class GRRSeleniumTest(GRRBaseTest):
     element = self.GetElement(target)
     return element and element.is_displayed()
 
+  def FileWasDownloaded(self):
+    new_count = stats.STATS.GetMetricValue(
+        "ui_renderer_latency", fields=["DownloadView"]).count
+
+    result = (new_count - self.prev_download_count) > 0
+    self.prev_download_count = new_count
+    return result
+
   def GetText(self, target):
     element = self.WaitUntil(self.GetVisibleElement, target)
     return element.text.strip()
@@ -862,6 +1209,18 @@ class GRRSeleniumTest(GRRBaseTest):
     self.WaitForAjaxCompleted()
     element = self.WaitUntil(self.GetVisibleElement, target)
     element.click()
+
+  @SeleniumAction
+  def DoubleClick(self, target):
+    # Selenium clicks elements by obtaining their position and then issuing a
+    # click action in the middle of this area. This may lead to misclicks when
+    # elements are moving. Make sure that they are stationary before issuing
+    # the click action (specifically, using the bootstrap "fade" class that
+    # slides dialogs in is highly discouraged in combination with
+    # .DoubleClick()).
+    self.WaitForAjaxCompleted()
+    element = self.WaitUntil(self.GetVisibleElement, target)
+    action_chains.ActionChains(self.driver).double_click(element).perform()
 
   def ClickUntilNotVisible(self, target):
     self.WaitUntil(self.GetVisibleElement, target)
@@ -922,11 +1281,22 @@ class GRRSeleniumTest(GRRBaseTest):
   def setUp(self):
     super(GRRSeleniumTest, self).setUp()
 
+    self.prev_download_count = stats.STATS.GetMetricValue(
+        "ui_renderer_latency", fields=["DownloadView"]).count
+
     # Make the user use the advanced gui so we can test it.
     with aff4.FACTORY.Create(
         aff4.ROOT_URN.Add("users/test"), aff4_type="GRRUser", mode="w",
         token=self.token) as user_fd:
       user_fd.Set(user_fd.Schema.GUI_SETTINGS(mode="ADVANCED"))
+
+    # This creates client fixtures for the UI tests.
+    registry.InitHook.classes["RunTestsInit"]().Run()
+
+    # Clean artifacts sources.
+    artifact_registry.REGISTRY.ClearSources()
+    artifact_registry.REGISTRY.AddDatastoreSources(
+        [aff4.ROOT_URN.Add("artifact_store")])
 
     self.InstallACLChecks()
 
@@ -939,47 +1309,68 @@ class AFF4ObjectTest(GRRBaseTest):
   """The base class of all aff4 object tests."""
   __metaclass__ = registry.MetaclassRegistry
 
-  client_id = rdfvalue.ClientURN("C." + "B" * 16)
+  client_id = rdf_client.ClientURN("C." + "B" * 16)
 
 
 class MicroBenchmarks(GRRBaseTest):
   """This base class created the GRR benchmarks."""
   __metaclass__ = registry.MetaclassRegistry
 
-  # Increase this for more accurate timing information.
-  REPEATS = 1000
-
   units = "us"
 
-  def setUp(self):
+  def setUp(self, extra_fields=None, extra_format=None):
     super(MicroBenchmarks, self).setUp()
 
+    if extra_fields is None:
+      extra_fields = []
+    if extra_format is None:
+      extra_format = []
+
+    base_scratchpad_fields = ["Benchmark", "Time (%s)", "Iterations"]
+    scratchpad_fields = base_scratchpad_fields + extra_fields
+    # Create format string for displaying benchmark results.
+    initial_fmt = ["45", "<20", "<20"] + extra_format
+    self.scratchpad_fmt = " ".join([("{%d:%s}" % (ind, x))
+                                    for ind, x in enumerate(initial_fmt)])
     # We use this to store temporary benchmark results.
-    self.benchmark_scratchpad = [
-        ["Benchmark", "Time (%s)", "Iterations"],
-        ["---------", "---------", "----------"]]
+    self.scratchpad = [scratchpad_fields,
+                       ["-" * len(x) for x in scratchpad_fields]]
 
   def tearDown(self):
+    super(MicroBenchmarks, self).tearDown()
     f = 1
     if self.units == "us":
       f = 1e6
     elif self.units == "ms":
       f = 1e3
-    if len(self.benchmark_scratchpad) > 2:
+    if len(self.scratchpad) > 2:
       print "\nRunning benchmark %s: %s" % (self._testMethodName,
                                             self._testMethodDoc or "")
 
-      for row in self.benchmark_scratchpad:
+      for row in self.scratchpad:
         if isinstance(row[1], (int, float)):
           row[1] = "%10.4f" % (row[1] * f)
         elif "%" in row[1]:
           row[1] %= self.units
 
-        if len(row) == 4 and isinstance(row[-1], (basestring, int, float)):
-          print "{0:45} {1:<20} {2:<20} ({3})".format(*row)
-        else:
-          print "{0:45} {1:<20} {2:<20}".format(*row)
+        print self.scratchpad_fmt.format(*row)
       print
+
+  def AddResult(self, name, time_taken, repetitions, *extra_values):
+    logging.info("%s: %s (%s)", name, time_taken, repetitions)
+    self.scratchpad.append([name, time_taken, repetitions] +
+                           list(extra_values))
+
+
+class AverageMicroBenchmarks(MicroBenchmarks):
+  """A MicroBenchmark subclass for tests that need to compute averages."""
+
+  # Increase this for more accurate timing information.
+  REPEATS = 1000
+  units = "s"
+
+  def setUp(self):
+    super(AverageMicroBenchmarks, self).setUp(["Value"])
 
   def TimeIt(self, callback, name=None, repetitions=None, pre=None, **kwargs):
     """Runs the callback repetitively and returns the average time."""
@@ -994,14 +1385,10 @@ class MicroBenchmarks(GRRBaseTest):
 
     start = time.time()
     for _ in xrange(repetitions):
-      v = callback(**kwargs)
+      return_value = callback(**kwargs)
 
-    time_taken = (time.time() - start)/repetitions
-    self.AddResult(name, time_taken, repetitions, v)
-
-  def AddResult(self, name, time_taken, repetitions, v=None):
-    self.benchmark_scratchpad.append(
-        [name, time_taken, repetitions, v])
+    time_taken = (time.time() - start) / repetitions
+    self.AddResult(name, time_taken, repetitions, return_value)
 
 
 class GRRTestLoader(unittest.TestLoader):
@@ -1057,13 +1444,22 @@ class GRRTestLoader(unittest.TestLoader):
 
 
 class MockClient(object):
+  """Simple emulation of the client.
+
+  This implementation operates directly on the server's queue of client
+  messages, bypassing the need to actually send the messages through the comms
+  library.
+  """
+
   def __init__(self, client_id, client_mock, token=None):
-    if not isinstance(client_id, rdfvalue.ClientURN):
+    if not isinstance(client_id, rdf_client.ClientURN):
       raise RuntimeError("Client id must be an instance of ClientURN")
 
     if client_mock is None:
-      client_mock = InvalidActionMock()
+      client_mock = action_mocks.InvalidActionMock()
 
+    self.status_message_enforced = getattr(
+        client_mock, "STATUS_MESSAGE_ENFORCED", True)
     self.client_id = client_id
     self.client_mock = client_mock
     self.token = token
@@ -1071,9 +1467,9 @@ class MockClient(object):
     # Well known flows are run on the front end.
     self.well_known_flows = flow.WellKnownFlow.GetAllWellKnownFlows(token=token)
 
-  def PushToStateQueue(self, message, **kw):
+  def PushToStateQueue(self, manager, message, **kw):
     # Assume the client is authorized
-    message.auth_state = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
+    message.auth_state = rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED
 
     # Update kw args
     for k, v in kw.items():
@@ -1083,36 +1479,37 @@ class MockClient(object):
     if message.request_id == 0:
 
       # Well known flows only accept messages of type MESSAGE.
-      if message.type == rdfvalue.GrrMessage.Type.MESSAGE:
+      if message.type == rdf_flows.GrrMessage.Type.MESSAGE:
         # Assume the message is authenticated and comes from this client.
-        message.SetWireFormat(
-            "source", utils.SmartStr(self.client_id.Basename()))
+        message.source = self.client_id
 
         message.auth_state = "AUTHENTICATED"
 
         session_id = message.session_id
 
         logging.info("Running well known flow: %s", session_id)
-        self.well_known_flows[str(session_id)].ProcessMessage(message)
+        self.well_known_flows[session_id.FlowName()].ProcessMessage(message)
 
       return
 
-    with queue_manager.QueueManager(token=self.token) as manager:
-      manager.QueueResponse(message.session_id, message)
+    manager.QueueResponse(message.session_id, message)
 
   def Next(self):
-    # Grab tasks for us from the queue.
+    # Grab tasks for us from the server's queue.
     with queue_manager.QueueManager(token=self.token) as manager:
       request_tasks = manager.QueryAndOwn(self.client_id.Queue(),
                                           limit=1,
                                           lease_seconds=10000)
       for message in request_tasks:
+        status = None
         response_id = 1
+
         # Collect all responses for this message from the client mock
         try:
           if hasattr(self.client_mock, "HandleMessage"):
             responses = self.client_mock.HandleMessage(message)
           else:
+            self.client_mock.message = message
             responses = getattr(self.client_mock, message.name)(message.payload)
 
           if not responses:
@@ -1121,45 +1518,56 @@ class MockClient(object):
           logging.info("Called client action %s generating %s responses",
                        message.name, len(responses) + 1)
 
-          status = rdfvalue.GrrStatus()
+          if self.status_message_enforced:
+            status = rdf_flows.GrrStatus()
         except Exception as e:  # pylint: disable=broad-except
           logging.exception("Error %s occurred in client", e)
 
           # Error occurred.
           responses = []
-          status = rdfvalue.GrrStatus(
-              status=rdfvalue.GrrStatus.ReturnedStatus.GENERIC_ERROR)
+          if self.status_message_enforced:
+            status = rdf_flows.GrrStatus(
+                status=rdf_flows.GrrStatus.ReturnedStatus.GENERIC_ERROR)
 
         # Now insert those on the flow state queue
         for response in responses:
-          if isinstance(response, rdfvalue.GrrStatus):
-            msg_type = rdfvalue.GrrMessage.Type.STATUS
-            response = rdfvalue.GrrMessage(
+          if isinstance(response, rdf_flows.GrrStatus):
+            msg_type = rdf_flows.GrrMessage.Type.STATUS
+            response = rdf_flows.GrrMessage(
                 session_id=message.session_id, name=message.name,
                 response_id=response_id, request_id=message.request_id,
-                payload=response,
-                type=msg_type)
-
-          elif not isinstance(response, rdfvalue.GrrMessage):
-            msg_type = rdfvalue.GrrMessage.Type.MESSAGE
-            response = rdfvalue.GrrMessage(
+                payload=response, type=msg_type)
+          elif isinstance(response, rdf_client.Iterator):
+            msg_type = rdf_flows.GrrMessage.Type.ITERATOR
+            response = rdf_flows.GrrMessage(
                 session_id=message.session_id, name=message.name,
                 response_id=response_id, request_id=message.request_id,
-                payload=response,
-                type=msg_type)
+                payload=response, type=msg_type)
+          elif not isinstance(response, rdf_flows.GrrMessage):
+            msg_type = rdf_flows.GrrMessage.Type.MESSAGE
+            response = rdf_flows.GrrMessage(
+                session_id=message.session_id, name=message.name,
+                response_id=response_id, request_id=message.request_id,
+                payload=response, type=msg_type)
 
           # Next expected response
           response_id = response.response_id + 1
-          self.PushToStateQueue(response)
+          self.PushToStateQueue(manager, response)
 
-        # Add a Status message to the end
-        self.PushToStateQueue(message, response_id=response_id,
-                              payload=status,
-                              type=rdfvalue.GrrMessage.Type.STATUS)
+        # Status may only be None if the client reported itself as crashed.
+        if status is not None:
+          self.PushToStateQueue(manager, message, response_id=response_id,
+                                payload=status,
+                                type=rdf_flows.GrrMessage.Type.STATUS)
+        else:
+          # Status may be None only if status_message_enforced is False.
+          if self.status_message_enforced:
+            raise RuntimeError("status message can only be None when "
+                               "status_message_enforced is False")
 
         # Additionally schedule a task for the worker
-        manager.NotifyQueue(message.session_id,
-                            priority=message.priority)
+        manager.QueueNotification(session_id=message.session_id,
+                                  priority=message.priority)
 
       return len(request_tasks)
 
@@ -1191,9 +1599,9 @@ class MockWorker(worker.GRRWorker):
   SYSTEM_CPU = [0]
   NETWORK_BYTES = [0]
 
-  def __init__(self, queue=worker.DEFAULT_WORKER_QUEUE,
+  def __init__(self, queues=queue_config.WORKER_LIST,
                check_flow_errors=True, token=None):
-    self.queue = queue
+    self.queues = queues
     self.check_flow_errors = check_flow_errors
     self.token = token
 
@@ -1225,30 +1633,33 @@ class MockWorker(worker.GRRWorker):
       RuntimeError: if the flow terminates with an error.
     """
     with queue_manager.QueueManager(token=self.token) as manager:
-      sessions_available = manager.GetSessionsFromQueue(self.queue)
-
-      sessions_available = [rdfvalue.SessionID(session_id)
-                            for session_id in sessions_available]
-      # Run all the flows until they are finished
       run_sessions = []
+      for queue in self.queues:
+        notifications_available = manager.GetNotificationsForAllShards(queue)
+        # Run all the flows until they are finished
 
-      # Only sample one session at the time to force serialization of flows
-      # after each state run - this helps to catch unpickleable objects.
-      for session_id in sessions_available[:1]:
-        manager.DeleteNotification(session_id)
-        run_sessions.append(session_id)
+        # Only sample one session at the time to force serialization of flows
+        # after each state run - this helps to catch unpickleable objects.
+        for notification in notifications_available[:1]:
+          session_id = notification.session_id
+          manager.DeleteNotification(session_id, end=notification.timestamp)
+          run_sessions.append(session_id)
 
-        # Handle well known flows here.
-        if session_id in self.well_known_flows:
-          self.well_known_flows[session_id].ProcessRequests(
-              self.pool)
-          continue
+          # Handle well known flows here.
+          flow_name = session_id.FlowName()
+          if flow_name in self.well_known_flows:
+            well_known_flow = self.well_known_flows[flow_name]
+            with well_known_flow:
+              responses = well_known_flow.FetchAndRemoveRequestsAndResponses(
+                  well_known_flow.well_known_session_id)
+            well_known_flow.ProcessResponses(responses, self.pool)
+            continue
 
-        with aff4.FACTORY.OpenWithLock(
-            session_id, token=self.token, blocking=False) as flow_obj:
+          with aff4.FACTORY.OpenWithLock(
+              session_id, token=self.token, blocking=False) as flow_obj:
 
-          # Run it
-          with flow_obj.GetRunner() as runner:
+            # Run it
+            runner = flow_obj.GetRunner()
             cpu_used = runner.context.client_resources.cpu_usage
             user_cpu = self.cpu_user.next()
             system_cpu = self.cpu_system.next()
@@ -1256,92 +1667,43 @@ class MockWorker(worker.GRRWorker):
             cpu_used.user_cpu_time += user_cpu
             cpu_used.system_cpu_time += system_cpu
             runner.context.network_bytes_sent += network_bytes
-            runner.ProcessCompletedRequests(self.pool)
+            runner.ProcessCompletedRequests(notification, self.pool)
 
             if (self.check_flow_errors and
-                runner.context.state == rdfvalue.Flow.State.ERROR):
+                runner.context.state == rdf_flows.Flow.State.ERROR):
               logging.exception("Flow terminated in state %s with an error: %s",
                                 runner.context.current_state,
                                 runner.context.backtrace)
-
               raise RuntimeError(runner.context.backtrace)
 
     return run_sessions
 
 
-class FakeClientWorker(comms.GRRClientWorker):
-  """A Fake GRR client worker which just collects SendReplys."""
+class Popen(object):
+  """A mock object for subprocess.Popen."""
 
-  def __init__(self):
-    self.responses = []
-    self.sent_bytes_per_flow = {}
-    self.lock = threading.RLock()
-    self.stats_collector = client_stats.ClientStatsCollector(self)
+  def __init__(self, run, stdout, stderr, stdin, env=None):
+    _ = env
+    Popen.running_args = run
+    Popen.stdout = stdout
+    Popen.stderr = stderr
+    Popen.stdin = stdin
+    Popen.returncode = 0
 
-  def __del__(self):
-    pass
+    try:
+      # Store the content of the executable file.
+      Popen.binary = open(run[0]).read()
+    except IOError:
+      Popen.binary = None
 
-  def SendReply(self, rdf_value,
-                message_type=rdfvalue.GrrMessage.Type.MESSAGE, **kw):
-    message = rdfvalue.GrrMessage(
-        type=message_type, payload=rdf_value, **kw)
-
-    self.responses.append(message)
-
-
-class ActionMock(object):
-  """A client mock which runs a real action.
-
-  This can be used as input for TestFlowHelper.
-
-  It is possible to mix mocked actions with real actions. Simple extend this
-  class and add methods for the mocked actions, while instantiating with the
-  list of read actions to run:
-
-  class MixedActionMock(ActionMock):
-    def __init__(self):
-      super(MixedActionMock, self).__init__("RealAction")
-
-    def MockedAction(self, args):
-      return []
-
-  Will run the real action "RealAction" at the same time as a mocked action
-  MockedAction.
-  """
-
-  def __init__(self, *action_names):
-    self.action_names = action_names
-    self.action_classes = dict(
-        [(k, v) for (k, v) in actions.ActionPlugin.classes.items()
-         if k in action_names])
-    self.action_counts = dict((x, 0) for x in action_names)
-
-  def HandleMessage(self, message):
-    message.auth_state = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
-    client_worker = FakeClientWorker()
-
-    # We allow special methods to be specified for certain actions.
-    if hasattr(self, message.name):
-      return getattr(self, message.name)(message.payload)
-
-    action_cls = self.action_classes[message.name]
-    action = action_cls(message=message, grr_worker=client_worker)
-    action.Execute()
-    self.action_counts[message.name] += 1
-    return client_worker.responses
-
-
-class InvalidActionMock(object):
-  """An action mock which raises for all actions."""
-
-  def HandleMessage(self, unused_message):
-    raise RuntimeError("Invalid Action Mock.")
+  def communicate(self):  # pylint: disable=g-bad-name
+    return "stdout here", "stderr here"
 
 
 class Test(actions.ActionPlugin):
   """A test action which can be used in mocks."""
-  in_rdfvalue = rdfvalue.DataBlob
-  out_rdfvalue = rdfvalue.DataBlob
+  in_rdfvalue = rdf_protodict.DataBlob
+  out_rdfvalue = rdf_protodict.DataBlob
 
 
 def CheckFlowErrors(total_flows, token=None):
@@ -1353,7 +1715,7 @@ def CheckFlowErrors(total_flows, token=None):
     except IOError:
       continue
 
-    if flow_obj.state.context.state != rdfvalue.Flow.State.TERMINATED:
+    if flow_obj.state.context.state != rdf_flows.Flow.State.TERMINATED:
       if flags.FLAGS.debug:
         pdb.set_trace()
       raise RuntimeError("Flow %s completed in state %s" % (
@@ -1383,7 +1745,6 @@ def TestFlowHelper(flow_urn_or_cls_name, client_mock=None, client_id=None,
     The caller should iterate over the generator to get all the flows
     and subflows executed.
   """
-
   if client_id or client_mock:
     client_mock = MockClient(client_id, client_mock, token=token)
 
@@ -1425,50 +1786,30 @@ def TestFlowHelper(flow_urn_or_cls_name, client_mock=None, client_id=None,
 
 class CrashClientMock(object):
 
+  STATUS_MESSAGE_ENFORCED = False
+
   def __init__(self, client_id, token):
     self.client_id = client_id
     self.token = token
 
   def HandleMessage(self, message):
-    status = rdfvalue.GrrStatus(
-        status=rdfvalue.GrrStatus.ReturnedStatus.CLIENT_KILLED,
+    status = rdf_flows.GrrStatus(
+        status=rdf_flows.GrrStatus.ReturnedStatus.CLIENT_KILLED,
         error_message="Client killed during transaction")
 
-    msg = rdfvalue.GrrMessage(
+    msg = rdf_flows.GrrMessage(
         request_id=message.request_id, response_id=1,
         session_id=message.session_id,
-        type=rdfvalue.GrrMessage.Type.STATUS,
+        type=rdf_flows.GrrMessage.Type.STATUS,
         payload=status,
-        auth_state=rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED)
-    msg.SetWireFormat("source", utils.SmartStr(self.client_id.Basename()))
+        source=self.client_id,
+        auth_state=rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED)
 
     self.flow_id = message.session_id
 
     # This is normally done by the FrontEnd when a CLIENT_KILLED message is
     # received.
     flow.Events.PublishEvent("ClientCrash", msg, token=self.token)
-
-    return [status]
-
-
-class MemoryClientMock(ActionMock):
-  """A mock of client state including memory actions."""
-
-  def InstallDriver(self, _):
-    return []
-
-  def UninstallDriver(self, _):
-    return []
-
-  def GetMemoryInformation(self, _):
-    reply = rdfvalue.MemoryInformation(
-        device=rdfvalue.PathSpec(
-            path=r"\\.\pmem",
-            pathtype=rdfvalue.PathSpec.PathType.MEMORY))
-    reply.runs.Append(offset=0x1000, length=0x10000)
-    reply.runs.Append(offset=0x20000, length=0x10000)
-
-    return [reply]
 
 
 class SampleHuntMock(object):
@@ -1483,9 +1824,9 @@ class SampleHuntMock(object):
     return self._StatFile(args)
 
   def _StatFile(self, args):
-    req = rdfvalue.ListDirRequest(args)
+    req = rdf_client.ListDirRequest(args)
 
-    response = rdfvalue.StatEntry(
+    response = rdf_client.StatEntry(
         pathspec=req.pathspec,
         st_mode=33184,
         st_ino=1063090,
@@ -1502,7 +1843,7 @@ class SampleHuntMock(object):
     self.count += 1
 
     # Create status message to report sample resource usage
-    status = rdfvalue.GrrStatus(status=rdfvalue.GrrStatus.ReturnedStatus.OK)
+    status = rdf_flows.GrrStatus(status=rdf_flows.GrrStatus.ReturnedStatus.OK)
     status.cpu_time_used.user_cpu_time = self.responses
     status.cpu_time_used.system_cpu_time = self.responses * 2
     status.network_bytes_sent = self.responses * 3
@@ -1515,7 +1856,7 @@ class SampleHuntMock(object):
     return [response, status]
 
   def TransferBuffer(self, args):
-    response = rdfvalue.BufferReference(args)
+    response = rdf_client.BufferReference(args)
 
     offset = min(args.offset, len(self.data))
     response.data = self.data[offset:]
@@ -1524,7 +1865,23 @@ class SampleHuntMock(object):
 
 
 def TestHuntHelperWithMultipleMocks(client_mocks, check_flow_errors=False,
-                                    token=None):
+                                    token=None, iteration_limit=None):
+  """Runs a hunt with a given set of clients mocks.
+
+  Args:
+    client_mocks: Dictionary of (client_id->client_mock) pairs. Client mock
+        objects are used to handle client actions. Methods names of a client
+        mock object correspond to client actions names. For an example of a
+        client mock object, see SampleHuntMock.
+    check_flow_errors: If True, raises when one of hunt-initiated flows fails.
+    token: An instance of access_control.ACLToken security token.
+    iteration_limit: If None, hunt will run until it's finished. Otherwise,
+        worker_mock.Next() will be called iteration_limit number of tiems.
+        Every iteration processes worker's message queue. If new messages
+        are sent to the queue during the iteration processing, they will
+        be processed on next iteration,
+  """
+
   total_flows = set()
 
   client_mocks = [MockClient(client_id, client_mock, token=token)
@@ -1532,8 +1889,9 @@ def TestHuntHelperWithMultipleMocks(client_mocks, check_flow_errors=False,
   worker_mock = MockWorker(check_flow_errors=check_flow_errors, token=token)
 
   # Run the clients and worker until nothing changes any more.
-  while True:
+  while iteration_limit is None or iteration_limit > 0:
     client_processed = 0
+
     for client_mock in client_mocks:
       client_processed += client_mock.Next()
 
@@ -1546,19 +1904,39 @@ def TestHuntHelperWithMultipleMocks(client_mocks, check_flow_errors=False,
     if client_processed == 0 and not flows_run:
       break
 
+    if iteration_limit:
+      iteration_limit -= 1
+
   if check_flow_errors:
     CheckFlowErrors(total_flows, token=token)
 
 
 def TestHuntHelper(client_mock, client_ids, check_flow_errors=False,
-                   token=None):
-  return TestHuntHelperWithMultipleMocks(
+                   token=None, iteration_limit=None):
+  """Runs a hunt with a given client mock on given clients.
+
+  Args:
+    client_mock: Client mock objects are used to handle client actions.
+        Methods names of a client mock object correspond to client actions
+        names. For an example of a client mock object, see SampleHuntMock.
+    client_ids: List of clients ids. Hunt will run on these clients.
+        client_mock will be used for every client id.
+    check_flow_errors: If True, raises when one of hunt-initiated flows fails.
+    token: An instance of access_control.ACLToken security token.
+    iteration_limit: If None, hunt will run until it's finished. Otherwise,
+        worker_mock.Next() will be called iteration_limit number of tiems.
+        Every iteration processes worker's message queue. If new messages
+        are sent to the queue during the iteration processing, they will
+        be processed on next iteration.
+  """
+  TestHuntHelperWithMultipleMocks(
       dict([(client_id, client_mock) for client_id in client_ids]),
-      check_flow_errors=check_flow_errors, token=token)
+      check_flow_errors=check_flow_errors, iteration_limit=iteration_limit,
+      token=token)
 
 
-# Default fixture age is (Mon Mar 26 14:07:13 2012).
-FIXTURE_TIME = 1332788833
+# Make the fixture appear to be 1 week old.
+FIXTURE_TIME = rdfvalue.RDFDatetime().Now() - rdfvalue.Duration("8d")
 
 
 def FilterFixture(fixture=None, regex="."):
@@ -1613,22 +1991,22 @@ class ClientFixture(object):
     """
     self.args = kwargs
     self.token = token
-    self.age = age or FIXTURE_TIME
-    self.client_id = rdfvalue.ClientURN(client_id)
+    self.age = age or FIXTURE_TIME.AsSecondsFromEpoch()
+    self.client_id = rdf_client.ClientURN(client_id)
     self.args["client_id"] = self.client_id.Basename()
     self.args["age"] = self.age
     self.CreateClientObject(fixture or client_fixture.VFS)
 
   def CreateClientObject(self, vfs_fixture):
     """Make a new client object."""
+
+    # First remove the old fixture just in case its still there.
+    aff4.FACTORY.Delete(self.client_id, token=self.token)
+
     # Create the fixture at a fixed time.
-    with Stubber(time, "time", lambda: self.age):
+    with FakeTime(self.age):
       for path, (aff4_type, attributes) in vfs_fixture:
         path %= self.args
-
-        # First remove the old fixture just in case its still there.
-        data_store.DB.DeleteAttributesRegex(
-            self.client_id.Add(path), aff4.AFF4_PREFIXES, token=self.token)
 
         aff4_object = aff4.FACTORY.Create(self.client_id.Add(path),
                                           aff4_type, mode="rw",
@@ -1640,7 +2018,8 @@ class ClientFixture(object):
             value %= self.args
 
           # Is this supposed to be an RDFValue array?
-          if aff4.issubclass(attribute.attribute_type, rdfvalue.RDFValueArray):
+          if aff4.issubclass(attribute.attribute_type,
+                             rdf_protodict.RDFValueArray):
             rdfvalue_object = attribute()
             for item in value:
               new_object = rdfvalue_object.rdf_type.FromTextFormat(
@@ -1649,7 +2028,7 @@ class ClientFixture(object):
 
           # It is a text serialized protobuf.
           elif aff4.issubclass(attribute.attribute_type,
-                               rdfvalue.RDFProtoStruct):
+                               rdf_structs.RDFProtoStruct):
             # Use the alternate constructor - we always write protobufs in
             # textual form:
             rdfvalue_object = attribute.attribute_type.FromTextFormat(
@@ -1658,21 +2037,69 @@ class ClientFixture(object):
           else:
             rdfvalue_object = attribute(value)
 
-          aff4_object.AddAttribute(attribute, rdfvalue_object)
+          # If we don't already have a pathspec, try and get one from the stat.
+          if aff4_object.Get(aff4_object.Schema.PATHSPEC) is None:
+            # If the attribute was a stat, it has a pathspec nested in it.
+            # We should add that pathspec as an attribute.
+            if attribute.attribute_type == rdf_client.StatEntry:
+              stat_object = attribute.attribute_type.FromTextFormat(
+                  utils.SmartStr(value))
+              if stat_object.pathspec:
+                pathspec_attribute = aff4.Attribute(
+                    "aff4:pathspec", rdf_paths.PathSpec,
+                    "The pathspec used to retrieve "
+                    "this object from the client.",
+                    "pathspec")
+                aff4_object.AddAttribute(pathspec_attribute,
+                                         stat_object.pathspec)
+
+          if attribute in ["aff4:content", "aff4:content"]:
+            # For AFF4MemoryStreams we need to call Write() instead of
+            # directly setting the contents..
+            aff4_object.Write(rdfvalue_object)
+          else:
+            aff4_object.AddAttribute(attribute, rdfvalue_object)
 
         # Make sure we do not actually close the object here - we only want to
         # sync back its attributes, not run any finalization code.
         aff4_object.Flush()
+        if aff4_type == "VFSGRRClient":
+          aff4.FACTORY.Create(client_index.MAIN_INDEX,
+                              aff4_type="ClientIndex",
+                              mode="rw",
+                              token=self.token).AddClient(aff4_object)
 
 
-class ClientVFSHandlerFixture(vfs.VFSHandler):
+class ClientVFSHandlerFixtureBase(vfs.VFSHandler):
+  """A base class for VFSHandlerFixtures."""
+
+  def ListNames(self):
+    for stat in self.ListFiles():
+      yield os.path.basename(stat.pathspec.path)
+
+  def IsDirectory(self):
+    return bool(self.ListFiles())
+
+  def _FakeDirStat(self):
+    # We return some fake data, this makes writing tests easier for some
+    # things but we give an error to the tester as it is often not what you
+    # want.
+    logging.warn("Fake value for %s under %s", self.path, self.prefix)
+    return rdf_client.StatEntry(pathspec=self.pathspec,
+                                st_mode=16877,
+                                st_size=12288,
+                                st_atime=1319796280,
+                                st_dev=1)
+
+
+class ClientVFSHandlerFixture(ClientVFSHandlerFixtureBase):
   """A client side VFS handler for the OS type - returns the fixture."""
   # A class wide cache for fixtures. Key is the prefix, and value is the
   # compiled fixture.
   cache = {}
 
   paths = None
-  supported_pathtype = rdfvalue.PathSpec.PathType.OS
+  supported_pathtype = rdf_paths.PathSpec.PathType.OS
 
   # Do not auto-register.
   auto_register = False
@@ -1680,8 +2107,11 @@ class ClientVFSHandlerFixture(vfs.VFSHandler):
   # Everything below this prefix is emulated
   prefix = "/fs/os"
 
-  def __init__(self, base_fd, prefix=None, pathspec=None):
-    super(ClientVFSHandlerFixture, self).__init__(base_fd, pathspec=pathspec)
+  def __init__(self, base_fd=None, prefix=None, pathspec=None,
+               progress_callback=None, full_pathspec=None):
+    super(ClientVFSHandlerFixture, self).__init__(
+        base_fd, pathspec=pathspec, progress_callback=progress_callback,
+        full_pathspec=full_pathspec)
 
     self.prefix = self.prefix or prefix
     self.pathspec.Append(pathspec)
@@ -1703,16 +2133,16 @@ class ClientVFSHandlerFixture(vfs.VFSHandler):
       if path == "/":
         continue
 
-      stat = rdfvalue.StatEntry()
+      stat = rdf_client.StatEntry()
       args = {"client_id": "C.1234"}
       attrs = attributes.get("aff4:stat")
 
       if attrs:
         attrs %= args  # Remove any %% and interpolate client_id.
-        stat = rdfvalue.StatEntry.FromTextFormat(utils.SmartStr(attrs))
+        stat = rdf_client.StatEntry.FromTextFormat(utils.SmartStr(attrs))
 
-      stat.pathspec = rdfvalue.PathSpec(pathtype=self.supported_pathtype,
-                                        path=path)
+      stat.pathspec = rdf_paths.PathSpec(pathtype=self.supported_pathtype,
+                                         path=path)
 
       # TODO(user): Once we add tests around not crossing device boundaries,
       # we need to be smarter here, especially for the root entry.
@@ -1726,7 +2156,7 @@ class ClientVFSHandlerFixture(vfs.VFSHandler):
     """Handle casing differences for different filesystems."""
     # Special handling for case sensitivity of registry keys.
     # This mimicks the behavior of the operating system.
-    if self.supported_pathtype == rdfvalue.PathSpec.PathType.REGISTRY:
+    if self.supported_pathtype == rdf_paths.PathSpec.PathType.REGISTRY:
       self.path = self.path.replace("\\", "/")
       parts = path.split("/")
       if vfs_type == "VFSFile":
@@ -1745,19 +2175,21 @@ class ClientVFSHandlerFixture(vfs.VFSHandler):
     client fixture.
     """
     for dirname, (_, stat) in self.paths.items():
+      pathspec = stat.pathspec
       while 1:
         dirname = os.path.dirname(dirname)
 
-        new_pathspec = stat.pathspec.Copy()
-        new_pathspec.path = dirname
+        new_pathspec = pathspec.Copy()
+        new_pathspec.path = os.path.dirname(pathspec.path)
+        pathspec = new_pathspec
 
         if dirname == "/" or dirname in self.paths: break
 
         self.paths[dirname] = ("VFSDirectory",
-                               rdfvalue.StatEntry(st_mode=16877,
-                                                  st_size=1,
-                                                  st_dev=1,
-                                                  pathspec=new_pathspec))
+                               rdf_client.StatEntry(st_mode=16877,
+                                                    st_size=1,
+                                                    st_dev=1,
+                                                    pathspec=new_pathspec))
 
   def ListFiles(self):
     # First return exact matches
@@ -1767,11 +2199,11 @@ class ClientVFSHandlerFixture(vfs.VFSHandler):
         yield stat
 
   def Read(self, length):
-    result = self.paths.get(self.path)
+    result = self.paths.get(self._NormalizeCaseForPath(self.path, "VFSFile"))
     if not result:
       raise IOError("File not found")
 
-    result = result[1]   # We just want the stat.
+    result = result[1]  # We just want the stat.
     data = ""
     if result.HasField("resident"):
       data = result.resident
@@ -1783,56 +2215,99 @@ class ClientVFSHandlerFixture(vfs.VFSHandler):
     self.offset += len(data)
     return data
 
-  def ListNames(self):
-    for stat in self.ListFiles():
-      yield os.path.basename(stat.pathspec.path)
-
-  def IsDirectory(self):
-    return bool(self.ListFiles())
-
   def Stat(self):
     """Get Stat for self.path."""
     stat_data = self.paths.get(self._NormalizeCaseForPath(self.path, None))
     if (not stat_data and
-        self.supported_pathtype == rdfvalue.PathSpec.PathType.REGISTRY):
+        self.supported_pathtype == rdf_paths.PathSpec.PathType.REGISTRY):
       # Check in case it is a registry value. Unfortunately our API doesn't let
       # the user specify if they are after a value or a key, so we have to try
       # both.
       stat_data = self.paths.get(self._NormalizeCaseForPath(self.path,
                                                             "VFSFile"))
     if stat_data:
-      return stat_data[1]   # Strip the vfs_type.
+      return stat_data[1]  # Strip the vfs_type.
     else:
-      # We return some fake data, this makes writing tests easier for some
-      # things but we give an error to the tester as it is often not what you
-      # want.
-      logging.warn("Fake value for %s under %s", self.path, self.prefix)
-      return rdfvalue.StatEntry(pathspec=self.pathspec,
-                                st_mode=16877,
-                                st_size=12288,
-                                st_atime=1319796280,
-                                st_dev=1)
+      return self._FakeDirStat()
 
 
-class ClientRegistryVFSFixture(ClientVFSHandlerFixture):
+class FakeRegistryVFSHandler(ClientVFSHandlerFixture):
   """Special client VFS mock that will emulate the registry."""
   prefix = "/registry"
-  supported_pathtype = rdfvalue.PathSpec.PathType.REGISTRY
+  supported_pathtype = rdf_paths.PathSpec.PathType.REGISTRY
 
 
-class ClientFullVFSFixture(ClientVFSHandlerFixture):
+class FakeFullVFSHandler(ClientVFSHandlerFixture):
   """Full client VFS mock."""
   prefix = "/"
-  supported_pathtype = rdfvalue.PathSpec.PathType.OS
+  supported_pathtype = rdf_paths.PathSpec.PathType.OS
+
+
+class FakeTestDataVFSHandler(ClientVFSHandlerFixtureBase):
+  """Client VFS mock that looks for files in the test_data directory."""
+  prefix = "/fs/os"
+  supported_pathtype = rdf_paths.PathSpec.PathType.OS
+
+  def __init__(self, base_fd=None, prefix=None, pathspec=None,
+               progress_callback=None, full_pathspec=None):
+    super(FakeTestDataVFSHandler, self).__init__(
+        base_fd, pathspec=pathspec, progress_callback=progress_callback,
+        full_pathspec=full_pathspec)
+    # This should not really be done since there might be more information
+    # in the pathspec than the path but here in the test is ok.
+    if not base_fd:
+      self.pathspec = pathspec
+    else:
+      self.pathspec.last.path = os.path.join(
+          self.pathspec.last.path, pathspec.CollapsePath().lstrip("/"))
+    self.path = self.pathspec.CollapsePath()
+
+  def _AbsPath(self, filename=None):
+    path = self.path
+    if filename:
+      path = os.path.join(path, filename)
+    return os.path.join(
+        config_lib.CONFIG["Test.data_dir"], "VFSFixture", path.lstrip("/"))
+
+  def Read(self, length):
+    test_data_path = self._AbsPath()
+
+    if not os.path.exists(test_data_path):
+      raise IOError("Could not find %s" % test_data_path)
+
+    data = open(test_data_path, "r").read()[self.offset:self.offset + length]
+
+    self.offset += len(data)
+    return data
+
+  def Stat(self):
+    """Get Stat for self.path."""
+    test_data_path = self._AbsPath()
+    st = os.stat(test_data_path)
+    return files.MakeStatResponse(st, self.pathspec)
+
+  def ListFiles(self):
+    for f in os.listdir(self._AbsPath()):
+      ps = self.pathspec.Copy()
+      ps.last.path = os.path.join(ps.last.path, f)
+      yield files.MakeStatResponse(os.stat(self._AbsPath(f)), ps)
 
 
 class GrrTestProgram(unittest.TestProgram):
-  """A Unit test program which is compatible with conf based args parsing."""
+  """A Unit test program which is compatible with conf based args parsing.
+
+  This program ignores the testLoader passed to it and implements its
+  own test loading behavior in case the --tests argument was specified
+  when the program is ran. It magically reads from the --tests argument.
+
+  In case no --tests argument was specified, the program uses the test
+  loader to load the tests.
+  """
 
   def __init__(self, labels=None, **kw):
     self.labels = labels
 
-    # Recreate a new data store each time.
+    # Set everything up once for all test.
     startup.TestInit()
 
     self.setUp()
@@ -1846,9 +2321,26 @@ class GrrTestProgram(unittest.TestProgram):
 
   def setUp(self):
     """Any global initialization goes here."""
+    # We don't want to send actual email in our tests
+    self.smtp_patcher = mock.patch("smtplib.SMTP")
+    self.mock_smtp = self.smtp_patcher.start()
+
+    # "test" must not be a system user or notifications will not be delivered.
+    if "test" in aff4.GRRUser.SYSTEM_USERS:
+      users.GRRUser.SYSTEM_USERS.remove("test")
+
+    def DisabledSet(*unused_args, **unused_kw):
+      raise NotImplementedError(
+          "Usage of Set() is disabled, please use a configoverrider in tests.")
+
+    self.config_set_disable = utils.Stubber(
+        config_lib.CONFIG, "Set", DisabledSet)
+    self.config_set_disable.Start()
 
   def tearDown(self):
     """Global teardown code goes here."""
+    self.config_set_disable.Stop()
+    self.smtp_patcher.stop()
 
   def parseArgs(self, argv):
     """Delegate arg parsing to the conf subsystem."""
@@ -1897,6 +2389,49 @@ class RemotePDB(pdb.Pdb):
     (clientsocket, address) = RemotePDB.skt.accept()
     RemotePDB.handle = clientsocket.makefile("rw", 1)
     logging.warn("Received a connection from %s", address)
+
+
+class TestRekallRepositoryProfileServer(rekall_profile_server.ProfileServer):
+  """This server gets the profiles locally from the test data dir."""
+
+  def __init__(self, *args, **kw):
+    super(TestRekallRepositoryProfileServer, self).__init__(*args, **kw)
+    self.profiles_served = 0
+
+  def GetProfileByName(self, profile_name, version="v1.0"):
+    try:
+      profile_data = open(os.path.join(
+          config_lib.CONFIG["Test.data_dir"], "profiles", version,
+          profile_name + ".gz"), "rb").read()
+
+      self.profiles_served += 1
+
+      return rdf_rekall_types.RekallProfile(name=profile_name,
+                                            version=version,
+                                            data=profile_data)
+    except IOError:
+      return None
+
+
+class OSSpecificClientTests(EmptyActionTest):
+  """OS-specific client action tests.
+
+  We need to temporarily disable the actionplugin class registry to avoid
+  registering actions for other OSes.
+  """
+
+  def setUp(self):
+    super(OSSpecificClientTests, self).setUp()
+    self.action_reg_stubber = utils.Stubber(actions.ActionPlugin, "classes", {})
+    self.action_reg_stubber.Start()
+    self.binary_command_stubber = utils.Stubber(standard.ExecuteBinaryCommand,
+                                                "classes", {})
+    self.binary_command_stubber.Start()
+
+  def tearDown(self):
+    super(OSSpecificClientTests, self).tearDown()
+    self.action_reg_stubber.Stop()
+    self.binary_command_stubber.Stop()
 
 
 def main(argv=None):

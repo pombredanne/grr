@@ -17,8 +17,8 @@ class DjangoInit(registry.InitHook):
 
   def RunOnce(self):
     """Configure the Django environment."""
-    if django.VERSION[0] == 1 and django.VERSION[1] < 4:
-      msg = ("The installed Django version is too old. We need 1.4+. You can "
+    if django.VERSION[0] == 1 and django.VERSION[1] < 5:
+      msg = ("The installed Django version is too old. We need 1.5+. You can "
              "install a new version with 'sudo easy_install Django'.")
       logging.error(msg)
       raise RuntimeError(msg)
@@ -38,11 +38,18 @@ class DjangoInit(registry.InitHook):
         # Don't use the database for sessions, use a file.
         "SESSION_ENGINE": "django.contrib.sessions.backends.file",
         "ALLOWED_HOSTS": config_lib.CONFIG["AdminUI.django_allowed_hosts"],
+        "USE_I18N": False,
     }
 
     # The below will use conf/global_settings/py from Django, we need to
     # override every variable we need to set.
     settings.configure(**django_settings)
+
+    try:
+      # This is necessary for Django >= 1.7 but fails for 1.6 and below.
+      django.setup()
+    except AttributeError:
+      pass
 
     if settings.SECRET_KEY == "CHANGE_ME":
       msg = "Please change the secret key in the settings module."

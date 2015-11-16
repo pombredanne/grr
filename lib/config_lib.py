@@ -2,15 +2,14 @@
 """This is the GRR config management code.
 
 This handles opening and parsing of config files.
-
-Config documentation is at:
-http://grr.googlecode.com/git/docs/configuration.html
 """
 
 import collections
 import ConfigParser
 import errno
 import os
+import pickle
+import platform
 import re
 import StringIO
 import sys
@@ -44,6 +43,10 @@ flags.DEFINE_list("context", [],
 flags.DEFINE_list("plugins", [],
                   "Load these files as additional plugins.")
 
+flags.DEFINE_bool("disallow_missing_config_definitions", False,
+                  "If true, we raise an error on undefined config options.")
+
+
 flags.PARSER.add_argument(
     "-p", "--parameter", action="append",
     default=[],
@@ -69,6 +72,22 @@ class UnknownOption(Error, KeyError):
 
 class FilterError(Error):
   """Raised when a filter fails to perform its function."""
+
+
+class ConstModificationError(Error):
+  """Raised when the config tries to change a constant option."""
+
+
+class AlreadyInitializedError(Error):
+  """Raised when an option is defined after initialization."""
+
+
+class MissingConfigDefinitionError(Error):
+  """Raised when a config contains an undefined config option."""
+
+
+class InvalidContextError(Error):
+  """Raised when an invalid context is used."""
 
 
 class ConfigFilter(object):
@@ -111,11 +130,16 @@ class Filename(ConfigFilter):
       raise FilterError("%s: %s" % (data, e))
 
 
-class UnixPath(ConfigFilter):
-  name = "unixpath"
+class FixPathSeparator(ConfigFilter):
+  name = "fixpathsep"
 
   def Filter(self, data):
-    return data.replace("\\", "/")
+    if platform.system() == "Windows":
+      # This will fix "X:\", and might add extra slashes to other paths, but
+      # this is OK.
+      return data.replace("\\", "\\\\")
+    else:
+      return data.replace("\\", "/")
 
 
 class Base64(ConfigFilter):
@@ -316,21 +340,41 @@ class YamlParser(GRRConfigParser):
 
   name = "yaml"
 
+  def _LoadYamlByName(self, filename):
+    return yaml.safe_load(open(filename, "rb"))
+
+  def _ParseYaml(self, filename="", fd=None):
+    """Recursively parse included configs."""
+    if not filename and not fd:
+      raise IOError("Neither filename nor fd specified")
+
+    if fd:
+      data = yaml.safe_load(fd) or OrderedYamlDict()
+    elif filename:
+      data = self._LoadYamlByName(filename) or OrderedYamlDict()
+    for include in data.pop("ConfigIncludes", []):
+      path = os.path.join(os.path.dirname(filename), include)
+      parser_cls = GrrConfigManager.GetParserFromFilename(path)
+      parser = parser_cls(filename=path)
+      data.update(parser.RawData())
+
+    return data
+
   def __init__(self, filename=None, data=None, fd=None):
     super(YamlParser, self).__init__()
 
     if fd:
-      self.parsed = yaml.safe_load(fd)
       self.fd = fd
       try:
         self.filename = fd.name
       except AttributeError:
         self.filename = None
+      self.parsed = self._ParseYaml(fd=fd, filename=(self.filename or ""))
 
     elif filename:
+      self.filename = filename
       try:
-        self.parsed = yaml.safe_load(open(filename, "rb")) or OrderedYamlDict()
-
+        self.parsed = self._ParseYaml(filename=filename) or OrderedYamlDict()
       except IOError as e:
         if e.errno == errno.EACCES:
           # Specifically catch access denied errors, this usually indicates the
@@ -342,12 +386,10 @@ class YamlParser(GRRConfigParser):
       except OSError:
         self.parsed = OrderedYamlDict()
 
-      self.filename = filename
-
     elif data is not None:
-      fd = StringIO.StringIO(data)
-      self.parsed = yaml.safe_load(fd)
       self.filename = filename
+      fd = StringIO.StringIO(data)
+      self.parsed = self._ParseYaml(fd=fd)
     else:
       raise Error("Filename not specified.")
 
@@ -396,7 +438,7 @@ class YamlParser(GRRConfigParser):
     Returns:
       a dict in common format. Any keys in the raw data which have a "." in them
       are separated into their own sections. This allows the config to be
-      written explicitely in dot notation instead of using a section.
+      written explicitly in dot notation instead of using a section.
     """
     if not isinstance(data, dict):
       return data
@@ -439,7 +481,7 @@ class StringInterpolator(lexer.Lexer):
 
   tokens = [
       # When in literal mode, only allow to escape }
-      lexer.Token("Literal", r"\\[^}]", "AppendArg", None),
+      lexer.Token("Literal", r"\\[^{}]", "AppendArg", None),
 
       # Allow escaping of special characters
       lexer.Token(None, r"\\(.)", "Escape", None),
@@ -448,25 +490,24 @@ class StringInterpolator(lexer.Lexer):
       # i.e. we include anything until the next }. It is still possible to
       # escape } if this character needs to be inserted literally.
       lexer.Token("Literal", r"\}", "EndLiteralExpression,PopState", None),
-      lexer.Token("Literal", r"[^}]+", "AppendArg", None),
+      lexer.Token("Literal", r"[^}\\]+", "AppendArg", None),
       lexer.Token(None, r"\%\{", "StartExpression,PushState", "Literal"),
 
       # Expansion sequence is %(....)
       lexer.Token(None, r"\%\(", "StartExpression", None),
-      lexer.Token(None, r"\|([a-zA-Z]+)\)", "Filter", None),
+      lexer.Token(None, r"\|([a-zA-Z_]+)\)", "Filter", None),
       lexer.Token(None, r"\)", "ExpandArg", None),
 
       # Glob up as much data as possible to increase efficiency here.
       lexer.Token(None, r"[^()%{}|\\]+", "AppendArg", None),
       lexer.Token(None, r".", "AppendArg", None),
-
-      # Empty input is also ok.
-      lexer.Token(None, "^$", None, None)
-      ]
+  ]
 
   STRING_ESCAPES = {"\\\\": "\\",
                     "\\(": "(",
                     "\\)": ")",
+                    "\\{": "{",
+                    "\\}": "}",
                     "\\%": "%"}
 
   def __init__(self, data, config, default_section="", parameter=None,
@@ -511,6 +552,7 @@ class StringInterpolator(lexer.Lexer):
       if filter_object is None:
         raise FilterError("Unknown filter function %r" % filter_name)
 
+      logging.debug("Applying filter %s for %s.", filter_name, arg)
       arg = filter_object().Filter(arg)
 
     self.stack[-1] += arg
@@ -564,6 +606,8 @@ class GrrConfigManager(object):
     self.writeback_data = OrderedYamlDict()
     self.global_override = dict()
     self.context_descriptions = {}
+    self.constants = set()
+    self.valid_contexts = set()
 
     # This is the type info set describing all configuration
     # parameters.
@@ -574,6 +618,8 @@ class GrrConfigManager(object):
 
     # A cache of validated and interpolated results.
     self.FlushCache()
+
+    self.initialized = False
 
   def FlushCache(self):
     self.cache = {}
@@ -601,6 +647,7 @@ class GrrConfigManager(object):
     result.type_infos = self.type_infos
     result.defaults = self.defaults
     result.context = self.context
+    result.valid_contexts = self.valid_contexts
 
     return result
 
@@ -682,17 +729,36 @@ class GrrConfigManager(object):
     Args:
       context_string: A string which describes the global program.
       description: A description as to when this context applies.
+    Raises:
+      InvalidContextError: An undefined context was specified.
     """
     if context_string not in self.context:
+      if context_string not in self.valid_contexts:
+        raise InvalidContextError(
+            "Invalid context specified: %s" % context_string)
+
       self.context.append(context_string)
       self.context_descriptions[context_string] = description
 
     self.FlushCache()
 
+  def RemoveContext(self, context_string):
+    if context_string in self.context:
+      self.context.remove(context_string)
+      self.context_descriptions.pop(context_string)
+
+    self.FlushCache()
+
+  def ExportState(self):
+    return pickle.dumps(self)
+
   def SetRaw(self, name, value):
     """Set the raw string without verification or escaping."""
     if self.writeback is None:
       logging.warn("Attempting to modify a read only config object.")
+    if name in self.constants:
+      raise ConstModificationError(
+          "Attempting to modify constant value %s" % name)
 
     self.writeback_data[name] = value
     self.FlushCache()
@@ -707,13 +773,17 @@ class GrrConfigManager(object):
       name: The name of the parameter to set.
       value: The value to set it to. The value will be validated against the
         option's type descriptor.
+    Raises:
+      ConstModificationError: When attempting to change a constant option.
     """
-
     # If the configuration system has a write back location we use it,
     # otherwise we use the primary configuration object.
     if self.writeback is None:
       logging.warn("Attempting to modify a read only config object for %s.",
                    name)
+    if name in self.constants:
+      raise ConstModificationError(
+          "Attempting to modify constant value %s" % name)
 
     writeback_data = self.writeback_data
 
@@ -747,25 +817,39 @@ class GrrConfigManager(object):
       raise RuntimeError("Attempting to write a configuration without a "
                          "writeback location.")
 
-  def AddOption(self, descriptor):
+  def AddOption(self, descriptor, constant=False):
     """Registers an option with the configuration system.
 
     Args:
       descriptor: A TypeInfoObject instance describing the option.
+      constant: If this is set, the option is treated as a constant - it can be
+                read at any time (before parsing the configuration) and it's an
+                error to try to override it in a config file.
 
     Raises:
       RuntimeError: The descriptor's name must contain a . to denote the section
          name, otherwise we raise.
+      AlreadyInitializedError: If the config has already been read it's too late
+         to define new options.
     """
+    if self.initialized:
+      raise AlreadyInitializedError(
+          "Config was already initialized when defining %s" % descriptor.name)
+
     descriptor.section = descriptor.name.split(".")[0]
     if descriptor.name in self.type_infos:
       logging.warning("Config Option %s multiply defined!", descriptor.name)
 
     self.type_infos.Append(descriptor)
+    if constant:
+      self.constants.add(descriptor.name)
 
     # Register this option's default value.
     self.defaults[descriptor.name] = descriptor.GetDefault()
     self.FlushCache()
+
+  def DefineContext(self, context_name):
+    self.valid_contexts.add(context_name)
 
   def FormatHelp(self):
     result = "Context: %s\n\n" % ",".join(self.context)
@@ -786,7 +870,7 @@ class GrrConfigManager(object):
       unicode: type_info.String,
       int: type_info.Integer,
       list: type_info.List,
-      }
+  }
 
   def MergeData(self, merge_data, raw_data=None):
     self.FlushCache()
@@ -796,6 +880,8 @@ class GrrConfigManager(object):
     for k, v in merge_data.items():
       # A context clause.
       if isinstance(v, OrderedYamlDict):
+        if k not in self.valid_contexts:
+          raise InvalidContextError("Invalid context specified: %s" % k)
         context_data = raw_data.setdefault(k, OrderedYamlDict())
         self.MergeData(v, context_data)
 
@@ -803,19 +889,24 @@ class GrrConfigManager(object):
         # Find the descriptor for this field.
         descriptor = self.type_infos.get(k)
         if descriptor is None:
-          descriptor_cls = self.default_descriptors.get(type(v),
-                                                        type_info.String)
-          descriptor = descriptor_cls(name=k)
-          logging.debug("Parameter %s in config file not known, assuming %s",
-                        k, type(descriptor))
-          self.AddOption(descriptor)
+          msg = ("Missing config definition for %s. This option is likely "
+                 "deprecated or renamed. Check the release notes." % k)
+          if flags.FLAGS.disallow_missing_config_definitions:
+            raise MissingConfigDefinitionError(msg)
+          else:
+            logging.warning(msg)
 
         if isinstance(v, basestring):
           v = v.strip()
 
+        if k in self.constants:
+          raise ConstModificationError(
+              "Attempting to modify constant value %s" % k)
+
         raw_data[k] = v
 
-  def _GetParserFromFilename(self, path):
+  @classmethod
+  def GetParserFromFilename(cls, path):
     """Returns the appropriate parser class from the filename url."""
     # Find the configuration parser.
     url = urlparse.urlparse(path, scheme="file")
@@ -849,7 +940,7 @@ class GrrConfigManager(object):
     Returns:
       The parser used to parse this configuration source.
     """
-    parser_cls = self._GetParserFromFilename(url)
+    parser_cls = self.GetParserFromFilename(url)
     parser = parser_cls(filename=url)
     logging.info("Loading configuration from %s", url)
 
@@ -891,6 +982,7 @@ class GrrConfigManager(object):
       self.raw_data = OrderedYamlDict()
       self.writeback_data = OrderedYamlDict()
       self.writeback = None
+      self.initialized = False
 
     if fd is not None:
       self.parser = parser(fd=fd)
@@ -908,6 +1000,8 @@ class GrrConfigManager(object):
 
     else:
       raise RuntimeError("Registry path not provided.")
+
+    self.initialized = True
 
   def __getitem__(self, name):
     """Retrieve a configuration value after suitable interpolations."""
@@ -937,17 +1031,31 @@ class GrrConfigManager(object):
 
       default: If retrieving the value results in an error, return this default.
 
-      context: A context to resolve the configuration. This is a set of roles
-        the caller is current executing with. For example (client, windows). If
-        not specified we take the context from the current thread's TLS stack.
+      context: A list of context strings to resolve the configuration. This is a
+      set of roles the caller is current executing with. For example (client,
+      windows). If not specified we take the context from the current thread's
+      TLS stack.
 
     Returns:
       The value of the parameter.
     Raises:
       ConfigFormatError: if verify=True and the config doesn't validate.
+      RuntimeError: if a value is retrieved before the config is initialized.
+      ValueError: if a bad context is passed.
     """
+    if not self.initialized:
+      if name not in self.constants:
+        raise RuntimeError("Error while retrieving %s: "
+                           "Configuration hasn't been initialized yet." % name)
+    if context:
+      # Make sure it's not just a string and is iterable.
+      if (isinstance(context, basestring) or
+          not isinstance(context, collections.Iterable)):
+        raise ValueError("context should be a list, got %s" % str(context))
+
     calc_context = context
     # Use a default global context if context is not provided.
+
     if context is None:
       # Only use the cache when no special context is specified.
       if default is utils.NotAValue and name in self.cache:
@@ -998,6 +1106,9 @@ class GrrConfigManager(object):
       path = []
 
     for element in context:
+      if element not in self.valid_contexts:
+        raise InvalidContextError("Invalid context specified: %s" % element)
+
       if element in raw_data:
         context_raw_data = raw_data[element]
 
@@ -1047,8 +1158,10 @@ class GrrConfigManager(object):
       value = matches[-1][1]
       container = matches[-1][0]
 
-      if (len(matches) >= 2 and len(matches[-1][2]) == len(matches[-2][2]) and
-          matches[-1][2] != matches[-2][2]):
+      if (len(matches) >= 2 and
+          len(matches[-1][2]) == len(matches[-2][2]) and
+          matches[-1][2] != matches[-2][2] and
+          matches[-1][1] != matches[-2][1]):
         # This warning specifies that there is an ambiguous match, the config
         # attempts to find the most specific value e.g. if you have a value
         # for X.y in context A,B,C, and a value for X.y in D,B it should choose
@@ -1056,8 +1169,9 @@ class GrrConfigManager(object):
         # A,B and one in A,C. The config doesn't know which one to pick so picks
         # one and displays this warning.
         logging.warn("Ambiguous configuration for key %s: "
-                     "Contexts of equal length: %s and %s", name,
-                     matches[-1][2], matches[-2][2])
+                     "Contexts of equal length: %s (%s) and %s (%s)",
+                     name, matches[-1][2], matches[-1][1],
+                     matches[-2][2], matches[-2][1])
 
     # If there is a writeback location this overrides any previous
     # values.
@@ -1085,7 +1199,7 @@ class GrrConfigManager(object):
   def InterpolateValue(self, value, type_info_obj=type_info.String(),
                        default_section=None, context=None):
     """Interpolate the value and parse it with the appropriate type."""
-    # It is only possible to interpolate strings.
+    # It is only possible to interpolate strings...
     if isinstance(value, basestring):
       value = StringInterpolator(
           value, self, default_section=default_section,
@@ -1093,6 +1207,11 @@ class GrrConfigManager(object):
 
       # Parse the data from the string.
       value = type_info_obj.FromString(value)
+
+    # ... and lists of strings.
+    if isinstance(value, list):
+      value = [self.InterpolateValue(
+          v, default_section=default_section, context=context) for v in value]
 
     return value
 
@@ -1102,6 +1221,29 @@ class GrrConfigManager(object):
       result.add(descriptor.section)
 
     return result
+
+  def MatchBuildContext(self, target_os, target_arch, target_package,
+                        context=None):
+    """Return true if target_platforms matches the supplied parameters.
+
+    Used by buildanddeploy to determine what clients need to be built.
+
+    Args:
+      target_os: which os we are building for in this run (linux, windows,
+                 darwin)
+      target_arch: which arch we are building for in this run (i386, amd64)
+      target_package: which package type we are building (exe, dmg, deb, rpm)
+      context: config_lib context
+
+    Returns:
+      bool: True if target_platforms spec matches parameters.
+    """
+    for spec in self.Get("ClientBuilder.target_platforms", context=context):
+      spec_os, arch, package = spec.split("_")
+      if (spec_os == target_os and arch == target_arch and
+          package == target_package):
+        return True
+    return False
 
   # pylint: disable=g-bad-name,redefined-builtin
   def DEFINE_bool(self, name, default, help):
@@ -1130,11 +1272,27 @@ class GrrConfigManager(object):
                                   description=help,
                                   validator=type_info.String()))
 
+  def DEFINE_constant_string(self, name, default, help):
+    """A helper for defining constant strings."""
+    self.AddOption(type_info.String(name=name, default=default or "",
+                                    description=help), constant=True)
+
+  def DEFINE_context(self, name):
+    self.DefineContext(name)
+
   # pylint: enable=g-bad-name
 
 
 # Global for storing the config.
 CONFIG = GrrConfigManager()
+
+
+def ImportConfigManger(pickled_manager):
+  """Import a config manager exported with GrrConfigManager.ExportState()."""
+  global CONFIG
+  CONFIG = pickle.loads(pickled_manager)
+  CONFIG.FlushCache()
+  return CONFIG
 
 
 # pylint: disable=g-bad-name,redefined-builtin
@@ -1181,6 +1339,13 @@ def DEFINE_choice(name, default, choices, help):
       description=help))
 
 
+def DEFINE_multichoice(name, default, choices, help):
+  """Choose multiple options from a list."""
+  CONFIG.AddOption(type_info.MultiChoice(
+      name=name, default=default, choices=choices,
+      description=help))
+
+
 def DEFINE_list(name, default, help):
   """A helper for defining lists of strings options."""
   CONFIG.AddOption(type_info.List(name=name, default=default,
@@ -1195,6 +1360,12 @@ def DEFINE_semantic(semantic_type, name, default=None, description=""):
 
 def DEFINE_option(type_descriptor):
   CONFIG.AddOption(type_descriptor)
+
+
+def DEFINE_constant_string(name, default, help):
+  """A helper for defining constant strings."""
+  CONFIG.AddOption(type_info.String(name=name, default=default or "",
+                                    description=help), constant=True)
 
 # pylint: enable=g-bad-name
 
@@ -1214,9 +1385,6 @@ def LoadConfig(config_obj, config_file, secondary_configs=None,
 
   Returns:
     The resulting config object. The one passed in, unless None was specified.
-
-  See the following for extra details on how this works:
-  http://grr.googlecode.com/git/docs/configuration.html
   """
   if config_obj is None or reset:
     # Create a new config object.
@@ -1262,7 +1430,11 @@ def ParseConfigCommandLine():
 
   # Load additional contexts from the command line.
   for context in flags.FLAGS.context:
-    CONFIG.AddContext(context)
+    if context:
+      CONFIG.AddContext(context)
+
+  if CONFIG["Config.writeback"]:
+    CONFIG.SetWriteBack(CONFIG["Config.writeback"])
 
   # Does the user want to dump help? We do this after the config system is
   # initialized so the user can examine what we think the value of all the

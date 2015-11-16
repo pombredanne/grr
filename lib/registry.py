@@ -47,6 +47,10 @@ class MetaclassRegistry(abc.ABCMeta):
 
       try:
         if cls.classes and cls.__name__ in cls.classes:
+          # TODO(user): this should really raise instead of just logging,
+          # since it can hide serious problems with registration.  Unfortunately
+          # gui/runtests.TestPluginInit relies on being able to re-import and
+          # overwrite the test plugins after django has been initialized.
           logging.warn("Duplicate names for registered classes: %s, %s",
                        cls, cls.classes[cls.__name__])
 
@@ -70,6 +74,22 @@ class MetaclassRegistry(abc.ABCMeta):
 
       except AttributeError:
         pass
+    else:
+      # Abstract classes should still have all the metadata attributes
+      # registered.
+      for base in bases:
+        try:
+          cls.classes = base.classes
+          cls.classes_by_name = base.classes_by_name
+          break
+        except AttributeError:
+          pass
+
+      if not hasattr(cls, "classes"):
+        cls.classes = {}
+
+      if not hasattr(cls, "classes_by_name"):
+        cls.classes_by_name = {}
 
   def GetPlugin(cls, name):
     """Return the class of the implementation that carries that name.
@@ -84,6 +104,18 @@ class MetaclassRegistry(abc.ABCMeta):
        A the registered class referred to by the name.
     """
     return cls.classes[name]
+
+
+class EventRegistry(MetaclassRegistry):
+
+  EVENT_NAME_MAP = {}
+
+  def __init__(cls, name, bases, env_dict):
+    MetaclassRegistry.__init__(cls, name, bases, env_dict)
+
+    # Register ourselves as listeners for the events in cls.EVENTS.
+    for ev in cls.EVENTS:
+      EventRegistry.EVENT_NAME_MAP.setdefault(ev, set()).add(cls)
 
 
 # Utility functions
@@ -136,11 +168,13 @@ class HookRegistry(object):
       cls_instance.RunOnce()
       self.already_run_once.add(hook_cls)
 
-  def _RunAllHooks(self, executed_hooks):
+  def _RunAllHooks(self, executed_hooks, skip_set):
     for hook_cls in self.__class__.classes.values():
+      if skip_set and hook_cls.__name__ in skip_set:
+        continue
       self._RunSingleHook(hook_cls, executed_hooks)
 
-  def Init(self):
+  def Init(self, skip_set=None):
     with InitHook.lock:
       executed_hooks = set()
       while 1:
@@ -148,7 +182,7 @@ class HookRegistry(object):
           # This code allows init hooks to import modules which have more hooks
           # defined - We ensure we only run each hook only once.
           last_run_hooks = len(executed_hooks)
-          self._RunAllHooks(executed_hooks)
+          self._RunAllHooks(executed_hooks, skip_set)
           if last_run_hooks == len(executed_hooks):
             break
 
@@ -178,9 +212,9 @@ def TestInit():
   InitHook().Init()
 
 
-def Init():
+def Init(skip_set=None):
   if InitHook.already_run_once:
     return
 
   # This initializes any class which inherits from InitHook.
-  InitHook().Init()
+  InitHook().Init(skip_set)

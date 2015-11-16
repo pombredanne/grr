@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Test the webhistory flows."""
 
 import os
@@ -7,13 +6,24 @@ import os
 from grr.client import client_utils_linux
 from grr.client import client_utils_osx
 from grr.client.client_actions import standard
+from grr.lib import action_mocks
 from grr.lib import aff4
-from grr.lib import rdfvalue
+from grr.lib import artifact_test
+from grr.lib import flags
 from grr.lib import test_lib
 from grr.lib import utils
+# pylint: disable=unused-import
+from grr.lib.flows.general import webhistory
+# pylint: enable=unused-import
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
-class TestWebHistory(test_lib.FlowTestsBaseclass):
+class WebHistoryFlowTest(test_lib.FlowTestsBaseclass):
+  pass
+
+
+class TestWebHistory(WebHistoryFlowTest):
   """Test the browser history flows."""
 
   def setUp(self):
@@ -23,23 +33,23 @@ class TestWebHistory(test_lib.FlowTestsBaseclass):
     self.client.Set(self.client.Schema.SYSTEM("Linux"))
 
     user_list = self.client.Schema.USER()
-    user_list.Append(rdfvalue.User(username="test",
-                                   full_name="test user",
-                                   homedir="/home/test/",
-                                   last_logon=250))
+    user_list.Append(rdf_client.User(username="test",
+                                     full_name="test user",
+                                     homedir="/home/test/",
+                                     last_logon=250))
     self.client.AddAttribute(self.client.Schema.USER, user_list)
     self.client.Close()
 
-    self.client_mock = test_lib.ActionMock(
-        "ReadBuffer", "HashFile", "HashBuffer", "TransferBuffer", "StatFile",
-        "Find", "ListDirectory")
+    self.client_mock = action_mocks.ActionMock(
+        "ReadBuffer", "FingerprintFile", "HashBuffer", "TransferBuffer",
+        "StatFile", "Find", "ListDirectory", "Grep")
 
     # Mock the client to make it look like the root partition is mounted off the
     # test image. This will force all flow access to come off the image.
     def MockGetMountpoints():
       return {
           "/": (os.path.join(self.base_path, "test_img.dd"), "ext2")
-          }
+      }
     self.orig_linux_mp = client_utils_linux.GetMountpoints
     self.orig_osx_mp = client_utils_osx.GetMountpoints
     client_utils_linux.GetMountpoints = MockGetMountpoints
@@ -59,7 +69,7 @@ class TestWebHistory(test_lib.FlowTestsBaseclass):
     for _ in test_lib.TestFlowHelper(
         "ChromeHistory", self.client_mock, check_flow_errors=False,
         client_id=self.client_id, username="test", token=self.token,
-        output="analysis/testfoo", pathtype=rdfvalue.PathSpec.PathType.TSK):
+        output="analysis/testfoo", pathtype=rdf_paths.PathSpec.PathType.TSK):
       pass
 
     # Now check that the right files were downloaded.
@@ -85,7 +95,7 @@ class TestWebHistory(test_lib.FlowTestsBaseclass):
     for _ in test_lib.TestFlowHelper(
         "FirefoxHistory", self.client_mock, check_flow_errors=False,
         client_id=self.client_id, username="test", token=self.token,
-        output="analysis/ff_out", pathtype=rdfvalue.PathSpec.PathType.TSK):
+        output="analysis/ff_out", pathtype=rdf_paths.PathSpec.PathType.TSK):
       pass
 
     # Now check that the right files were downloaded.
@@ -96,7 +106,7 @@ class TestWebHistory(test_lib.FlowTestsBaseclass):
                   "test_img.dd"])).Add(fs_path.replace("\\", "/"))
     fd = aff4.FACTORY.Open(output_path, token=self.token)
     self.assertTrue(fd.size > 20000)
-    self.assertEquals(fd.read(15), "SQLite format 3")
+    self.assertEqual(fd.read(15), "SQLite format 3")
 
     # Check for analysis file.
     output_path = self.client_id.Add("analysis/ff_out")
@@ -113,7 +123,7 @@ class TestWebHistory(test_lib.FlowTestsBaseclass):
         "CacheGrep", self.client_mock, check_flow_errors=False,
         client_id=self.client_id, grep_users=["test"],
         data_regex="ENIAC", output="analysis/cachegrep/{u}",
-        pathtype=rdfvalue.PathSpec.PathType.TSK, token=self.token):
+        pathtype=rdf_paths.PathSpec.PathType.TSK, token=self.token):
       pass
 
     # Check if the collection file was created.
@@ -123,12 +133,71 @@ class TestWebHistory(test_lib.FlowTestsBaseclass):
                            token=self.token)
 
     # There should be one hit.
-    self.assertEquals(len(fd), 1)
+    self.assertEqual(len(fd), 1)
 
     # Get the first hit.
     hits = list(fd)
 
-    self.assertIsInstance(hits[0], rdfvalue.StatEntry)
+    self.assertIsInstance(hits[0], rdf_client.StatEntry)
 
-    self.assertEquals(hits[0].pathspec.last.path,
-                      "/home/test/.config/google-chrome/Default/Cache/data_1")
+    self.assertEqual(hits[0].pathspec.last.path,
+                     "/home/test/.config/google-chrome/Default/Cache/data_1")
+
+
+class TestWebHistoryWithArtifacts(WebHistoryFlowTest,
+                                  artifact_test.ArtifactTest):
+  """Test the browser history flows."""
+
+  def setUp(self):
+    super(TestWebHistoryWithArtifacts, self).setUp()
+    self.SetLinuxClient()
+    fd = aff4.FACTORY.Open(self.client_id, token=self.token, mode="rw")
+    self.kb = fd.Schema.KNOWLEDGE_BASE()
+    self.kb.users.Append(rdf_client.KnowledgeBaseUser(username="test",
+                                                      full_name="test user",
+                                                      homedir="/home/test/",
+                                                      last_logon=250))
+    self.kb.os = "Linux"
+    fd.AddAttribute(fd.Schema.KNOWLEDGE_BASE, self.kb)
+    fd.Flush()
+
+    self.client_mock = action_mocks.ActionMock(
+        "ReadBuffer", "FingerprintFile", "HashBuffer", "TransferBuffer",
+        "StatFile", "Find", "ListDirectory")
+
+  def testChrome(self):
+    """Check we can run WMI based artifacts."""
+    with self.MockClientMountPointsWithImage(
+        os.path.join(self.base_path, "test_img.dd")):
+
+      fd = self.RunCollectorAndGetCollection(
+          ["ChromeHistory"], client_mock=self.client_mock, use_tsk=True,
+          knowledge_base=self.kb)
+
+    self.assertEqual(len(fd), 71)
+    self.assertTrue("/home/john/Downloads/funcats_scr.exe" in
+                    [d.download_path for d in fd])
+    self.assertTrue("http://www.java.com/" in [d.url for d in fd])
+    self.assertTrue(fd[0].source_urn.Path().endswith(
+        "/home/test/.config/google-chrome/Default/History"))
+
+  def testFirefox(self):
+    """Check we can run WMI based artifacts."""
+    with self.MockClientMountPointsWithImage(
+        os.path.join(self.base_path, "test_img.dd")):
+      fd = self.RunCollectorAndGetCollection(
+          ["FirefoxHistory"], client_mock=self.client_mock, use_tsk=True)
+
+    self.assertEqual(len(fd), 5)
+    self.assertEqual(fd[0].access_time.AsSecondsFromEpoch(), 1340623334)
+    self.assertTrue("http://sport.orf.at/" in [d.url for d in fd])
+    self.assertTrue(fd[0].source_urn.Path().endswith(
+        "/home/test/.mozilla/firefox/adts404t.default/places.sqlite"))
+
+
+def main(argv):
+  # Run the full test suite
+  test_lib.GrrTestProgram(argv=argv)
+
+if __name__ == "__main__":
+  flags.StartMain(main)

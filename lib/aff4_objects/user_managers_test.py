@@ -9,6 +9,7 @@ from grr.lib.aff4_objects import user_managers
 
 
 class GRRUserTest(test_lib.AFF4ObjectTest):
+
   def testUserPasswords(self):
     with aff4.FACTORY.Create("aff4:/users/test", "GRRUser",
                              token=self.token) as user:
@@ -22,12 +23,14 @@ class GRRUserTest(test_lib.AFF4ObjectTest):
   def testLabels(self):
     with aff4.FACTORY.Create("aff4:/users/test", "GRRUser",
                              token=self.token) as user:
-      user.SetLabels("hello", "world")
+      user.SetLabels("hello", "world", owner="GRR")
+
     user = aff4.FACTORY.Open(user.urn, token=self.token)
-    self.assertListEqual(["hello", "world"], user.GetLabels())
+    self.assertListEqual(["hello", "world"], user.GetLabelsNames())
 
 
 class CheckAccessHelperTest(test_lib.AFF4ObjectTest):
+
   def setUp(self):
     super(CheckAccessHelperTest, self).setUp()
     self.helper = user_managers.CheckAccessHelper("test")
@@ -139,11 +142,11 @@ class CheckAccessHelperTest(test_lib.AFF4ObjectTest):
     self.Ok("aff4:/config/drivers/windows/memory/winpmem.amd64.sys", access)
 
     self.Ok("aff4:/flows", access)
-    self.Ok("aff4:/flows/W:12345678", access)
+    self.Ok("aff4:/flows/F:12345678", access)
 
     self.Ok("aff4:/hunts", access)
-    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456", access)
-    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456/W:AAAAAAAA", access)
+    self.Ok("aff4:/hunts/H:12345678/C.1234567890123456", access)
+    self.Ok("aff4:/hunts/H:12345678/C.1234567890123456/F:AAAAAAAA", access)
 
     self.Ok("aff4:/cron", access)
     self.Ok("aff4:/cron/OSBreakDown", access)
@@ -153,10 +156,11 @@ class CheckAccessHelperTest(test_lib.AFF4ObjectTest):
 
     self.Ok("aff4:/audit", access)
     self.Ok("aff4:/audit/log", access)
+    self.Ok("aff4:/audit/logs", access)
 
     self.Ok("aff4:/C.0000000000000001", access)
     self.NotOk("aff4:/C.0000000000000001/fs/os", access)
-    self.NotOk("aff4:/C.0000000000000001/flows/W:12345678", access)
+    self.NotOk("aff4:/C.0000000000000001/flows/F:12345678", access)
 
     self.Ok("aff4:/tmp", access)
     self.Ok("aff4:/tmp/C8FAFC0F", access)
@@ -190,8 +194,8 @@ class CheckAccessHelperTest(test_lib.AFF4ObjectTest):
     self.Ok("aff4:/flows/W:12345678", access)
 
     self.Ok("aff4:/hunts", access)
-    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456", access)
-    self.Ok("aff4:/hunts/W:12345678/C.1234567890123456/W:AAAAAAAA", access)
+    self.Ok("aff4:/hunts/H:12345678/C.1234567890123456", access)
+    self.Ok("aff4:/hunts/H:12345678/C.1234567890123456/F:AAAAAAAA", access)
 
     self.Ok("aff4:/cron", access)
     self.Ok("aff4:/cron/OSBreakDown", access)
@@ -199,6 +203,7 @@ class CheckAccessHelperTest(test_lib.AFF4ObjectTest):
     self.NotOk("aff4:/crashes", access)
 
     self.NotOk("aff4:/audit", access)
+    self.Ok("aff4:/audit/logs", access)
 
     self.Ok("aff4:/C.0000000000000001", access)
     self.NotOk("aff4:/C.0000000000000001/fs/os", access)

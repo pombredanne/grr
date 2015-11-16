@@ -18,15 +18,17 @@ from grr.lib import config_lib
 from grr.lib import data_store
 from grr.lib import email_alerts
 from grr.lib import flow
+from grr.lib import queues
 from grr.lib import rdfvalue
 from grr.lib import registry
 from grr.lib import rendering
 from grr.lib import stats
 from grr.lib import utils
+from grr.lib.aff4_objects import collections
 from grr.lib.aff4_objects import reports
-from grr.proto import flows_pb2
-
-
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
@@ -44,13 +46,19 @@ class ClientCrashEventListener(flow.EventListener):
 
   def _AppendCrashDetails(self, path, crash_details):
     collection = aff4.FACTORY.Create(
-        path, "RDFValueCollection", mode="rw", token=self.token)
+        path, "PackedVersionedCollection", mode="rw", token=self.token)
 
     collection.Add(crash_details)
     collection.Close(sync=False)
 
   def WriteAllCrashDetails(self, client_id, crash_details,
                            flow_session_id=None, hunt_session_id=None):
+    # Update last crash attribute of the client.
+    client_obj = aff4.FACTORY.Create(client_id, "VFSGRRClient",
+                                     token=self.token)
+    client_obj.Set(client_obj.Schema.LAST_CRASH(crash_details))
+    client_obj.Close(sync=False)
+
     # Duplicate the crash information in a number of places so we can find it
     # easily.
     self._AppendCrashDetails(client_id.Add("crashes"), crash_details)
@@ -71,7 +79,20 @@ class ClientCrashEventListener(flow.EventListener):
               hunt_session_id.Add("crashes"), crash_details)
 
 
-class GetClientStats(flow.GRRFlow):
+class GetClientStatsProcessResponseMixin(object):
+  """Mixin defining ProcessReponse() that writes client stats to datastore."""
+
+  def ProcessResponse(self, client_id, response):
+    """Actually processes the contents of the response."""
+    urn = client_id.Add("stats")
+
+    with aff4.FACTORY.Create(urn, "ClientStats", token=self.token,
+                             mode="w") as stats_fd:
+      # Only keep the average of all values that fall within one minute.
+      stats_fd.AddAttribute(stats_fd.Schema.STATS, response.DownSample())
+
+
+class GetClientStats(flow.GRRFlow, GetClientStatsProcessResponseMixin):
   """This flow retrieves information about the GRR client process."""
 
   category = "/Administrative/"
@@ -91,34 +112,23 @@ class GetClientStats(flow.GRRFlow):
     for response in responses:
       self.ProcessResponse(self.client_id, response)
 
-  def ProcessResponse(self, client_id, response):
-    """Actually processes the contents of the response."""
-    urn = client_id.Add("stats")
 
-    stats_fd = aff4.FACTORY.Create(urn, "ClientStats", token=self.token,
-                                   mode="rw")
-
-    # Only keep the average of all values that fall within one minute.
-    response.DownSample()
-    stats_fd.AddAttribute(stats_fd.Schema.STATS(response))
-
-    stats_fd.Close()
-
-
-class GetClientStatsAuto(GetClientStats, flow.WellKnownFlow):
+class GetClientStatsAuto(flow.WellKnownFlow,
+                         GetClientStatsProcessResponseMixin):
   """This action pushes client stats to the server automatically."""
 
   category = None
 
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:Stats")
+  well_known_session_id = rdfvalue.SessionID(flow_name="Stats",
+                                             queue=queues.STATS)
 
   def ProcessMessage(self, message):
     """Processes a stats response from the client."""
-    client_stats = rdfvalue.ClientStats(message.args)
+    client_stats = rdf_client.ClientStats(message.payload)
     self.ProcessResponse(message.source, client_stats)
 
 
-class DeleteGRRTempFilesArgs(rdfvalue.RDFProtoStruct):
+class DeleteGRRTempFilesArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.DeleteGRRTempFilesArgs
 
 
@@ -149,7 +159,7 @@ class DeleteGRRTempFiles(flow.GRRFlow):
       self.Log(response.data)
 
 
-class UninstallArgs(rdfvalue.RDFProtoStruct):
+class UninstallArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.UninstallArgs
 
 
@@ -206,11 +216,11 @@ class Kill(flow.GRRFlow):
       self.Log("Kill failed on the client.")
 
 
-class UpdateConfigArgs(rdfvalue.RDFProtoStruct):
-  protobuf = flows_pb2.UpdateConfigArgs
+class UpdateConfigurationArgs(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.UpdateConfigurationArgs
 
 
-class UpdateConfig(flow.GRRFlow):
+class UpdateConfiguration(flow.GRRFlow):
   """Update the configuration of the client.
 
     Note: This flow is somewhat dangerous, so we don't expose it in the UI.
@@ -218,12 +228,12 @@ class UpdateConfig(flow.GRRFlow):
 
   # Still accessible (e.g. via ajax but not visible in the UI.)
   category = None
-  args_type = UpdateConfigArgs
+  args_type = UpdateConfigurationArgs
 
   @flow.StateHandler(next_state=["Confirmation"])
   def Start(self):
-    """Call the GetConfig function on the client."""
-    self.CallClient("UpdateConfig", self.args.config,
+    """Call the UpdateConfiguration function on the client."""
+    self.CallClient("UpdateConfiguration", request=self.args.config,
                     next_state="Confirmation")
 
   @flow.StateHandler(next_state="End")
@@ -234,7 +244,7 @@ class UpdateConfig(flow.GRRFlow):
           responses.status))
 
 
-class ExecutePythonHackArgs(rdfvalue.RDFProtoStruct):
+class ExecutePythonHackArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ExecutePythonHackArgs
 
 
@@ -250,11 +260,13 @@ class ExecutePythonHack(flow.GRRFlow):
     fd = aff4.FACTORY.Open(python_hack_root_urn.Add(self.args.hack_name),
                            token=self.token)
 
-    python_blob = fd.Get(fd.Schema.BINARY)
-    if python_blob is None:
+    if not isinstance(fd, aff4.GRRSignedBlob):
       raise RuntimeError("Python hack %s not found." % self.args.hack_name)
-    self.CallClient("ExecutePython", python_code=python_blob,
-                    py_args=self.args.py_args, next_state="Done")
+
+    # TODO(user): This will break if someone wants to execute lots of Python.
+    for python_blob in fd:
+      self.CallClient("ExecutePython", python_code=python_blob,
+                      py_args=self.args.py_args, next_state="Done")
 
   @flow.StateHandler()
   def Done(self, responses):
@@ -271,7 +283,7 @@ class ExecutePythonHack(flow.GRRFlow):
       self.SendReply(rdfvalue.RDFBytes(utils.SmartStr(response.return_val)))
 
 
-class ExecuteCommandArgs(rdfvalue.RDFProtoStruct):
+class ExecuteCommandArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ExecuteCommandArgs
 
 
@@ -322,7 +334,7 @@ class Foreman(flow.WellKnownFlow):
   scheduled for them based on their types. This allows the server to schedule
   flows for entire classes of machines based on certain criteria.
   """
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:Foreman")
+  well_known_session_id = rdfvalue.SessionID(flow_name="Foreman")
   foreman_cache = None
 
   # How often we refresh the rule set from the data store.
@@ -334,7 +346,7 @@ class Foreman(flow.WellKnownFlow):
     """Run the foreman on the client."""
     # Only accept authenticated messages
     if (message.auth_state !=
-        rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED):
+        rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED):
       return
 
     now = time.time()
@@ -351,7 +363,7 @@ class Foreman(flow.WellKnownFlow):
       self.foreman_cache.AssignTasksToClient(message.source)
 
 
-class OnlineNotificationArgs(rdfvalue.RDFProtoStruct):
+class OnlineNotificationArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.OnlineNotificationArgs
 
 
@@ -371,7 +383,7 @@ class OnlineNotification(flow.GRRFlow):
 </p>
 
 <p>Thanks,</p>
-<p>The GRR team.</p>
+<p>%(signature)s</p>
 </body></html>"""
 
   args_type = OnlineNotificationArgs
@@ -400,7 +412,7 @@ class OnlineNotification(flow.GRRFlow):
 
       subject = "GRR Client on %s became available." % hostname
 
-      email_alerts.SendEmail(
+      email_alerts.EMAIL_ALERTER.SendEmail(
           self.args.email, "grr-noreply",
           subject,
           self.template % dict(
@@ -408,13 +420,14 @@ class OnlineNotification(flow.GRRFlow):
               admin_ui=config_lib.CONFIG["AdminUI.url"],
               hostname=hostname,
               urn=url,
-              creator=self.token.username),
+              creator=self.token.username,
+              signature=config_lib.CONFIG["Email.signature"]),
           is_html=True)
     else:
       flow.FlowError("Error while pinging client.")
 
 
-class UpdateClientArgs(rdfvalue.RDFProtoStruct):
+class UpdateClientArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.UpdateClientArgs
 
 
@@ -445,7 +458,9 @@ class UpdateClient(flow.GRRFlow):
   @flow.StateHandler(next_state="Interrogate")
   def Start(self):
     """Start."""
-    if not self.args.blob_path:
+    blob_path = self.args.blob_path
+    if not blob_path:
+      # No explicit path was given, we guess a reasonable default here.
       client = aff4.FACTORY.Open(self.client_id, token=self.token)
       client_platform = client.Get(client.Schema.SYSTEM)
       if not client_platform:
@@ -453,25 +468,31 @@ class UpdateClient(flow.GRRFlow):
       blob_urn = "aff4:/config/executables/%s/agentupdates" % (
           self.system_platform_mapping[client_platform])
       blob_dir = aff4.FACTORY.Open(blob_urn, token=self.token)
-      updates = sorted(list(blob_dir.OpenChildren()))
+      updates = sorted(list(blob_dir.ListChildren()))
       if not updates:
         raise RuntimeError(
             "No matching updates found, please specify one manually.")
-      aff4_blob = updates[-1]
-      self.args.blob_path = aff4_blob.urn
-    else:
-      aff4_blob = aff4.FACTORY.Open(self.args.blob_path, token=self.token)
+      blob_path = updates[-1]
 
-    blob = aff4_blob.Get(aff4_blob.Schema.BINARY)
-
-    if ("windows" in utils.SmartStr(self.args.blob_path) or
-        "darwin" in utils.SmartStr(self.args.blob_path) or
-        "linux" in utils.SmartStr(self.args.blob_path)):
-      self.CallClient("UpdateAgent", executable=blob, next_state="Interrogate")
-
-    else:
+    if not ("windows" in utils.SmartStr(self.args.blob_path) or
+            "darwin" in utils.SmartStr(self.args.blob_path) or
+            "linux" in utils.SmartStr(self.args.blob_path)):
       raise RuntimeError("Update not supported for this urn, use aff4:/config"
                          "/executables/<platform>/agentupdates/<version>")
+
+    aff4_blobs = aff4.FACTORY.Open(blob_path, token=self.token)
+    if not isinstance(aff4_blobs, aff4.GRRSignedBlob):
+      raise RuntimeError("%s is not a valid GRRSignedBlob." % blob_path)
+
+    offset = 0
+    write_path = "%d_%s" % (time.time(), aff4_blobs.urn.Basename())
+    for i, blob in enumerate(aff4_blobs):
+      self.CallClient(
+          "UpdateAgent", executable=blob, more_data=i < aff4_blobs.chunks - 1,
+          offset=offset, write_path=write_path, next_state="Interrogate",
+          use_client_env=False)
+
+      offset += len(blob.data)
 
   @flow.StateHandler(next_state="Done")
   def Interrogate(self, responses):
@@ -493,7 +514,7 @@ class NannyMessageHandler(ClientCrashEventListener):
   """A listener for nanny messages."""
   EVENTS = ["NannyMessage"]
 
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:NannyMessage")
+  well_known_session_id = rdfvalue.SessionID(flow_name="NannyMessage")
 
   mail_template = """
 <html><body><h1>GRR nanny message received.</h1>
@@ -504,7 +525,7 @@ The nanny for client %(client_id)s (%(hostname)s) just sent a message:<br>
 <br>
 Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
 
-<p>The GRR team.
+<p>%(signature)s</p>
 
 </body></html>"""
 
@@ -519,7 +540,7 @@ Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
 
     client_id = message.source
 
-    message = rdfvalue.DataBlob(message.args).string
+    message = message.payload.string
 
     logging.info(self.logline, client_id, message)
 
@@ -527,7 +548,7 @@ Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
     client = aff4.FACTORY.Open(client_id, token=self.token)
     client_info = client.Get(client.Schema.CLIENT_INFO)
 
-    crash_details = rdfvalue.ClientCrash(
+    crash_details = rdf_client.ClientCrash(
         client_id=client_id, client_info=client_info,
         crash_message=message, timestamp=long(time.time() * 1e6),
         crash_type=self.well_known_session_id)
@@ -541,7 +562,7 @@ Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
       url = urllib.urlencode((("c", client_id),
                               ("main", "HostInformation")))
 
-      email_alerts.SendEmail(
+      email_alerts.EMAIL_ALERTER.SendEmail(
           config_lib.CONFIG["Monitoring.alert_email"],
           "GRR server",
           self.subject % client_id,
@@ -549,7 +570,9 @@ Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
               client_id=client_id,
               admin_ui=config_lib.CONFIG["AdminUI.url"],
               hostname=hostname,
-              urn=url, message=message),
+              signature=config_lib.CONFIG["Email.signature"],
+              urn=url,
+              message=message),
           is_html=True)
 
 
@@ -557,7 +580,7 @@ class ClientAlertHandler(NannyMessageHandler):
   """A listener for client messages."""
   EVENTS = ["ClientAlert"]
 
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:ClientAlert")
+  well_known_session_id = rdfvalue.SessionID(flow_name="ClientAlert")
 
   mail_template = """
 <html><body><h1>GRR client message received.</h1>
@@ -568,7 +591,7 @@ The client %(client_id)s (%(hostname)s) just sent a message:<br>
 <br>
 Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
 
-<p>The GRR team.
+<p>%(signature)s</p>
 
 </body></html>"""
 
@@ -581,7 +604,7 @@ class ClientCrashHandler(ClientCrashEventListener):
   """A listener for client crashes."""
   EVENTS = ["ClientCrash"]
 
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:CrashHandler")
+  well_known_session_id = rdfvalue.SessionID(flow_name="CrashHandler")
 
   mail_template = """
 <html><body><h1>GRR client crash report.</h1>
@@ -590,7 +613,7 @@ Client %(client_id)s (%(hostname)s) just crashed while executing an action.
 Click <a href='%(admin_ui)s/#%(urn)s'> here </a> to access this machine.
 
 <p>Thanks,</p>
-<p>The GRR team.
+<p>%(signature)s</p>
 <p>
 P.S. The state of the failing flow was:
 %(state)s
@@ -618,8 +641,8 @@ P.S. The state of the failing flow was:
     client = aff4.FACTORY.Open(client_id, token=self.token)
     client_info = client.Get(client.Schema.CLIENT_INFO)
 
-    status = rdfvalue.GrrStatus(message.args)
-    crash_details = rdfvalue.ClientCrash(
+    status = rdf_flows.GrrStatus(message.payload)
+    crash_details = rdf_client.ClientCrash(
         client_id=client_id, session_id=message.session_id,
         client_info=client_info, crash_message=status.error_message,
         timestamp=rdfvalue.RDFDatetime().Now(),
@@ -640,7 +663,7 @@ P.S. The state of the failing flow was:
 
       renderer = rendering.FindRendererForObject(flow_obj.state)
 
-      email_alerts.SendEmail(
+      email_alerts.EMAIL_ALERTER.SendEmail(
           config_lib.CONFIG["Monitoring.alert_email"],
           "GRR server",
           "Client %s reported a crash." % client_id,
@@ -649,7 +672,10 @@ P.S. The state of the failing flow was:
               admin_ui=config_lib.CONFIG["AdminUI.url"],
               hostname=hostname,
               state=renderer.RawHTML(),
-              urn=url, nanny_msg=nanny_msg),
+              urn=url,
+              nanny_msg=nanny_msg,
+              signature=config_lib.CONFIG["Email.signature"]
+          ),
           is_html=True)
 
     if nanny_msg:
@@ -664,7 +690,7 @@ P.S. The state of the failing flow was:
 
 class ClientStartupHandler(flow.EventListener):
 
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:Startup")
+  well_known_session_id = rdfvalue.SessionID(flow_name="Startup")
 
   @flow.EventHandler(allow_client_access=True, auth_required=False)
   def ProcessMessage(self, message=None, event=None):
@@ -673,7 +699,7 @@ class ClientStartupHandler(flow.EventListener):
     # We accept unauthenticated messages so there are no errors but we don't
     # store the results.
     if (message.auth_state !=
-        rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED):
+        rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED):
       return
 
     client_id = message.source
@@ -682,7 +708,7 @@ class ClientStartupHandler(flow.EventListener):
                                  token=self.token)
     old_info = client.Get(client.Schema.CLIENT_INFO)
     old_boot = client.Get(client.Schema.LAST_BOOT_TIME, 0)
-    startup_info = rdfvalue.StartupInfo(message.args)
+    startup_info = rdf_client.StartupInfo(message.payload)
     info = startup_info.client_info
 
     # Only write to the datastore if we have new information.
@@ -695,7 +721,7 @@ class ClientStartupHandler(flow.EventListener):
     if new_data != old_data:
       client.Set(client.Schema.CLIENT_INFO(info))
 
-    client.AddLabels(info.labels)
+    client.AddLabels(*info.labels, owner="GRR")
 
     # Allow for some drift in the boot times (5 minutes).
     if abs(int(old_boot) - int(startup_info.boot_time)) > 300 * 1e6:
@@ -711,18 +737,25 @@ class IgnoreResponses(flow.WellKnownFlow):
 
   category = None
 
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:DevNull")
+  well_known_session_id = rdfvalue.SessionID(flow_name="DevNull")
 
   def ProcessMessage(self, message):
     pass
 
 
-class KeepAliveArgs(rdfvalue.RDFProtoStruct):
+class KeepAliveArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.KeepAliveArgs
 
 
 class KeepAlive(flow.GRRFlow):
   """Requests that the clients stays alive for a period of time."""
+
+  # We already want to run this flow while waiting for a client approval.
+  # Note that this can potentially be abused to launch a DDOS attack against
+  # the frontend server(s) by putting all clients into fastpoll mode. The load
+  # of idle polling messages is not that high though and this can only be done
+  # by users that have a GRR account already so the risk is acceptable.
+  ACL_ENFORCED = False
 
   category = "/Administrative/"
   behaviours = flow.GRRFlow.behaviours + "BASIC"
@@ -754,7 +787,7 @@ class KeepAlive(flow.GRRFlow):
       self.CallState(next_state="SendMessage", start_time=start_time)
 
 
-class TerminateFlowArgs(rdfvalue.RDFProtoStruct):
+class TerminateFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.TerminateFlowArgs
 
 
@@ -780,7 +813,7 @@ class TerminateFlow(flow.GRRFlow):
                                token=self.token, force=True)
 
 
-class LaunchBinaryArgs(rdfvalue.RDFProtoStruct):
+class LaunchBinaryArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.LaunchBinaryArgs
 
 
@@ -795,13 +828,18 @@ class LaunchBinary(flow.GRRFlow):
   @flow.StateHandler(next_state=["End"])
   def Start(self):
     fd = aff4.FACTORY.Open(self.args.binary, token=self.token)
-
-    blob = fd.Get(fd.Schema.BINARY)
-    if blob is None:
+    if not isinstance(fd, collections.GRRSignedBlob):
       raise RuntimeError("Executable binary %s not found." % self.args.binary)
 
-    self.CallClient("ExecuteBinaryCommand", executable=blob,
-                    args=shlex.split(self.args.command_line), next_state="End")
+    offset = 0
+    write_path = "%d" % time.time()
+    for i, blob in enumerate(fd):
+      self.CallClient(
+          "ExecuteBinaryCommand", executable=blob, more_data=i < fd.chunks - 1,
+          args=shlex.split(self.args.command_line), offset=offset,
+          write_path=write_path, next_state="End")
+
+      offset += len(blob.data)
 
   def _TruncateResult(self, data):
     if len(data) > 2000:
@@ -824,7 +862,7 @@ class LaunchBinary(flow.GRRFlow):
       self.SendReply(response)
 
 
-class RunReportFlowArgs(rdfvalue.RDFProtoStruct):
+class RunReportFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.RunReportFlowArgs
 
 
@@ -843,10 +881,6 @@ class RunReport(flow.GRRGlobalFlow):
 
   @flow.StateHandler(next_state="RunReport")
   def Start(self):
-    if not data_store.DB.security_manager.CheckUserLabels(
-        self.token.username, self.AUTHORIZED_LABELS):
-      raise access_control.UnauthorizedAccess("Must be admin to run this flow.")
-
     if self.state.args.report_name not in reports.Report.classes:
       raise flow.FlowError("No such report %s" % self.state.args.report_name)
     else:

@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- mode: python; encoding: utf-8 -*-
 
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Test the collection viewer interface."""
 
 
@@ -26,7 +25,7 @@ class TestContainerViewer(test_lib.GRRSeleniumTest):
           "aff4:/C.0000000000000001/fs/os/c/bin C.0000000000000001/bash",
           "aff4:/C.0000000000000001/fs/os/c/bin/bash",
           "aff4:/C.0000000000000001/fs/os/c/bin/rbash",
-          ]:
+      ]:
         fd = aff4.FACTORY.Open(urn, token=self.token)
         out_fd.Add(urn=urn, stat=fd.Get(fd.Schema.STAT))
 
@@ -41,7 +40,7 @@ class TestContainerViewer(test_lib.GRRSeleniumTest):
   def testContainerViewer(self):
     self.Open("/")
 
-    self.Type("client_query", "0001")
+    self.Type("client_query", "C.0000000000000001")
     self.Click("client_query_submit")
 
     self.WaitUntilEqual(u"C.0000000000000001",
@@ -61,7 +60,7 @@ class TestContainerViewer(test_lib.GRRSeleniumTest):
     self.WaitUntil(self.IsElementPresent, "css=td:contains(\"VIEW\")")
     self.assert_("View details" in self.GetText(
         "css=a[href=\"#"
-        "c=C.0000000000000001&"
+        "c=aff4%3A%2FC.0000000000000001&"
         "container=aff4%3A%2FC.0000000000000001%2Fanalysis%2FFindFlowTest&"
         "main=ContainerViewer&"
         "reason=Running+tests\"]"))
@@ -123,6 +122,7 @@ class TestContainerViewer(test_lib.GRRSeleniumTest):
 def main(argv):
   # Run the full test suite
   runtests_test.SeleniumTestProgram(argv=argv)
+
 
 if __name__ == "__main__":
   flags.StartMain(main)

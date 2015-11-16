@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Implement access to the windows registry."""
 
 
@@ -12,8 +11,10 @@ import StringIO
 import _winreg
 
 from grr.client import vfs
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import protodict as rdf_protodict
 
 
 # Difference between 1 Jan 1601 and 1 Jan 1970.
@@ -250,7 +251,7 @@ def Reg2Py(data, size, data_type):
 class RegistryFile(vfs.VFSHandler):
   """Emulate registry access through the VFS."""
 
-  supported_pathtype = rdfvalue.PathSpec.PathType.REGISTRY
+  supported_pathtype = rdf_paths.PathSpec.PathType.REGISTRY
   auto_register = True
 
   value = None
@@ -258,24 +259,28 @@ class RegistryFile(vfs.VFSHandler):
   hive = None
   last_modified = 0
   is_directory = True
+  fd = None
 
   # Maps the registry types to protobuf enums
   registry_map = {
-      _winreg.REG_NONE: rdfvalue.StatEntry.RegistryType.REG_NONE,
-      _winreg.REG_SZ: rdfvalue.StatEntry.RegistryType.REG_SZ,
-      _winreg.REG_EXPAND_SZ: rdfvalue.StatEntry.RegistryType.REG_EXPAND_SZ,
-      _winreg.REG_BINARY: rdfvalue.StatEntry.RegistryType.REG_BINARY,
-      _winreg.REG_DWORD: rdfvalue.StatEntry.RegistryType.REG_DWORD,
+      _winreg.REG_NONE: rdf_client.StatEntry.RegistryType.REG_NONE,
+      _winreg.REG_SZ: rdf_client.StatEntry.RegistryType.REG_SZ,
+      _winreg.REG_EXPAND_SZ: rdf_client.StatEntry.RegistryType.REG_EXPAND_SZ,
+      _winreg.REG_BINARY: rdf_client.StatEntry.RegistryType.REG_BINARY,
+      _winreg.REG_DWORD: rdf_client.StatEntry.RegistryType.REG_DWORD,
       _winreg.REG_DWORD_LITTLE_ENDIAN: (
-          rdfvalue.StatEntry.RegistryType.REG_DWORD_LITTLE_ENDIAN),
+          rdf_client.StatEntry.RegistryType.REG_DWORD_LITTLE_ENDIAN),
       _winreg.REG_DWORD_BIG_ENDIAN: (
-          rdfvalue.StatEntry.RegistryType.REG_DWORD_BIG_ENDIAN),
-      _winreg.REG_LINK: rdfvalue.StatEntry.RegistryType.REG_LINK,
-      _winreg.REG_MULTI_SZ: rdfvalue.StatEntry.RegistryType.REG_MULTI_SZ,
-      }
+          rdf_client.StatEntry.RegistryType.REG_DWORD_BIG_ENDIAN),
+      _winreg.REG_LINK: rdf_client.StatEntry.RegistryType.REG_LINK,
+      _winreg.REG_MULTI_SZ: rdf_client.StatEntry.RegistryType.REG_MULTI_SZ,
+  }
 
-  def __init__(self, base_fd, pathspec=None):
-    super(RegistryFile, self).__init__(base_fd, pathspec=pathspec)
+  def __init__(self, base_fd, pathspec=None, progress_callback=None,
+               full_pathspec=None):
+    super(RegistryFile, self).__init__(base_fd, pathspec=pathspec,
+                                       full_pathspec=full_pathspec,
+                                       progress_callback=progress_callback)
 
     if base_fd is None:
       self.pathspec.Append(pathspec)
@@ -298,11 +303,11 @@ class RegistryFile(vfs.VFSHandler):
 
     # Normalize the path casing if needed
     self.key_name = "/".join(path_components[1:])
+    self.local_path = CanonicalPathToLocalPath(self.key_name)
 
     try:
       # Maybe its a value
-      key_name, value_name = os.path.split(
-          CanonicalPathToLocalPath(self.key_name))
+      key_name, value_name = os.path.split(self.local_path)
       with OpenKey(self.hive, key_name) as key:
         self.value, self.value_type = QueryValueEx(key, value_name)
 
@@ -311,8 +316,7 @@ class RegistryFile(vfs.VFSHandler):
     except exceptions.WindowsError:
       try:
         # Try to get the default value for this key
-        with OpenKey(self.hive, CanonicalPathToLocalPath(
-            self.key_name)) as key:
+        with OpenKey(self.hive, self.local_path) as key:
 
           # Check for default value.
           try:
@@ -325,18 +329,16 @@ class RegistryFile(vfs.VFSHandler):
       except exceptions.WindowsError:
         raise IOError("Unable to open key %s" % self.key_name)
 
-    self.fd = StringIO.StringIO(utils.SmartStr(self.value))
-
   def Stat(self):
     return self._Stat("", self.value, self.value_type)
 
   def _Stat(self, name, value, value_type):
-    response = rdfvalue.StatEntry()
+    response = rdf_client.StatEntry()
     response_pathspec = self.pathspec.Copy()
 
     # No matter how we got here, there is no need to do case folding from now on
     # since this is the exact filename casing.
-    response_pathspec.path_options = rdfvalue.PathSpec.Options.CASE_LITERAL
+    response_pathspec.path_options = rdf_paths.PathSpec.Options.CASE_LITERAL
 
     response_pathspec.last.path = utils.JoinPath(
         response_pathspec.last.path, name)
@@ -349,8 +351,9 @@ class RegistryFile(vfs.VFSHandler):
 
     response.st_mtime = self.last_modified
     response.st_size = len(utils.SmartStr(value))
-    response.registry_type = self.registry_map.get(value_type, 0)
-    response.registry_data = rdfvalue.DataBlob().SetValue(value)
+    if value_type is not None:
+      response.registry_type = self.registry_map.get(value_type, 0)
+      response.registry_data = rdf_protodict.DataBlob().SetValue(value)
     return response
 
   def ListNames(self):
@@ -366,8 +369,7 @@ class RegistryFile(vfs.VFSHandler):
       return
 
     try:
-      with OpenKey(self.hive, CanonicalPathToLocalPath(
-          self.key_name)) as key:
+      with OpenKey(self.hive, self.local_path) as key:
         (self.number_of_keys, self.number_of_values,
          self.last_modified) = QueryInfoKey(key)
 
@@ -398,7 +400,7 @@ class RegistryFile(vfs.VFSHandler):
     if self.hive is None:
       for name in dir(_winreg):
         if name.startswith("HKEY_"):
-          response = rdfvalue.StatEntry(
+          response = rdf_client.StatEntry(
               st_mode=stat.S_IFDIR)
           response_pathspec = self.pathspec.Copy()
           response_pathspec.last.path = utils.JoinPath(
@@ -409,8 +411,7 @@ class RegistryFile(vfs.VFSHandler):
       return
 
     try:
-      with OpenKey(self.hive, CanonicalPathToLocalPath(
-          self.key_name)) as key:
+      with OpenKey(self.hive, self.local_path) as key:
         (self.number_of_keys, self.number_of_values,
          self.last_modified) = QueryInfoKey(key)
 
@@ -419,14 +420,18 @@ class RegistryFile(vfs.VFSHandler):
         for i in range(self.number_of_keys):
           try:
             name = EnumKey(key, i)
-            response = rdfvalue.StatEntry(
-                # Keys look like Directories in the VFS.
-                st_mode=stat.S_IFDIR,
-                st_mtime=self.last_modified)
-            response_pathspec = self.pathspec.Copy()
-            response_pathspec.last.path = utils.JoinPath(
-                response_pathspec.last.path, name)
-            response.pathspec = response_pathspec
+            key_name = utils.JoinPath(self.local_path, name)
+
+            try:
+              # Store the default value in the stat response for values.
+              with OpenKey(self.hive, key_name) as subkey:
+                value, value_type = QueryValueEx(subkey, "")
+            except exceptions.WindowsError:
+              value, value_type = None, None
+
+            response = self._Stat(name, value, value_type)
+            # Keys look like Directories in the VFS.
+            response.st_mode = stat.S_IFDIR
 
             yield response
           except exceptions.WindowsError:
@@ -452,7 +457,11 @@ class RegistryFile(vfs.VFSHandler):
     return self.is_directory
 
   def Read(self, length):
+    if not self.fd:
+      self.fd = StringIO.StringIO(utils.SmartStr(self.value))
     return self.fd.read(length)
 
   def Seek(self, offset, whence=0):
+    if not self.fd:
+      self.fd = StringIO.StringIO(utils.SmartStr(self.value))
     return self.fd.seek(offset, whence)

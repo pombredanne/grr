@@ -6,6 +6,8 @@
 from grr.lib import aff4
 from grr.lib import data_store
 from grr.lib import export_utils
+from grr.lib.aff4_objects import security
+from grr.lib.rdfvalues import client
 from grr.tools.export_plugins import plugin
 
 
@@ -22,7 +24,7 @@ class FileExportPlugin(plugin.ExportPlugin):
                         "Can be either a file or a directory.")
 
     parser.add_argument("--output", required=True,
-                        help="Directory downloaded files will be written.")
+                        help="Directory downloaded files will be written to.")
 
     parser.add_argument("--depth", type=int, default=5,
                         help="Depth of recursion when path is a directory.")
@@ -36,11 +38,30 @@ class FileExportPlugin(plugin.ExportPlugin):
   def Run(self, args):
     """Downloads files/directories with the given path."""
 
+    # If we're exporting a path inside a client, check to see if we have access
+    # to that client and get the appropriate token.  This means we can avoid
+    # having to specify --reason.
+    client_id = client.GetClientURNFromPath(args.path)
+
+    if client_id is not None:
+      token = security.Approval.GetApprovalForObject(
+          client_id, token=data_store.default_token,
+          username=data_store.default_token.username)
+      data_store.default_token = token
+
     try:
-      directory = aff4.FACTORY.Open(args.path, "VFSDirectory",
+      directory = aff4.FACTORY.Open(args.path, "AFF4Volume",
                                     token=data_store.default_token)
     except aff4.InstantiationError:
       directory = None
+
+    if directory and not isinstance(directory, aff4.VFSDirectory):
+      # If directory is not a VFSDirectory, check that it's in its' parent
+      # children list. This way we check that the path actually exists.
+      directory_parent = aff4.FACTORY.Open(directory.urn.Dirname(),
+                                           token=data_store.default_token)
+      if directory.urn not in directory_parent.ListChildren():
+        raise RuntimeError("Specified path %s doesn't exist!" % directory.urn)
 
     if directory:
       export_utils.RecursiveDownload(directory, args.output,

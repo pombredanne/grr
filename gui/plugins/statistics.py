@@ -8,6 +8,9 @@ import time
 from grr.gui import renderers
 from grr.lib import aff4
 from grr.lib import rdfvalue
+from grr.lib.aff4_objects import aff4_grr
+from grr.lib.aff4_objects import stats as aff4_stats
+from grr.lib.rdfvalues import client as rdf_client
 
 
 class ShowStatistics(renderers.Splitter2WayVertical):
@@ -20,6 +23,42 @@ class ShowStatistics(renderers.Splitter2WayVertical):
   right_renderer = "ReportRenderer"
 
 
+def InterpolatePaths(path, labels):
+  """Interpolate paths with %%LABEL%% markers.
+
+  Args:
+    path: path string to interpolate
+    labels: list of label strings
+  Returns:
+    list of path strings for each label supplied
+  """
+  if "%%LABEL%%" not in path:
+    return dict([(path, None)])
+  else:
+    paths = {}
+    for label in labels:
+      paths[path.replace("%%LABEL%%", label)] = label
+    return paths
+
+
+def GetClassLookupDict(classes, labels):
+  """Build a path->class lookup dict.
+
+  Args:
+    classes: list of class objects
+    labels: list of label strings
+  Returns:
+    Dict of (class object, label string) tuples keyed by path
+  """
+  paths = {}
+  for cls in classes:
+    category = getattr(cls, "category", None)
+    if category:
+      for path, label in InterpolatePaths(category, labels).items():
+        paths[path] = (cls, label)
+  return paths
+
+
 class ReportRenderer(renderers.TemplateRenderer):
   """A renderer for Statistic Reports."""
 
@@ -30,47 +69,44 @@ class ReportRenderer(renderers.TemplateRenderer):
   {% endif %}
   <div id="{{unique|escape}}"></div>
 </div>
-<script>
-  grr.subscribe("tree_select", function(path) {
-    grr.state.path = path
-    $("#{{id|escapejs}}").html("<em>Loading&#8230;</em>");
-    grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}");
-  }, "{{unique|escapejs}}");
-</script>
 """)
 
   def Layout(self, request, response):
     """Delegate to a stats renderer if needed."""
     path = request.REQ.get("path", "")
 
+    labels = aff4_grr.GetAllClientLabels(request.token, include_catchall=True)
     # Try and find the correct renderer to use.
-    for cls in self.classes.values():
-      if getattr(cls, "category", None) == path:
-        self.delegated_renderer = cls()
+    lookup_dict = GetClassLookupDict(self.classes.values(), labels)
+    if path in lookup_dict:
+      self.delegated_renderer = lookup_dict[path][0]()
 
-        # Render the renderer directly here
-        self.delegated_renderer.Layout(request, response)
-        break
+      # Tell the renderer which label it should be using
+      request.label = lookup_dict[path][1]
 
-    return super(ReportRenderer, self).Layout(request, response)
+      # Render the renderer directly here
+      self.delegated_renderer.Layout(request, response)
+
+    response = super(ReportRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "ReportRenderer.Layout",
+                               renderer=self.__class__.__name__)
 
 
 class StatsTree(renderers.TreeRenderer):
   """Show all the available reports."""
 
-  def GetStatsClasses(self):
-    classes = []
-
+  def GetStatsPaths(self, request):
+    paths = []
+    labels = aff4_grr.GetAllClientLabels(request.token, include_catchall=True)
     for cls in self.classes.values():
       if aff4.issubclass(cls, Report) and cls.category:
-        classes.append(cls.category)
+        paths.extend(InterpolatePaths(cls.category, labels).keys())
+    paths.sort()
+    return paths
 
-    classes.sort()
-    return classes
-
-  def RenderBranch(self, path, _):
+  def RenderBranch(self, path, request):
     """Show all the stats available."""
-    for category_name in self.GetStatsClasses():
+    for category_name in self.GetStatsPaths(request):
       if category_name.startswith(path):
         elements = filter(None, category_name[len(path):].split("/"))
 
@@ -113,16 +149,17 @@ class PieChart(Report):
 
 
 class OSBreakdown(PieChart):
-  category = "/Clients/OS Breakdown/ 1 Day Active"
+  category = "/Clients/%%LABEL%%/OS Breakdown/ 1 Day Active"
   title = "Operating system break down."
   description = "OS breakdown for clients that were active in the last day."
   active_day = 1
-  attribute = aff4.ClientFleetStats.SchemaCls.OS_HISTOGRAM
+  attribute = aff4_stats.ClientFleetStats.SchemaCls.OS_HISTOGRAM
+  data_urn = rdfvalue.RDFURN("aff4:/stats/ClientFleetStats")
 
   def Layout(self, request, response):
     """Extract only the operating system type from the active histogram."""
     try:
-      fd = aff4.FACTORY.Open("aff4:/stats/ClientFleetStats",
+      fd = aff4.FACTORY.Open(self.data_urn.Add(request.label),
                              token=request.token)
       self.data = []
       for graph in fd.Get(self.attribute):
@@ -138,48 +175,48 @@ class OSBreakdown(PieChart):
 
 
 class OSBreakdown7(OSBreakdown):
-  category = "/Clients/OS Breakdown/ 7 Day Active"
+  category = "/Clients/%%LABEL%%/OS Breakdown/ 7 Day Active"
   description = "OS breakdown for clients that were active in the last week."
   active_day = 7
 
 
 class OSBreakdown30(OSBreakdown):
-  category = "/Clients/OS Breakdown/30 Day Active"
+  category = "/Clients/%%LABEL%%/OS Breakdown/30 Day Active"
   description = "OS breakdown for clients that were active in the last month."
   active_day = 30
 
 
 class ReleaseBreakdown(OSBreakdown):
-  category = "/Clients/OS Release Breakdown/ 1 Day Active"
+  category = "/Clients/%%LABEL%%/OS Release Breakdown/ 1 Day Active"
   title = "Operating system version break down."
   description = "This plot shows what OS clients active within the last day."
   active_day = 1
-  attribute = aff4.ClientFleetStats.SchemaCls.VERSION_HISTOGRAM
+  attribute = aff4_stats.ClientFleetStats.SchemaCls.RELEASE_HISTOGRAM
 
 
 class ReleaseBreakdown7(ReleaseBreakdown):
-  category = "/Clients/OS Release Breakdown/ 7 Day Active"
+  category = "/Clients/%%LABEL%%/OS Release Breakdown/ 7 Day Active"
   description = "What OS Version clients were active within the last week."
   active_day = 7
 
 
 class ReleaseBreakdown30(ReleaseBreakdown):
-  category = "/Clients/OS Release Breakdown/30 Day Active"
+  category = "/Clients/%%LABEL%%/OS Release Breakdown/30 Day Active"
   description = "What OS Version clients were active within the last month."
   active_day = 30
 
 
 class LastActiveReport(Report):
   """Display a histogram of last actives."""
-  category = "/Clients/Last Active/Count of last activity time"
+  category = "/Clients/%%LABEL%%/Last Active/Count of last activity time"
   title = "Breakdown of Client Count Based on Last Activity of the Client."
   description = """
 This plot shows the number of clients active in the last day and how that number
 evolves over time.
 """
   active_days_display = [1, 3, 7, 30, 60]
-  attribute = aff4.ClientFleetStats.SchemaCls.LAST_CONTACTED_HISTOGRAM
-  DATA_URN = "aff4:/stats/ClientFleetStats"
+  attribute = aff4_stats.ClientFleetStats.SchemaCls.LAST_CONTACTED_HISTOGRAM
+  data_urn = rdfvalue.RDFURN("aff4:/stats/ClientFleetStats")
 
   layout_template = renderers.Template("""
 <div class="padded">
@@ -199,17 +236,18 @@ evolves over time.
     for graph in graph_series:
       for sample in graph:
         # Provide the time in js timestamps (millisecond since the epoch)
-        days = sample.x_value/1000000/24/60/60
+        days = sample.x_value / 1000000 / 24 / 60 / 60
         if days in self.active_days_display:
           label = "%s day active" % days
           self.categories.setdefault(label, []).append(
-              (graph_series.age/1000, sample.y_value))
+              (graph_series.age / 1000, sample.y_value))
 
   def Layout(self, request, response):
     """Show how the last active breakdown evolves over time."""
     try:
       self.start_time, self.end_time = GetAgeTupleFromRequest(request, 180)
-      fd = aff4.FACTORY.Open(self.DATA_URN, token=request.token,
+      fd = aff4.FACTORY.Open(self.data_urn.Add(request.label),
+                             token=request.token,
                              age=(self.start_time, self.end_time))
       self.categories = {}
       for graph_series in fd.GetValuesForAttribute(self.attribute):
@@ -229,14 +267,13 @@ evolves over time.
 
 class LastDayGRRVersionReport(LastActiveReport):
   """Display a histogram of last actives based on GRR Version."""
-  category = "/Clients/GRR Version/ 1 Day"
+  category = "/Clients/%%LABEL%%/GRR Version/ 1 Day"
   title = "1 day Active Clients."
   description = """This shows the number of clients active in the last day based
 on the GRR version.
 """
-  DATA_URN = "aff4:/stats/ClientFleetStats"
   active_day = 1
-  attribute = aff4.ClientFleetStats.SchemaCls.GRRVERSION_HISTOGRAM
+  attribute = aff4_stats.ClientFleetStats.SchemaCls.GRRVERSION_HISTOGRAM
 
   def _ProcessGraphSeries(self, graph_series):
     for graph in graph_series:
@@ -244,13 +281,13 @@ on the GRR version.
       if "%s day" % self.active_day in graph.title:
         for sample in graph:
           self.categories.setdefault(sample.label, []).append(
-              (graph_series.age/1000, sample.y_value))
+              (graph_series.age / 1000, sample.y_value))
         break
 
 
 class Last7DaysGRRVersionReport(LastDayGRRVersionReport):
   """Display a histogram of last actives based on GRR Version."""
-  category = "/Clients/GRR Version/ 7 Day"
+  category = "/Clients/%%LABEL%%/GRR Version/ 7 Day"
   title = "7 day Active Clients."
   description = """This shows the number of clients active in the last 7 days
 based on the GRR version.
@@ -260,7 +297,7 @@ based on the GRR version.
 
 class Last30DaysGRRVersionReport(LastDayGRRVersionReport):
   """Display a histogram of last actives based on GRR Version."""
-  category = "/Clients/GRR Version/ 30 Day"
+  category = "/Clients/%%LABEL%%/GRR Version/ 30 Day"
   title = "30 day Active Clients."
   description = """This shows the number of clients active in the last 30 days
 based on the GRR version.
@@ -280,17 +317,24 @@ class StatGraph(object):
   def AddSeries(self, series, series_name, max_samples=1000):
     """Add a downsampled series to a graph."""
     downsample_ratio = 1
-    if max_samples:
+    if max_samples and series:
       downsample_ratio = int(math.ceil(float(len(series)) / max_samples))
     data = [[k, series[k]] for k in sorted(series)[::downsample_ratio]]
-    self.series.append(StatData(series_name, ",".join(map(str, data))))
+    self.series.append(StatData(series_name, data))
     self.downsample = downsample_ratio
+
+  def ToDict(self):
+    return dict(self.__dict__, series=[s.ToDict() for s in self.series])
 
 
 class StatData(object):
+
   def __init__(self, label, data):
     self.data = data
     self.label = label
+
+  def ToDict(self):
+    return self.__dict__
 
 
 class AFF4ClientStats(Report):
@@ -302,28 +346,6 @@ class AFF4ClientStats(Report):
   layout_template = renderers.Template("""
 <div class="padded">
 {% if this.graphs %}
-<script>
-selectTab = function (tabid) {
-  {% for graph in this.graphs %}
-      $("#{{unique|escapejs}}_{{graph.id|escapejs}}")[0]
-          .style.display = "none";
-      $("#{{unique|escapejs}}_{{graph.id|escapejs}}_a")
-          .removeClass("selected");
-  {% endfor %}
-
-  $("#{{unique|escapejs}}_" + tabid)[0].style.display = "block";
-  $("#{{unique|escapejs}}_click").text("");
-  $("#{{unique|escapejs}}_" + tabid + "_a").addClass("selected");
-
-  $("#{{unique|escapejs}}_" + tabid)[0].style.visibility = "hidden";
-  $("#{{id|escapejs}}").resize();
-  p = eval("plot_" + tabid);
-  p.resize();
-  p.setupGrid();
-  p.draw();
-  $("#{{unique|escapejs}}_" + tabid)[0].style.visibility = "visible";
-};
-</script>
 
 {% for graph in this.graphs %}
   <a id="{{unique|escape}}_{{graph.id|escape}}_a"
@@ -334,47 +356,8 @@ selectTab = function (tabid) {
 <div id="{{unique|escape}}_graphs" style="height:100%;">
 {% for graph in this.graphs %}
   <div id="{{unique|escape}}_{{graph.id|escape}}" class="grr_graph"></div>
-  <script>
-      var specs_{{graph.id|escapejs}} = [];
-
-  {% for stats in graph.series %}
-    specs_{{graph.id|escapejs}}.push({
-      label: "{{stats.label|escapejs}}",
-      data: [
-        {{stats.data|escapejs}}
-      ],
-    });
-  {% endfor %}
-    var options_{{graph.id|escapejs}} = {
-      xaxis: {mode: "time",
-              timeformat: "%y/%m/%d - %H:%M:%S"},
-      lines: {show: true},
-      points: {show: true},
-      zoom: {interactive: true},
-      pan: {interactive: true},
-      grid: {clickable: true, autohighlight: true},
-    };
-
-    var placeholder = $("#{{unique|escapejs}}_{{graph.id|escapejs}}");
-    var plot_{{graph.id|escapejs}} = $.plot(
-            placeholder, specs_{{graph.id|escapejs}},
-            options_{{graph.id|escapejs}});
-
-    placeholder.bind("plotclick", function(event, pos, item) {
-      if (item) {
-        var date = new Date(item.datapoint[0]);
-        var msg = "{{graph.click_text|escapejs}}";
-        msg = msg.replace("%date", date.toString())
-        msg = msg.replace("%value", item.datapoint[1])
-        $("#{{unique|escapejs}}_click").text(msg);
-      };
-    });
-  </script>
-  {% endfor %}
+{% endfor %}
 </div>
-<script>
-  selectTab("cpu");
-</script>
 {% else %}
   <h3>No data Available</h3>
 {% endif %}
@@ -389,7 +372,7 @@ selectTab = function (tabid) {
   def Layout(self, request, response):
     """This renders graphs for the various client statistics."""
 
-    self.client_id = rdfvalue.ClientURN(request.REQ.get("client_id"))
+    self.client_id = rdf_client.ClientURN(request.REQ.get("client_id"))
 
     self.start_time, self.end_time = GetAgeTupleFromRequest(request, 90)
     fd = aff4.FACTORY.Open(self.client_id.Add("stats"), token=request.token,
@@ -409,7 +392,7 @@ selectTab = function (tabid) {
     series = dict()
     for stat_entry in stats:
       for s in stat_entry.cpu_samples:
-        series[int(s.timestamp/1e3)] = s.cpu_percent
+        series[int(s.timestamp / 1e3)] = s.cpu_percent
     graph = StatGraph(name="CPU Usage", graph_id="cpu",
                       click_text="CPU usage on %date: %value")
     graph.AddSeries(series, "CPU Usage in %", max_samples)
@@ -419,7 +402,7 @@ selectTab = function (tabid) {
     series = dict()
     for stat_entry in stats:
       for s in stat_entry.io_samples:
-        series[int(s.timestamp/1e3)] = int(s.read_bytes/1024/1024)
+        series[int(s.timestamp / 1e3)] = int(s.read_bytes / 1024 / 1024)
     graph = StatGraph(
         name="IO Bytes Read", graph_id="io_read",
         click_text="Number of bytes received (IO) until %date: %value")
@@ -429,7 +412,7 @@ selectTab = function (tabid) {
     series = dict()
     for stat_entry in stats:
       for s in stat_entry.io_samples:
-        series[int(s.timestamp/1e3)] = int(s.write_bytes/1024/1024)
+        series[int(s.timestamp / 1e3)] = int(s.write_bytes / 1024 / 1024)
     graph = StatGraph(
         name="IO Bytes Written", graph_id="io_write",
         click_text="Number of bytes written (IO) until %date: %value")
@@ -442,11 +425,11 @@ selectTab = function (tabid) {
         click_text="Memory usage on %date: %value")
     series = dict()
     for stat_entry in stats:
-      series[int(stat_entry.age/1e3)] = int(stat_entry.RSS_size/1024/1024)
+      series[int(stat_entry.age / 1e3)] = int(stat_entry.RSS_size / 1024 / 1024)
     graph.AddSeries(series, "RSS size in MB", max_samples)
     series = dict()
     for stat_entry in stats:
-      series[int(stat_entry.age/1e3)] = int(stat_entry.VMS_size/1024/1024)
+      series[int(stat_entry.age / 1e3)] = int(stat_entry.VMS_size / 1024 / 1024)
     graph.AddSeries(series, "VMS size in MB", max_samples)
     self.graphs.append(graph)
 
@@ -456,8 +439,8 @@ selectTab = function (tabid) {
         click_text="Network bytes received until %date: %value")
     series = dict()
     for stat_entry in stats:
-      series[int(stat_entry.age/1e3)] = int(
-          stat_entry.bytes_received/1024/1024)
+      series[int(stat_entry.age / 1e3)] = int(
+          stat_entry.bytes_received / 1024 / 1024)
     graph.AddSeries(series, "Network Bytes Received in MB", max_samples)
     self.graphs.append(graph)
 
@@ -466,17 +449,20 @@ selectTab = function (tabid) {
         click_text="Network bytes sent until %date: %value")
     series = dict()
     for stat_entry in stats:
-      series[int(stat_entry.age/1e3)] = int(stat_entry.bytes_sent/1024/1024)
+      series[
+          int(stat_entry.age / 1e3)] = int(stat_entry.bytes_sent / 1024 / 1024)
     graph.AddSeries(series, "Network Bytes Sent in MB", max_samples)
     self.graphs.append(graph)
 
-    return super(AFF4ClientStats, self).Layout(request, response)
+    response = super(AFF4ClientStats, self).Layout(request, response)
+    return self.CallJavascript(response, "AFF4ClientStats.Layout",
+                               graphs=[g.ToDict() for g in self.graphs])
 
 
 def GetAgeTupleFromRequest(request, default_days=90):
   """Check the request for start/end times and return aff4 age tuple."""
   now = int(time.time() * 1e6)
-  default_start = now - (60*60*24*1e6*default_days)
+  default_start = now - (60 * 60 * 24 * 1e6 * default_days)
   start_time = int(request.REQ.get("start_time", default_start))
   end_time = int(request.REQ.get("end_time", now))
   return (start_time, end_time)
@@ -497,7 +483,7 @@ class CustomXAxisChart(Report):
   def Layout(self, request, response):
     """Set X,Y values."""
     try:
-      fd = aff4.FACTORY.Open(self.data_urn)
+      fd = aff4.FACTORY.Open(self.data_urn, token=request.token)
       self.graph = fd.Get(self.attribute)
 
       self.data = []
@@ -526,7 +512,7 @@ class LogXAxisChart(CustomXAxisChart):
 
   def Layout(self, request, response):
     try:
-      fd = aff4.FACTORY.Open(self.data_urn)
+      fd = aff4.FACTORY.Open(self.data_urn, token=request.token)
       self.graph = fd.Get(self.attribute)
 
       self.data = []
@@ -613,5 +599,3 @@ class FileClientCount(CustomXAxisChart):
   category = "/FileStore/ClientCounts"
   data_urn = "aff4:/stats/FileStoreStats"
   attribute = aff4.FilestoreStats.SchemaCls.FILESTORE_CLIENTCOUNT_HISTOGRAM
-
-

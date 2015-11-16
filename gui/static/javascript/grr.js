@@ -78,7 +78,7 @@ grr.init = function() {
     }
   }, 'body');
 
-  $('#backtrace').on('hidden', function() {
+  $('#backtrace').on('hidden.bs.modal', function() {
     grr.publish('grr_messages', ' ');
   });
   $('#show_backtrace').unbind('click').click(function() {
@@ -104,20 +104,29 @@ grr.init = function() {
    * basically patches the jQuery.ajax method to remove the XSSI preamble.
    */
   if (grr.installXssiProtection) {
+    var json_converter = function(data) {
+      if (typeof data !== 'string' || !data) {
+        return null;
+      }
+
+      if (data.substring(0, 4) != ')]}\n') {
+        return jQuery.error('JSON object not properly protected.');
+      }
+
+      return $.parseJSON(data.substring(4, data.length));
+    };
+
+    var test = function(data) {
+      return window.String(data);
+    };
+
     $.ajaxSetup({
       crossDomain: false,
-      converters:
-        { 'text json': function(data) {
-          if (typeof data !== 'string' || !data) {
-            return null;
-          }
-
-          if (data.substring(0, 4) != ')]}\n') {
-            return jQuery.error('JSON object not properly protected.');
-          }
-
-          return $.parseJSON(data.substring(4, data.length));
-        }
+      converters: {
+        '* application': window.String,
+        'application json': json_converter,
+        'application javascript': json_converter,
+        'text json': json_converter
       }
     });
     grr.installXssiProtection = false;
@@ -129,7 +138,7 @@ grr.init = function() {
   */
   var csrftoken = grr.getCookie('csrftoken');
 
-  $('html').ajaxSend(function(event, xhr, settings) {
+  $(document).ajaxSend(function(event, xhr, settings) {
     // Officially crossdomain should be covered by ajaxSetup call, but that
     // appears to not apply to tree renderers, so belt and braces here.
     if (!grr.csrfSafeMethod(settings.type)) {
@@ -156,15 +165,16 @@ grr.init = function() {
  *
  * @param {string} renderer The name of the RenderTree responsible for this
  *     tree.
- * @param {string} domId The domId of the div element that will contain the
+ * @param {string} unique_id The id of the div element that will contain the
  *     tree.
  * @param {string=} opt_publishEvent The name of the GRR event queue where
  *     select events will be published. DEFAULT: "tree_select".
  * @param {Object=} opt_state An optional state object to pass to the
  *     server. DEFAULT: global state.
  * @param {Function=} opt_success_cb an optional function to handle ajax stream.
+ * @return {Object=} jQuery-wrapped tree.
  */
-grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
+grr.grrTree = function(renderer, unique_id, opt_publishEvent, opt_state,
                        opt_success_cb) {
   var state = $.extend({}, grr.state, opt_state);
   var publishEvent = opt_publishEvent || 'tree_select';
@@ -173,14 +183,8 @@ grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
   state.reason = state.reason || grr.state.reason;
   state.client_id = state.client_id || grr.state.client_id;
 
-  /* Build the tree navigator */
-  var container = $('#' + domId);
-  var unique_id = (new Date()).getTime();
-
-  /* We attach the tree to a unique dom node so that when the tree is removed,
-   * subscribed events will also disappear. */
-  container.append("<div class='grr_default' id='" + unique_id + "'></div>");
   var tree = $('#' + unique_id);
+  tree.html('');
 
   tree.jstree({
     'json_data' : {
@@ -258,13 +262,13 @@ grr.grrTree = function(renderer, domId, opt_publishEvent, opt_state,
   });
 
   grr.subscribe('client_selection', function(message) {
-    // Kill the tree
-    container.html('');
     // Make a new one
-    grr.grrTree(renderer, domId, opt_publishEvent, opt_state,
-      opt_success_cb);
+    grr.grrTree(renderer, unique_id, opt_publishEvent, opt_state,
+                opt_success_cb);
     grr.publish(publishEvent, '/');
   }, unique_id);
+
+  return tree;
 };
 
 
@@ -337,7 +341,7 @@ grr.subscribe = function(name, handle, domId) {
   grr.queue_[queue_name] = new_queue;
 
   if (new_queue.length > 5) {
-    alert('Queue ' + queue_name + 'seems full');
+    alert('Queue ' + queue_name + ' seems full');
   }
 };
 
@@ -466,8 +470,8 @@ grr.table.sortableDialog = function() {
     var tbody = header.parents('table').find('tbody');
     var filter = header.attr('filter');
 
-    tbody.html('<tr><td id="' + tbody.attr('id') +
-        '" class="table_loading">Loading...</td></tr>');
+    tbody.html('<tr><td id="' + tbody.attr('id') + '_loading"' +
+        ' class="table_loading">Loading...</td></tr>');
     tbody.scroll();
     if (filter != null) {
       header.attr('title', 'Filter: ' + filter);
@@ -522,7 +526,9 @@ grr.table.scrollHandler = function(renderer, tbody, opt_state) {
 
   $('.table_loading', tbody).each(function() {
     loading_offset = $(this).offset();
-    elem = document.elementFromPoint(loading_offset.left, loading_offset.top);
+    elem = document.elementFromPoint(
+        loading_offset.left - $(window).scrollLeft() + 1,
+        loading_offset.top - $(window).scrollTop() + 1);
     if ($(elem).hasClass('table_loading')) {
       // Prevent scrollHandler from being called again for this "Loading..."
       // row.
@@ -616,7 +622,7 @@ grr.table.toggleChildRows = function(node, data) {
     item.removeClass('tree_opened');
   } else {
     var tbody = item.parents('table').find('tbody');
-    var dom = $("<td id='" + tbody.attr('id') +
+    var dom = $("<td id='" + tbody.attr('id') + '_loading' +
         "' class='table_loading' colspan=200>Loading ...</td>");
     dom.attr('data', data);
     dom.attr('depth', depth + 1);
@@ -644,8 +650,7 @@ grr.table.toggleChildRows = function(node, data) {
 grr.table.newTable = function(renderer, domId, unique, opt_state) {
   var me = $('#' + domId);
 
-  // Click handler.
-  $('#' + unique).click(function(event) {
+  var rowHandler = function(event) {
     /* Find the next TR above the clicked point */
     var node = $(event.target).closest('tr');
     var row_id = node.attr('row_id');
@@ -658,10 +663,14 @@ grr.table.newTable = function(renderer, domId, unique, opt_state) {
       node.addClass('row_selected');
 
       // Publish the selected node
-      grr.publish('select_' + domId, node);
+      grr.publish(event.data, node);
     }
     event.stopPropagation();
-  });
+  };
+
+  // Click handler.
+  $('#' + unique).click('select_' + domId, rowHandler);
+  $('#' + unique).dblclick('double_click_' + domId, rowHandler);
 
   $('#' + unique).on('refresh', function() {
     var selected_row = $('tr.row_selected', me).first();
@@ -672,13 +681,15 @@ grr.table.newTable = function(renderer, domId, unique, opt_state) {
     grr.update(renderer, tbody_id, null, function(data) { /* on_success */
       $('#' + tbody_id, me).html(data);
 
-      // If we can select previously selected row, select it.
-      // Otherwise - select the first one.
-      $('tr[row_id=' + selected_row_id + ']', me).each(function() {
-        $(this).click();
-      });
-      if ($('tr.selected', me).length == 0) {
-        $('tr', me).first().click();
+      if (selected_row_id) {
+        // If we can select previously selected row, select it.
+        // Otherwise - select the first one.
+        $('tr[row_id=' + selected_row_id + ']', me).each(function() {
+          $(this).click();
+        });
+        if ($('tr.selected', me).length == 0) {
+          $('tr', me).first().click();
+        }
       }
     });
   });
@@ -755,7 +766,6 @@ grr.poll = function(renderer, domId, callback, timeout, state, opt_datatype,
 
   // First one to kick off
   update();
-  window.setTimeout(update, timeout);
 };
 
 /**
@@ -804,17 +814,31 @@ grr._update = function(renderer, domId, opt_state, on_success, inflight_key,
     },
     error: function(jqXHR) {
       if (grr.GetFromAjaxQueue(inflight_key) === jqXHR) {
+        var jsonData = false;
         if (jqXHR.status == 500) {
           var data = jqXHR.responseText;
-          data = $.parseJSON(data.substring(4, data.length));
+          try {
+            data = $.parseJSON(data.substring(4, data.length));
+            jsonData = true;
+          } catch (e) {
+            // Usually renderers get a <script>...</script> code when error
+            // happens. We handle this here.
+            $(document.body).append(data);
+            data = {
+              message: grr._lastError,
+              traceback: grr._lastBacktrace
+            };
+          }
         } else {
           var data = {message: 'Server Error',
                       traceback: jqXHR.responseText};
         }
 
         if (!on_error) {
-          grr.publish('grr_messages', data.message);
-          grr.publish('grr_traceback', data.traceback);
+          if (jsonData) {
+            grr.publish('grr_messages', data.message);
+            grr.publish('grr_traceback', data.traceback);
+          }
         }
         else {
           on_error(data);
@@ -862,6 +886,7 @@ grr.update = function(renderer, domId, opt_state, on_success, inflight_key,
   if (!on_success) {
     on_success = function(data) {
       $('#' + domId).html(data);
+      grr.publish('on_renderer_load', domId);
     };
   }
 
@@ -884,6 +909,7 @@ grr.update = function(renderer, domId, opt_state, on_success, inflight_key,
 grr.layout = function(renderer, domId, opt_state, on_success) {
   success_handler = function(data) {
     $('#' + domId).html(data);
+    grr.publish('on_renderer_load', domId);
     if (on_success) {
       on_success(domId);
     }
@@ -989,11 +1015,21 @@ grr.update_form = function(formId, state) {
 /**
  * Parses the location bar's #hash value into an object.
  *
+ * @param {Object=} hash Optional hash to be parsed. If not passed,
+ *                       window.location.hash will be parsed instead.
  * @return {Object} an associative array of encoded values.
  */
-grr.parseHashState = function() {
+grr.parseHashState = function(hash) {
+  if (hash === undefined) {
+    hash = window.location.hash;
+  }
+
+  if (hash.indexOf('#') == 0) {
+    hash = hash.substr(1);
+  }
+
   var result = {};
-  var parts = window.location.hash.substr(1).split('&');
+  var parts = hash.split('&');
 
   for (var i = 0; i < parts.length; i++) {
     var kv = parts[i].split('=');
@@ -1092,7 +1128,7 @@ grr.hexview = {};
  *
  */
 grr.hexview.BuildTable = function(domId, width, height) {
-  var table = $($('#HexTableTemplate').text());
+  var table = $($('#HexTableTemplate').html());
 
   // Insert the offset headers
   var layout = '';
@@ -1564,6 +1600,9 @@ grr.downloadHandler = function(clickNode, state, safe_extension, url, target) {
   clickNode.unbind('click').click(function() {
     tmpform.submit();
   });
+  clickNode.bind('download', function() {
+    tmpform.submit();
+  });
 };
 
 
@@ -1608,7 +1647,7 @@ grr.getCookie = function(name) {
  */
 grr.enableSearchHelp = function(clickNode) {
   var help_content = 'Search by hostname, username, id or MAC<br/>' +
-      'Limit scope using mac: host: label: fqdn: or user:<br/>e.g.' +
+      'Limit scope using mac: host: label: fqdn: ip: or user:<br/>e.g.' +
       ' user:sham<br/>Regex is supported<br/> e.g. test1[2-5].*\.' +
       'example.com$';
   var popover_opts = {'placement': 'bottom',
@@ -1621,6 +1660,72 @@ grr.enableSearchHelp = function(clickNode) {
 
 };
 
+/**
+ * Pushes the state from the Javascript state dict to html tags.
+ * @param {string} domId of the widget which will receive the state.
+ * @param {Object} state The state to push.
+ */
+grr.pushState = function(domId, state) {
+  keys = Object.keys(state);
+  attrs = {};
+  for (var i = 0; i < keys.length; i++) {
+    attrs['state-' + keys[i]] = state[keys[i]];
+  }
+  $('#' + domId).attr(attrs);
+};
 
 /** Initialize the grr object */
 grr.init();
+
+/**
+ *  Initialize Angular GRR app. AngularJS has no problems coexisting with
+ *  existing set of GRR renderers.
+ */
+var grrUiApp = angular.module('grrUi', ['ngCookies',
+                                        'grrUi.appController',
+                                        'grrUiLocal.local']);
+
+grrUiApp.config(function($httpProvider, $interpolateProvider,
+                         $rootScopeProvider) {
+  // Set templating braces to be '{$' and '$}' to avoid conflicts with Django
+  // templates.
+  $interpolateProvider.startSymbol('{$');
+  $interpolateProvider.endSymbol('$}');
+
+  // Ensuring that Django plays nicely with Angular-initiated requests
+  // (see http://www.daveoncode.com/2013/10/17/how-to-
+  // make-angularjs-and-django-play-nice-together/).
+  $httpProvider.defaults.headers.post[
+    'Content-Type'] = 'application/x-www-form-urlencoded';
+  $httpProvider.defaults.headers.common['X-Requested-With'] = 'XMLHttpRequest';
+
+  // We use recursive data model generation when rendering forms. Therefore
+  // have to increase the digestTtl limit to 50.
+  $rootScopeProvider.digestTtl(50);
+});
+
+grrUiApp.run(function($injector, $http, $cookies, grrReflectionService) {
+  grr.angularInjector = $injector;
+
+  // Ensure CSRF token is in place for Angular-initiated HTTP requests.
+  $http.defaults.headers.post['X-CSRFToken'] = $cookies.get('csrftoken');
+
+  // Call reflection service as soon as possible in the app lifetime to cache
+  // the values. "ACLToken" is picked up here as an arbitrary name.
+  // grrReflectionService loads all RDFValues definitions on first request
+  // and then caches them.
+
+  grrReflectionService.getRDFValueDescriptor('ACLToken');
+});
+
+
+/**
+ * TODO(user): Remove when dependency on jQuery-migrate is removed.
+ */
+jQuery.migrateMute = true;
+
+/**
+ * Hardcoding jsTree themes folder so that it works correctly when used
+ * from a JS bundle file.
+ */
+$.jstree._themes = '/static/third-party/jstree-1.0rc3/themes/';

@@ -1,0 +1,15 @@
+.git
+.gitignore
+*.pyc
+*.egg-info
+ACKNOWLEDGEMENTS
+AUTHORS
+build
+debian
+executables
+!executables/windows/templates/unzipsfx/*.exe
+LICENSE
+README
+README.md
+travis
+vagrant

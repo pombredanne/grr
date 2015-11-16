@@ -7,9 +7,9 @@
 
 
 from grr.lib import flags
-from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib import type_info
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 class TypeInfoTest(test_lib.GRRBaseTest):
@@ -48,8 +48,30 @@ class TypeInfoTest(test_lib.GRRBaseTest):
     self.assertRaises(type_info.TypeValueError, a.Validate, None)
     self.assertRaises(type_info.TypeValueError, a.Validate, ["test"])
     self.assertRaises(type_info.TypeValueError, a.Validate, [
-        rdfvalue.PathSpec()])
+        rdf_paths.PathSpec()])
     a.Validate([1, 2, 3])
+
+  def testTypeInfoMultiChoiceObjects(self):
+    """Test MultiChoice objects."""
+    a = type_info.MultiChoice(choices=["a", "b"])
+    self.assertRaises(type_info.TypeValueError, a.Validate, "a")
+    self.assertRaises(type_info.TypeValueError, a.Validate, ["test"])
+    self.assertRaises(type_info.TypeValueError, a.Validate, ["a", "test"])
+    self.assertRaises(type_info.TypeValueError, a.Validate, ["a", "a"])
+    self.assertRaises(type_info.TypeValueError, a.Validate, None)
+    self.assertRaises(type_info.TypeValueError, a.Validate, [1])
+    self.assertRaises(type_info.TypeValueError, a.Validate, 1)
+    a.Validate(["a"])
+    a.Validate(["a", "b"])
+
+    with self.assertRaises(type_info.TypeValueError):
+      type_info.MultiChoice(choices=[1, 2])
+
+    a = type_info.MultiChoice(choices=[1, 2], validator=type_info.Integer())
+    self.assertRaises(type_info.TypeValueError, a.Validate, "a")
+    self.assertRaises(type_info.TypeValueError, a.Validate, ["test"])
+    a.Validate([2])
+    a.Validate([1, 2])
 
   def testTypeDescriptorSet(self):
 
@@ -73,19 +95,19 @@ class TypeInfoTest(test_lib.GRRBaseTest):
         type_infos[0],
         type_infos[1],
         type_infos[2],
-        )
+    )
 
     new_info = type_info.TypeDescriptorSet(
         type_infos[0],
-        )
+    )
 
     updated_info = new_info + type_info.TypeDescriptorSet(
         type_infos[1],
-        )
+    )
 
     updated_info += type_info.TypeDescriptorSet(
         type_infos[2],
-        )
+    )
 
     self.assertEqual(info.descriptor_map, updated_info.descriptor_map)
     self.assertEqual(sorted(info.descriptors), sorted(updated_info.descriptors))

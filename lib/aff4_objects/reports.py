@@ -8,6 +8,7 @@ import time
 
 import logging
 
+from grr.lib import config_lib
 from grr.lib import email_alerts
 from grr.lib import export_utils
 from grr.lib import rdfvalue
@@ -31,7 +32,7 @@ class ClientReport(Report):
   %(report_text)s
   <br/>
   <p>Thanks,</p>
-  <p>The GRR team.
+  <p>%(signature)s</p>
   </body></html>"""
   EMAIL_FROM = "noreply"
 
@@ -48,7 +49,7 @@ class ClientReport(Report):
     self.fields = [f.name for f in self.REPORT_ATTRS]
     self.fields += [f[1].name for f in self.EXTENDED_REPORT_ATTRS]
     self.thread_num = thread_num
-    self.broken_clients = []     #  Clients that are broken or fail to run.
+    self.broken_clients = []  # Clients that are broken or fail to run.
 
   def AsDict(self):
     """Give the report as a list of dicts."""
@@ -101,10 +102,11 @@ class ClientReport(Report):
     subject = subject or "%s - %s" % (self.REPORT_NAME, dt)
     csv_data = self.AsCsv()
     filename = "%s-%s.csv" % (self.REPORT_NAME, dt)
-    email_alerts.SendEmail(recipient, self.EMAIL_FROM, subject,
-                           "Please find the CSV report file attached",
-                           attachments={filename: csv_data.getvalue()},
-                           is_html=False)
+    email_alerts.EMAIL_ALERTER.SendEmail(
+        recipient, self.EMAIL_FROM, subject,
+        "Please find the CSV report file attached",
+        attachments={filename: csv_data.getvalue()},
+        is_html=False)
     logging.info("Report %s mailed to %s", self.REPORT_NAME, recipient)
 
   def MailHTMLReport(self, recipient, subject=None):
@@ -112,14 +114,17 @@ class ClientReport(Report):
     dt = rdfvalue.RDFDatetime().Now().Format("%Y-%m-%dT%H-%MZ")
     subject = subject or "%s - %s" % (self.REPORT_NAME, dt)
     report_text = self.AsHtmlTable()
-    email_alerts.SendEmail(recipient, self.EMAIL_FROM, subject,
-                           self.EMAIL_TEMPLATE % dict(
-                               report_text=report_text,
-                               report_name=self.REPORT_NAME),
-                           is_html=True)
+
+    email_alerts.EMAIL_ALERTER.SendEmail(
+        recipient, self.EMAIL_FROM, subject,
+        self.EMAIL_TEMPLATE % dict(
+            report_text=report_text,
+            report_name=self.REPORT_NAME,
+            signature=config_lib.CONFIG["Email.signature"]),
+        is_html=True)
     logging.info("Report %s mailed to %s", self.REPORT_NAME, recipient)
 
-  def Run(self, max_age=60*60*24*7):
+  def Run(self, max_age=60 * 60 * 24 * 7):
     """Run the report.
 
     Args:
@@ -155,7 +160,7 @@ class ClientListReport(ClientReport):
 
   REPORT_NAME = "GRR Client List Report"
 
-  def Run(self, max_age=60*60*24*7):
+  def Run(self, max_age=60 * 60 * 24 * 7):
     """Collect all the data for the report."""
     start_time = time.time()
     self.results = []
@@ -175,7 +180,7 @@ class VersionBreakdownReport(ClientReport):
   ]
   REPORT_NAME = "GRR Client Version Breakdown Report"
 
-  def Run(self, max_age=60*60*24*7):
+  def Run(self, max_age=60 * 60 * 24 * 7):
     """Run the report."""
     counts = {}
     self.fields.append("count")

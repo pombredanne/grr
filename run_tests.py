@@ -12,29 +12,34 @@ import sys
 import time
 import unittest
 
+import psutil
+
+# These need to register plugins so,
 # pylint: disable=unused-import,g-bad-import-order
 from grr.lib import server_plugins
+from grr.checks import tests
 from grr.client import tests
-# pylint: enable=unused-import,g-bad-import-order
 
-# These need to register plugins so, pylint: disable=unused-import
+from grr.gui import tests
 from grr.lib import flags
 from grr.lib import test_lib
 from grr.lib import tests
 from grr.lib import utils
 from grr.parsers import tests
+from grr.server.data_server import tests
 from grr.tools.export_plugins import tests
 from grr.worker import worker_test
+# pylint: enable=unused-import,g-bad-import-order
 
 
 flags.DEFINE_string("output", None,
                     "The name of the file we write on (default stderr).")
 
-flags.DEFINE_integer("processes", 5,
-                     "Total number of simultaneous tests to run.")
+flags.DEFINE_list("exclude_tests", [],
+                  "A comma-separated list of tests to exclude form running.")
 
-flags.DEFINE_string("type", "normal",
-                    "The type of the tests to run (normal, benchmarks).")
+flags.DEFINE_integer("processes", 0,
+                     "Total number of simultaneous tests to run.")
 
 
 class Colorizer(object):
@@ -78,17 +83,42 @@ class GRREverythingTestLoader(test_lib.GRRTestLoader):
 
 
 def RunTest(test_suite, stream=None):
+  """Run an individual test.
+
+  Ignore the argument test_suite passed to this function, then
+  magically acquire an individual test name as specified by the --tests
+  flag, run it, and then exit the whole Python program completely.
+
+  Args:
+    test_suite: Ignored.
+    stream: The stream to print results to.
+
+  Returns:
+    This function does not return; it causes a program exit.
+  """
+
   out_fd = stream
   if stream:
     out_fd = StringIO.StringIO()
 
   try:
+    # Here we use a GRREverythingTestLoader to load tests from.
+    # However, the fact that GRREverythingTestLoader loads all
+    # tests is irrelevant, because GrrTestProgram simply reads
+    # from the --tests flag passed to the program, so not all
+    # tests are ran. Only the test specified via --tests will
+    # be ran. Because --tests supports only one test at a time
+    # this will cause only an individual test to be ran.
+    # GrrTestProgram then terminates the execution of the whole
+    # python program using sys.exit() so this function does not
+    # return.
     test_lib.GrrTestProgram(argv=[sys.argv[0], test_suite],
                             testLoader=GRREverythingTestLoader(
                                 labels=flags.FLAGS.labels),
                             testRunner=unittest.TextTestRunner(
                                 stream=out_fd))
   finally:
+    # Clean up before the program exits.
     if stream:
       stream.write("Test name: %s\n" % test_suite)
       stream.write(out_fd.getvalue())
@@ -153,7 +183,7 @@ def DoesTestHaveLabels(cls, labels):
 
 
 def main(argv=None):
-  if flags.FLAGS.tests or flags.FLAGS.processes == 1:
+  if flags.FLAGS.tests:
     stream = sys.stderr
 
     if flags.FLAGS.output:
@@ -171,26 +201,44 @@ def main(argv=None):
       sys.argv.append("--debug")
 
     suites = flags.FLAGS.tests or test_lib.GRRBaseTest.classes
-    for test_suite in suites:
-      RunTest(test_suite, stream=stream)
+
+    if len(suites) != 1:
+      raise ValueError("Only a single test is supported in single "
+                       "processing mode, but %i were specified" %
+                       len(suites))
+
+    test_suite = suites[0]
+    print "Running test %s in single process mode" % test_suite
+    sys.stdout.flush()
+    RunTest(test_suite, stream=stream)
 
   else:
     processes = {}
     print "Running tests with labels %s" % ",".join(flags.FLAGS.labels)
 
-    with utils.TempDirectory() as flags.FLAGS.temp_dir:
+    with utils.TempDirectory() as temp_dir:
       start = time.time()
       labels = set(flags.FLAGS.labels)
 
       for name, cls in test_lib.GRRBaseTest.classes.items():
+        if name.startswith("_"):
+          continue
+
         if labels and not DoesTestHaveLabels(cls, labels):
           continue
 
-        result_filename = os.path.join(flags.FLAGS.temp_dir, name)
+        if name in flags.FLAGS.exclude_tests:
+          print "Skipping test %s" % name
+          continue
+
+        result_filename = os.path.join(temp_dir, name)
 
         argv = [sys.executable] + sys.argv[:]
         if "--output" not in argv:
           argv.extend(["--output", result_filename])
+
+        if flags.FLAGS.config:
+          argv.extend(["--config", flags.FLAGS.config])
 
         argv.extend(["--tests", name])
         argv.extend(["--labels", ",".join(flags.FLAGS.labels)])
@@ -200,8 +248,11 @@ def main(argv=None):
                                start=time.time(), output_path=result_filename,
                                test=name)
 
+        max_processes = flags.FLAGS.processes
+        if not max_processes:
+          max_processes = max(psutil.cpu_count() - 1, 1)
         WaitForAvailableProcesses(
-            processes, max_processes=flags.FLAGS.processes,
+            processes, max_processes=max_processes,
             completion_cb=ReportTestResult)
 
       # Wait for all jobs to finish.

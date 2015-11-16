@@ -21,12 +21,6 @@ override_dh_build:
 override_dh_prep:
 	# Nothing to do here, directory is already wiped and set up.
 
-override_dh_auto_install:
-	dh_auto_install
-
-override_dh_installinit:
-	dh_installinit --upstart-only
-
 override_dh_link:
 	dh_link "%(ClientBuilder.target_dir)/%(Client.binary_name)" "%(ClientBuilder.daemon_link)"
 
@@ -34,10 +28,11 @@ override_dh_strip:
 	# Necessary otherwise the PyInstaller build executables will not run
 
 override_dh_makeshlibs:
-	# Prevent useless call to ldconfig
-	dh_makeshlibs -n
+	# These add a lot of unnecessary dependencies to the deb package because
+	# it just looks for .so files and adds them as dependencies. Since we
+	# are shipping our .so's with Pyinstaller this is unnecessary
 
 override_dh_shlibdeps:
-	# Point debhelper to the locally included shared libraries.
-	dh_shlibdeps -l %(ClientBuilder.target_dir)
-
+	# These add a lot of unnecessary dependencies to the deb package because
+	# it just looks for .so files and adds them as dependencies. Since we
+	# are shipping our .so's with Pyinstaller this is unnecessary

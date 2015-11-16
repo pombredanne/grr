@@ -11,15 +11,28 @@ from grr.lib import aff4
 from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib.aff4_objects import filestore
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import crypto as rdf_crypto
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import protodict as rdf_protodict
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
-class GetFileArgs(rdfvalue.RDFProtoStruct):
+class GetFileArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.GetFileArgs
 
 
 class GetFile(flow.GRRFlow):
-  """An efficient file transfer mechanism.
+  """An efficient file transfer mechanism (deprecated, use MultiGetFile).
+
+  This flow is deprecated in favor of MultiGetFile, but kept for now for use by
+  MemoryCollector since the buffer hashing performed by MultiGetFile is
+  pointless for memory acquisition.
+
+  GetFile can also retrieve content from device files that report a size of 0 in
+  stat when read_length is specified.
 
   Returns to parent flow:
     An PathSpec.
@@ -31,7 +44,7 @@ class GetFile(flow.GRRFlow):
 
   class SchemaCls(flow.GRRFlow.SchemaCls):
     PROGRESS_GRAPH = aff4.Attribute(
-        "aff4:progress", rdfvalue.ProgressGraph,
+        "aff4:progress", rdf_flows.ProgressGraph,
         "Show a button to generate a progress graph for this flow.",
         default="")
 
@@ -51,14 +64,14 @@ class GetFile(flow.GRRFlow):
   def Start(self):
     """Get information about the file from the client."""
     self.state.Register("max_chunk_number",
-                        max(2, self.args.read_length/self.CHUNK_SIZE))
+                        max(2, self.args.read_length / self.CHUNK_SIZE))
 
     self.state.Register("current_chunk_number", 0)
     self.state.Register("file_size", 0)
     self.state.Register("fd", None)
     self.state.Register("stat", None)
 
-    self.CallClient("StatFile", rdfvalue.ListDirRequest(
+    self.CallClient("StatFile", rdf_client.ListDirRequest(
         pathspec=self.args.pathspec), next_state="Stat")
 
   @flow.StateHandler(next_state=["ReadBuffer", "CheckHashes"])
@@ -67,13 +80,16 @@ class GetFile(flow.GRRFlow):
     response = responses.First()
     if responses.success and response:
       self.state.stat = response
-      self.args.pathspec = self.state.stat.pathspec
+      # TODO(user): This is a workaround for broken clients sending back
+      # empty pathspecs for pathtype MEMORY. Not needed for clients > 3.0.0.5.
+      if self.state.stat.pathspec.path:
+        self.args.pathspec = self.state.stat.pathspec
     else:
       if not self.args.ignore_stat_failure:
         raise IOError("Error: %s" % responses.status)
 
       # Just fill up a bogus stat entry.
-      self.state.stat = rdfvalue.StatEntry(pathspec=self.args.pathspec)
+      self.state.stat = rdf_client.StatEntry(pathspec=self.args.pathspec)
 
     # Adjust the size from st_size if read length is not specified.
     if self.args.read_length == 0:
@@ -97,7 +113,7 @@ class GetFile(flow.GRRFlow):
       if self.state.current_chunk_number > self.state.max_chunk_number:
         return
 
-      request = rdfvalue.BufferReference(
+      request = rdf_client.BufferReference(
           pathspec=self.args.pathspec,
           offset=self.state.current_chunk_number * self.CHUNK_SIZE,
           length=self.CHUNK_SIZE)
@@ -153,18 +169,22 @@ class GetFile(flow.GRRFlow):
 
       self.Log("Finished reading %s", fd.urn)
       self.Log("Flow Completed in %s seconds",
-               time.time() - self.state.context.create_time/1e6)
+               time.time() - self.state.context.create_time / 1e6)
 
       stat_response = self.state.fd.Get(self.state.fd.Schema.STAT)
 
       fd.size = min(fd.size, self.state.file_size)
+      fd.Set(fd.Schema.CONTENT_LAST, rdfvalue.RDFDatetime().Now())
       fd.Close(sync=True)
 
       # Notify any parent flows the file is ready to be used now.
       self.SendReply(stat_response)
 
+    super(GetFile, self).End()
+
 
 class HashTracker(object):
+
   def __init__(self, hash_response, is_known=False):
     self.hash_response = hash_response
     self.is_known = is_known
@@ -175,18 +195,33 @@ class HashTracker(object):
 class FileTracker(object):
   """A Class to track a single file download."""
 
-  def __init__(self, stat_entry, client_id):
+  def __init__(self, stat_entry, client_id, request_data, index=None):
     self.fd = None
     self.stat_entry = stat_entry
-    self.digest = None
+    self.hash_obj = None
     self.hash_list = []
     self.pathspec = stat_entry.pathspec
     self.urn = aff4.AFF4Object.VFSGRRClient.PathspecToURN(
         self.pathspec, client_id)
     self.stat_entry.aff4path = self.urn
+    self.request_data = request_data
+    self.index = index
+
+    # The total number of bytes available in this file. This may be different
+    # from the size as reported by stat() for special files (e.g. proc files).
+    self.bytes_read = 0
+
+    # The number of bytes we are expected to fetch. This value depends on
+    # - the bytes available (stat_entry.st_size or bytes_read if available).
+    # - a limit to the file size in the flow (self.args.file_size).
+    self.size_to_download = 0
 
   def __str__(self):
-    return "<Tracker: %s (%s hashes)>" % (self.urn, len(self.hash_list))
+    sha256 = self.hash_obj and self.hash_obj.sha256
+    if sha256:
+      return "<Tracker: %s (sha256: %s)>" % (self.urn, sha256)
+    else:
+      return "<Tracker: %s >" % self.urn
 
   def CreateVFSFile(self, filetype, token=None, chunksize=None):
     """Create a VFSFile with stat_entry metadata.
@@ -203,24 +238,28 @@ class FileTracker(object):
     Returns:
       filehandle open for write
     """
+
     # We create the file in the client namespace and populate with metadata.
     self.fd = aff4.FACTORY.Create(self.urn, filetype, mode="w",
                                   token=token)
     self.fd.SetChunksize(chunksize)
     self.fd.Set(self.fd.Schema.STAT(self.stat_entry))
-    self.fd.Set(self.fd.Schema.SIZE(self.stat_entry.st_size))
     self.fd.Set(self.fd.Schema.PATHSPEC(self.pathspec))
+    self.fd.Set(self.fd.Schema.CONTENT_LAST(rdfvalue.RDFDatetime().Now()))
     return self.fd
 
 
-class MultiGetFileArgs(rdfvalue.RDFProtoStruct):
-  protobuf = flows_pb2.MultiGetFileArgs
+class MultiGetFileMixin(object):
+  """A flow mixin to efficiently retrieve a number of files.
 
-
-class MultiGetFile(flow.GRRFlow):
-  """A flow to effectively retrieve a number of files."""
-
-  args_type = MultiGetFileArgs
+  The class extending this can provide a self.state with the following
+  attributes:
+  - file_size: int. Maximum number of bytes to download.
+  - use_external_stores: boolean. If true, look in any defined external file
+    stores for files before downloading them, and offer any new files to
+    external stores. This should be true unless the external checks are
+    misbehaving.
+  """
 
   CHUNK_SIZE = 512 * 1024
 
@@ -228,13 +267,19 @@ class MultiGetFile(flow.GRRFlow):
   # allows us to amortize file store round trips and increases throughput.
   MIN_CALL_TO_FILE_STORE = 200
 
-  @flow.StateHandler(next_state=["ReceiveFileHash", "StoreStat"])
   def Start(self):
-    """Start state of the flow."""
+    """Initialize our state."""
+    super(MultiGetFileMixin, self).Start()
+
     self.state.Register("files_hashed", 0)
+    self.state.Register("use_external_stores", False)
+    self.state.Register("file_size", 0)
     self.state.Register("files_to_fetch", 0)
     self.state.Register("files_fetched", 0)
     self.state.Register("files_skipped", 0)
+
+    # Counter to batch up hash checking in the filestore
+    self.state.Register("files_hashed_since_check", 0)
 
     # A dict of file trackers which are waiting to be checked by the file
     # store.  Keys are vfs urns and values are FileTrack instances.  Values are
@@ -245,6 +290,9 @@ class MultiGetFile(flow.GRRFlow):
     # values are FileTracker instances.
     self.state.Register("pending_files", {})
 
+    # A mapping of index values to the original pathspecs.
+    self.state.Register("indexed_pathspecs", {})
+
     # Set of blobs we still need to fetch.
     self.state.Register("blobs_we_need", set())
 
@@ -252,43 +300,123 @@ class MultiGetFile(flow.GRRFlow):
                            token=self.token)
     self.state.Register("filestore", fd)
 
-    for pathspec in self.args.pathspecs:
+  def GenerateIndex(self, pathspec):
+    h = hashlib.sha256()
+    h.update(pathspec.SerializeToString())
+    return h.hexdigest()
 
-      vfs_urn = aff4.AFF4Object.VFSGRRClient.PathspecToURN(
-          pathspec, self.client_id)
+  def StartFileFetch(self, pathspec, request_data=None):
+    """The entry point for this flow mixin - Schedules new file transfer."""
+    # Create an index so we can find this pathspec later.
+    index = self.GenerateIndex(pathspec)
+    self.state.indexed_pathspecs[index] = pathspec
 
-      # If we have duplicate pathspecs only stat/hash once.
-      if vfs_urn not in self.state.pending_hashes:
-        self.CallClient("StatFile", pathspec=pathspec,
-                        next_state="StoreStat",
-                        request_data=dict(vfs_urn=vfs_urn))
-        self.CallClient("HashFile", pathspec=pathspec,
-                        next_state="ReceiveFileHash",
-                        request_data=dict(vfs_urn=vfs_urn))
+    request_data = request_data or {}
+    request_data["index"] = index
+    self.CallClient("StatFile", pathspec=pathspec,
+                    next_state="StoreStat",
+                    request_data=request_data)
+
+    request = rdf_client.FingerprintRequest(pathspec=pathspec,
+                                            max_filesize=self.state.file_size)
+    request.AddRequest(
+        fp_type=rdf_client.FingerprintTuple.Type.FPT_GENERIC,
+        hashers=[rdf_client.FingerprintTuple.HashType.MD5,
+                 rdf_client.FingerprintTuple.HashType.SHA1,
+                 rdf_client.FingerprintTuple.HashType.SHA256])
+
+    self.CallClient("HashFile", request, next_state="ReceiveFileHash",
+                    request_data=request_data)
+
+  def ReceiveFetchedFile(self, stat_entry, file_hash, request_data=None):
+    """This method will be called for each new file successfully fetched.
+
+    Args:
+      stat_entry: rdf_client.StatEntry object describing the file.
+      file_hash: rdf_crypto.Hash object with file hashes.
+      request_data: Arbitrary dictionary that was passed to the corresponding
+                    StartFileFetch call.
+    """
+
+  def FileFetchFailed(self, pathspec, request_name, request_data=None):
+    """This method will be called when stat or hash requests fail.
+
+    Args:
+      pathspec: Pathspec of a file that failed to be fetched.
+      request_name: Name of a failed client action.
+      request_data: Arbitrary dictionary that was passed to the corresponding
+                    StartFileFetch call.
+    """
 
   @flow.StateHandler()
   def StoreStat(self, responses):
+    """Stores stat entry in the flow's state."""
+
     if not responses.success:
       self.Log("Failed to stat file: %s", responses.status)
+      self.FileFetchFailed(responses.request.request.payload.pathspec,
+                           responses.request.request.name,
+                           request_data=responses.request_data)
       return
 
     stat_entry = responses.First()
-    vfs_urn = responses.request_data["vfs_urn"]
-    self.state.pending_hashes[vfs_urn] = FileTracker(stat_entry, self.client_id)
+    index = responses.request_data["index"]
+    self.state.pending_hashes[index] = FileTracker(
+        stat_entry, self.client_id, responses.request_data, index)
 
   @flow.StateHandler(next_state="CheckHash")
   def ReceiveFileHash(self, responses):
     """Add hash digest to tracker and check with filestore."""
-    vfs_urn = responses.request_data["vfs_urn"]
-    if not responses.success:
-      self.Log("Failed to hash file: %s", responses.status)
-      self.state.pending_hashes.pop(vfs_urn, None)
+    # Support old clients which may not have the new client action in place yet.
+    # TODO(user): Deprecate once all clients have the HashFile action.
+
+    if not responses.success and responses.request.request.name == "HashFile":
+      logging.debug(
+          "HashFile action not available, falling back to FingerprintFile.")
+      self.CallClient("FingerprintFile", responses.request.request.payload,
+                      next_state="ReceiveFileHash",
+                      request_data=responses.request_data)
       return
 
-    self.state.pending_hashes[vfs_urn].digest = rdfvalue.HashDigest(
-        responses.First().data)
+    index = responses.request_data["index"]
+    if not responses.success:
+      self.Log("Failed to hash file: %s", responses.status)
+      self.state.pending_hashes.pop(index, None)
+      self.FileFetchFailed(responses.request.request.payload.pathspec,
+                           responses.request.request.name,
+                           request_data=responses.request_data)
+      return
 
-    if len(self.state.pending_hashes) >= self.MIN_CALL_TO_FILE_STORE:
+    self.state.files_hashed += 1
+    response = responses.First()
+    if response.HasField("hash"):
+      hash_obj = response.hash
+    else:
+      # Deprecate this method of returning hashes.
+      hash_obj = rdf_crypto.Hash()
+
+      if len(response.results) < 1 or response.results[0]["name"] != "generic":
+        self.Log("Failed to hash file: %s", self.state.indexed_pathspecs[index])
+        self.state.pending_hashes.pop(index, None)
+        return
+
+      result = response.results[0]
+
+      try:
+        for hash_type in ["md5", "sha1", "sha256"]:
+          value = result.GetItem(hash_type)
+          setattr(hash_obj, hash_type, value)
+      except AttributeError:
+        self.Log("Failed to hash file: %s", self.state.indexed_pathspecs[index])
+        self.state.pending_hashes.pop(index, None)
+        return
+
+    tracker = self.state.pending_hashes[index]
+    tracker.hash_obj = hash_obj
+    tracker.bytes_read = response.bytes_read
+
+    self.state.files_hashed_since_check += 1
+    if self.state.files_hashed_since_check >= self.MIN_CALL_TO_FILE_STORE:
       self._CheckHashesWithFileStore()
 
   def _CheckHashesWithFileStore(self):
@@ -312,33 +440,39 @@ class MultiGetFile(flow.GRRFlow):
     # Store urns by hash to allow us to remove duplicates.
     # keys are hashdigest objects, values are arrays of tracker objects.
     hash_to_urn = {}
-    for vfs_urn, tracker in self.state.pending_hashes.iteritems():
-      digest = tracker.digest
-      digest.vfs_urn = vfs_urn
-      file_hashes[vfs_urn] = digest
+    for index, tracker in self.state.pending_hashes.iteritems():
+
+      # We might not have gotten this hash yet
+      if tracker.hash_obj is None:
+        continue
+
+      digest = tracker.hash_obj.sha256
+      file_hashes[index] = tracker.hash_obj
       hash_to_urn.setdefault(digest, []).append(tracker)
 
     # First we get all the files which are present in the file store.
     files_in_filestore = set()
-    for file_store_urn, digest in self.state.filestore.CheckHashes(
-        file_hashes.values(), external=self.args.use_external_stores):
+    for file_store_urn, hash_obj in self.state.filestore.CheckHashes(
+        file_hashes.values(), external=self.state.use_external_stores):
 
       self.HeartBeat()
 
       # Since checkhashes only returns one digest per unique hash we need to
       # find any other files pending download with the same hash.
-      for tracker in hash_to_urn[digest]:
-        vfs_urn = tracker.digest.vfs_urn
+      for tracker in hash_to_urn[hash_obj.sha256]:
         self.state.files_skipped += 1
-        file_hashes.pop(vfs_urn, None)
+        file_hashes.pop(tracker.index)
         files_in_filestore.add(file_store_urn)
         # Remove this tracker from the pending_hashes store since we no longer
         # need to process it.
-        self.state.pending_hashes.pop(vfs_urn, None)
+        self.state.pending_hashes.pop(tracker.index)
+
+    # Now that the check is done, reset our counter
+    self.state.files_hashed_since_check = 0
 
     # Now copy all existing files to the client aff4 space.
     for existing_blob in aff4.FACTORY.MultiOpen(files_in_filestore,
-                                                mode="r", token=self.token):
+                                                mode="rw", token=self.token):
 
       hashset = existing_blob.Get(existing_blob.Schema.HASH)
       if hashset is None:
@@ -346,10 +480,11 @@ class MultiGetFile(flow.GRRFlow):
         continue
 
       for file_tracker in hash_to_urn.get(hashset.sha256, []):
-
-        # Some existing_blob files can be created with 0 size, make sure our
-        # size matches the STAT.
-        existing_blob.size = file_tracker.stat_entry.st_size
+        # Due to potential filestore corruption, the existing_blob files can
+        # have 0 size, make sure our size matches the actual size in that case.
+        if existing_blob.size == 0:
+          existing_blob.size = (file_tracker.bytes_read or
+                                file_tracker.stat_entry.st_size)
 
         # Create a file in the client name space with the same classtype and
         # populate its attributes.
@@ -367,53 +502,69 @@ class MultiGetFile(flow.GRRFlow):
         file_tracker.fd.Close(sync=False)
 
         # Let the caller know we have this file already.
-        self.SendReply(file_tracker.stat_entry)
+        self.ReceiveFetchedFile(file_tracker.stat_entry, file_tracker.hash_obj,
+                                request_data=file_tracker.request_data)
 
     # Now we iterate over all the files which are not in the store and arrange
     # for them to be copied.
-    for vfs_urn in file_hashes:
+    for index in file_hashes:
 
       # Move the tracker from the pending hashes store to the pending files
       # store - it will now be downloaded.
-      file_tracker = self.state.pending_hashes.pop(vfs_urn, None)
-      self.state.pending_files[vfs_urn] = file_tracker
+      file_tracker = self.state.pending_hashes.pop(index)
+      self.state.pending_files[index] = file_tracker
 
       # Create the VFS file for this file tracker.
       file_tracker.CreateVFSFile("VFSBlobImage", token=self.token,
                                  chunksize=self.CHUNK_SIZE)
 
+      # If we already know how big the file is we use that, otherwise fall back
+      # to the size reported by stat.
+      if file_tracker.bytes_read > 0:
+        file_tracker.size_to_download = file_tracker.bytes_read
+      else:
+        file_tracker.size_to_download = file_tracker.stat_entry.st_size
+
       # We do not have the file here yet - we need to retrieve it.
-      expected_number_of_hashes = (file_tracker.stat_entry.st_size /
-                                   self.CHUNK_SIZE + 1)
+      expected_number_of_hashes = (
+          file_tracker.size_to_download / self.CHUNK_SIZE + 1)
 
       # We just hash ALL the chunks in the file now. NOTE: This maximizes client
       # VFS cache hit rate and is far more efficient than launching multiple
       # GetFile flows.
       self.state.files_to_fetch += 1
+
       for i in range(expected_number_of_hashes):
+        if i == expected_number_of_hashes - 1:
+          # The last chunk is short.
+          length = file_tracker.size_to_download % self.CHUNK_SIZE
+        else:
+          length = self.CHUNK_SIZE
         self.CallClient("HashBuffer", pathspec=file_tracker.pathspec,
                         offset=i * self.CHUNK_SIZE,
-                        length=self.CHUNK_SIZE, next_state="CheckHash",
-                        request_data=dict(urn=vfs_urn))
+                        length=length, next_state="CheckHash",
+                        request_data=dict(index=index))
 
     if self.state.files_hashed % 100 == 0:
       self.Log("Hashed %d files, skipped %s already stored.",
                self.state.files_hashed, self.state.files_skipped)
 
-    # Clear the pending urns. This should already be empty now but just in case
-    # we clear it.
-    self.state.pending_hashes = {}
-
   @flow.StateHandler(next_state="WriteBuffer")
   def CheckHash(self, responses):
     """Adds the block hash to the file tracker responsible for this vfs URN."""
-    vfs_urn = responses.request_data["urn"]
-    file_tracker = self.state.pending_files[vfs_urn]
+    index = responses.request_data["index"]
+
+    if index not in self.state.pending_files:
+      # This is a blobhash for a file we already failed to read and logged as
+      # below, check here to avoid logging dups.
+      return
+
+    file_tracker = self.state.pending_files[index]
 
     hash_response = responses.First()
     if not responses.success or not hash_response:
       self.Log("Failed to read %s: %s" % (file_tracker.urn, responses.status))
-      del self.state.pending_files[vfs_urn]
+      del self.state.pending_files[index]
       return
 
     hash_tracker = HashTracker(hash_response)
@@ -439,7 +590,7 @@ class MultiGetFile(flow.GRRFlow):
     self.state.blobs_we_need = set()
 
     # Now iterate over all the blobs and add them directly to the blob image.
-    for vfs_urn, file_tracker in self.state.pending_files.iteritems():
+    for index, file_tracker in self.state.pending_files.iteritems():
       for hash_tracker in file_tracker.hash_list:
         # Make sure we read the correct pathspec on the client.
         hash_tracker.hash_response.pathspec = file_tracker.pathspec
@@ -448,13 +599,13 @@ class MultiGetFile(flow.GRRFlow):
           # If we have the data we may call our state directly.
           self.CallState([hash_tracker.hash_response],
                          next_state="WriteBuffer",
-                         request_data=dict(urn=vfs_urn))
+                         request_data=dict(index=index))
 
         else:
           # We dont have this blob - ask the client to transmit it.
           self.CallClient("TransferBuffer", hash_tracker.hash_response,
                           next_state="WriteBuffer",
-                          request_data=dict(urn=vfs_urn))
+                          request_data=dict(index=index))
 
       # Clear the file tracker's hash list.
       file_tracker.hash_list = []
@@ -462,34 +613,35 @@ class MultiGetFile(flow.GRRFlow):
   @flow.StateHandler(next_state="IterateFind")
   def WriteBuffer(self, responses):
     """Write the hash received to the blob image."""
+
     # Note that hashes must arrive at this state in the correct order since they
     # are sent in the correct order (either via CallState or CallClient).
-    vfs_urn = responses.request_data["urn"]
-    if vfs_urn not in self.state.pending_files:
+    index = responses.request_data["index"]
+    if index not in self.state.pending_files:
       return
 
     # Failed to read the file - ignore it.
     if not responses.success:
-      return self.RemoveInFlightFile(vfs_urn)
+      return self.RemoveInFlightFile(index)
 
     response = responses.First()
-    file_tracker = self.state.pending_files.get(vfs_urn)
+    file_tracker = self.state.pending_files.get(index)
     if file_tracker:
       file_tracker.fd.AddBlob(response.data, response.length)
 
       if (response.length < file_tracker.fd.chunksize or
-          response.offset + response.length >= file_tracker.stat_entry.st_size):
+          response.offset + response.length >= file_tracker.size_to_download):
         # File done, remove from the store and close it.
-        self.RemoveInFlightFile(vfs_urn)
+        self.RemoveInFlightFile(index)
 
         # Close and write the file to the data store.
-        file_tracker.fd.Close(sync=False)
+        file_tracker.fd.Close(sync=True)
 
         # Publish the new file event to cause the file to be added to the
         # filestore. This is not time critical so do it when we have spare
         # capacity.
         self.Publish("FileStore.AddFileToStore", file_tracker.fd.urn,
-                     priority=rdfvalue.GrrMessage.Priority.LOW_PRIORITY)
+                     priority=rdf_flows.GrrMessage.Priority.LOW_PRIORITY)
 
         self.state.files_fetched += 1
 
@@ -497,10 +649,13 @@ class MultiGetFile(flow.GRRFlow):
           self.Log("Fetched %d of %d files.", self.state.files_fetched,
                    self.state.files_to_fetch)
 
-  def RemoveInFlightFile(self, vfs_urn):
-    file_tracker = self.state.pending_files.pop(vfs_urn)
+  def RemoveInFlightFile(self, index):
+    """Removes a file from the pending files list."""
+
+    file_tracker = self.state.pending_files.pop(index)
     if file_tracker:
-      self.SendReply(file_tracker.stat_entry)
+      self.ReceiveFetchedFile(file_tracker.stat_entry, file_tracker.hash_obj,
+                              request_data=file_tracker.request_data)
 
   @flow.StateHandler(next_state=["CheckHash", "WriteBuffer"])
   def End(self):
@@ -508,8 +663,47 @@ class MultiGetFile(flow.GRRFlow):
     if self.state.pending_hashes or self.state.pending_files:
       self._CheckHashesWithFileStore()
       self.FetchFileContent()
-    else:
-      return super(MultiGetFile, self).End()
+
+    if not self.runner.OutstandingRequests():
+      super(MultiGetFileMixin, self).End()
+
+
+class MultiGetFileArgs(rdf_structs.RDFProtoStruct):
+  protobuf = flows_pb2.MultiGetFileArgs
+
+
+class MultiGetFile(MultiGetFileMixin, flow.GRRFlow):
+  """A flow to effectively retrieve a number of files."""
+
+  args_type = MultiGetFileArgs
+
+  @flow.StateHandler(next_state=["ReceiveFileHash", "StoreStat"])
+  def Start(self):
+    """Start state of the flow."""
+    super(MultiGetFile, self).Start()
+
+    self.state.use_external_stores = self.args.use_external_stores
+
+    self.state.file_size = self.args.file_size
+
+    unique_paths = set()
+
+    for pathspec in self.args.pathspecs:
+
+      vfs_urn = aff4.AFF4Object.VFSGRRClient.PathspecToURN(
+          pathspec, self.client_id)
+
+      if vfs_urn not in unique_paths:
+        # Only Stat/Hash each path once, input pathspecs can have dups.
+        unique_paths.add(vfs_urn)
+
+        self.StartFileFetch(pathspec)
+
+  def ReceiveFetchedFile(self, stat_entry, unused_hash_obj,
+                         request_data=None):
+    """This method will be called for each new file successfully fetched."""
+    _ = request_data
+    self.SendReply(stat_entry)
 
 
 class FileStoreCreateFile(flow.EventListener):
@@ -526,7 +720,7 @@ class FileStoreCreateFile(flow.EventListener):
   EVENTS = ["FileStore.AddFileToStore"]
 
   well_known_session_id = rdfvalue.SessionID(
-      "aff4:/flows/W:FileStoreCreateFile")
+      flow_name="FileStoreCreateFile")
 
   CHUNK_SIZE = 512 * 1024
 
@@ -540,14 +734,15 @@ class FileStoreCreateFile(flow.EventListener):
     """Process the new file and add to the file store."""
     _ = event
     vfs_urn = message.payload
-    with aff4.FACTORY.Open(vfs_urn, mode="rw", token=self.token) as vfs_fd:
-      filestore_fd = aff4.FACTORY.Create(filestore.FileStore.PATH, "FileStore",
-                                         mode="w", token=self.token)
-      filestore_fd.AddFile(vfs_fd)
-      vfs_fd.Flush(sync=False)
+
+    vfs_fd = aff4.FACTORY.Open(vfs_urn, mode="rw", token=self.token)
+    filestore_fd = aff4.FACTORY.Create(filestore.FileStore.PATH, "FileStore",
+                                       mode="w", token=self.token)
+    filestore_fd.AddFile(vfs_fd)
+    vfs_fd.Flush(sync=False)
 
 
-class GetMBRArgs(rdfvalue.RDFProtoStruct):
+class GetMBRArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.GetMBRArgs
 
 
@@ -565,13 +760,13 @@ class GetMBR(flow.GRRFlow):
   @flow.StateHandler(next_state=["StoreMBR"])
   def Start(self):
     """Schedules the ReadBuffer client action."""
-    pathspec = rdfvalue.PathSpec(
+    pathspec = rdf_paths.PathSpec(
         path="\\\\.\\PhysicalDrive0\\",
-        pathtype=rdfvalue.PathSpec.PathType.OS,
-        path_options=rdfvalue.PathSpec.Options.CASE_LITERAL)
+        pathtype=rdf_paths.PathSpec.PathType.OS,
+        path_options=rdf_paths.PathSpec.Options.CASE_LITERAL)
 
-    request = rdfvalue.BufferReference(pathspec=pathspec, offset=0,
-                                       length=self.args.length)
+    request = rdf_client.BufferReference(pathspec=pathspec, offset=0,
+                                         length=self.args.length)
     self.CallClient("ReadBuffer", request, next_state="StoreMBR")
 
   @flow.StateHandler()
@@ -595,29 +790,29 @@ class GetMBR(flow.GRRFlow):
 
 class TransferStore(flow.WellKnownFlow):
   """Store a buffer into a determined location."""
-  well_known_session_id = rdfvalue.SessionID("aff4:/flows/W:TransferStore")
+  well_known_session_id = rdfvalue.SessionID(flow_name="TransferStore")
 
   def ProcessMessage(self, message):
     """Write the blob into the AFF4 blob storage area."""
     # Check that the message is authenticated
     if (message.auth_state !=
-        rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED):
+        rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED):
       logging.error("TransferStore request from %s is not authenticated.",
                     message.source)
       return
 
-    read_buffer = rdfvalue.DataBlob(message.args)
+    read_buffer = rdf_protodict.DataBlob(message.payload)
 
     # Only store non empty buffers
     if read_buffer.data:
       data = read_buffer.data
 
       if (read_buffer.compression ==
-          rdfvalue.DataBlob.CompressionType.ZCOMPRESSION):
+          rdf_protodict.DataBlob.CompressionType.ZCOMPRESSION):
         cdata = data
         data = zlib.decompress(cdata)
       elif (read_buffer.compression ==
-            rdfvalue.DataBlob.CompressionType.UNCOMPRESSED):
+            rdf_protodict.DataBlob.CompressionType.UNCOMPRESSED):
         cdata = zlib.compress(data)
       else:
         raise RuntimeError("Unsupported compression")
@@ -626,16 +821,12 @@ class TransferStore(flow.WellKnownFlow):
       digest = hashlib.sha256(data).digest()
       urn = rdfvalue.RDFURN("aff4:/blobs").Add(digest.encode("hex"))
 
-      # Write the blob to the data store. We cheat here and just store the
-      # compressed data to avoid recompressing it.
       fd = aff4.FACTORY.Create(urn, "AFF4MemoryStream", mode="w",
                                token=self.token)
-      fd.Set(fd.Schema.CONTENT(cdata))
-      fd.Set(fd.Schema.SIZE(len(data)))
-      super(aff4.AFF4MemoryStream, fd).Close(sync=True)
+      fd.OverwriteAndClose(cdata, len(data), sync=True)
 
-      logging.info("Got blob %s (length %s)", digest.encode("hex"),
-                   len(cdata))
+      logging.debug("Got blob %s (length %s)", digest.encode("hex"),
+                    len(cdata))
 
 
 class SendFile(flow.GRRFlow):
@@ -648,11 +839,11 @@ class SendFile(flow.GRRFlow):
   nc -l <port> | openssl aes-128-cbc -d -K <key> -iv <iv> > <filename>
 
   Returns to parent flow:
-    A rdfvalue.StatEntry of the sent file.
+    A rdf_client.StatEntry of the sent file.
   """
 
   category = "/Filesystem/"
-  args_type = rdfvalue.SendFileRequest
+  args_type = rdf_client.SendFileRequest
 
   @flow.StateHandler(next_state="Done")
   def Start(self):

@@ -4,49 +4,22 @@
 
 import __builtin__
 import base64
+import copy
+import functools
 import os
+import pipes
 import Queue
 import random
 import re
 import shlex
-import socket
 import shutil
 import struct
+import tarfile
 import tempfile
 import threading
 import time
-
-
-
-class IPInfo(object):
-  UNKNOWN = 0
-  INTERNAL = 1
-  EXTERNAL = 2
-  VPN = 3
-
-
-def RetrieveIPInfo(ip):
-  if not ip:
-    return (IPInfo.UNKNOWN, "No ip information.")
-  ip = SmartStr(ip)
-  if ":" in ip:
-    return RetrieveIP6Info(ip)
-  return RetrieveIP4Info(ip)
-
-def RetrieveIP4Info(ip):
-  """Retrieves information for an IP4 address."""
-  if ip.startswith("192"):
-    return (IPInfo.INTERNAL, "Internal IP address.")
-  try:
-    # It's an external IP, let's try to do a reverse lookup.
-    res = socket.gethostbyaddr(ip)
-    return (IPInfo.EXTERNAL, res[0])
-  except (socket.herror, socket.gaierror):
-    return (IPInfo.EXTERNAL, "Unknown IP address.")
-
-def RetrieveIP6Info(ip):
-  """Retrieves information for an IP6 address."""
-  return (IPInfo.INTERNAL, "Internal IP6 address.")
+import zipfile
+import zlib
 
 
 def Proxy(f):
@@ -97,6 +70,9 @@ class InterruptableThread(threading.Thread):
 
   def Iterate(self):
     """This will be repeatedly called between sleeps."""
+
+  def Stop(self):
+    self.exit = True
 
   def run(self):
     # When the main thread exits, the time module might disappear and be already
@@ -233,6 +209,10 @@ class FastStore(object):
     """
 
   @Synchronized
+  def __iter__(self):
+    return iter([(key, n.data) for key, n in self._hash.iteritems()])
+
+  @Synchronized
   def Expire(self):
     """Expires old cache entries."""
     while len(self._age) > self._limit:
@@ -337,12 +317,15 @@ class FastStore(object):
 
   @Synchronized
   def __getstate__(self):
-    """When pickled the cache is fushed."""
+    """When pickled the cache is flushed."""
     self.Flush()
     return dict(max_size=self._limit)
 
   def __setstate__(self, state):
-    self.__init__(max_size=state["max_size"])
+    self.__init__(max_size=state.get("max_size", 10))
+
+  def __len__(self):
+    return len(self._hash)
 
 
 class TimeBasedCache(FastStore):
@@ -384,7 +367,7 @@ class TimeBasedCache(FastStore):
             self._age.Unlink(node)
             self._hash.pop(node.key, None)
 
-    # This thread is designed to never finish
+    # This thread is designed to never finish.
     self.house_keeper_thread = InterruptableThread(target=HouseKeeper)
     self.house_keeper_thread.start()
 
@@ -413,27 +396,69 @@ class TimeBasedCache(FastStore):
     self.__init__(max_size=state["max_size"], max_age=state["max_age"])
 
 
+class Memoize(object):
+  """A decorator to produce a memoizing version of a method f.
+  """
+
+  def __init__(self, deep_copy=False):
+    """Constructor.
+
+    Args:
+      deep_copy: Whether to perform a deep copy of the returned object.
+          Otherwise, a direct reference is returned.
+    """
+    self.deep_copy = deep_copy
+
+  def __call__(self, f):
+    """Produce a memoizing version of f.
+
+    Requires that all parameters are hashable. Also, it does not copy the return
+    value, so changes to a returned object may be visible in future invocations.
+
+    Args:
+      f: The function which will be wrapped.
+
+    Returns:
+      A wrapped function which memoizes all values returned by f, keyed by
+      the arguments to f.
+
+    """
+    f.memo_pad = {}
+    f.memo_deep_copy = self.deep_copy
+    @functools.wraps(f)
+    def Wrapped(self, *args, **kwargs):
+      # We keep args and kwargs separate to avoid confusing an arg which is a
+      # pair with a kwarg. Also, we don't try to match calls when an argument
+      # moves between args and kwargs.
+      key = tuple(args), tuple(sorted(kwargs.items(), key=lambda x: x[0]))
+      if key not in f.memo_pad:
+        f.memo_pad[key] = f(self, *args, **kwargs)
+      if f.memo_deep_copy:
+        return copy.deepcopy(f.memo_pad[key])
+      else:
+        return f.memo_pad[key]
+
+    return Wrapped
+
+
 class PickleableLock(object):
   """A lock which is safe to pickle."""
 
   lock = None
 
+  def __init__(self):
+    self.lock = threading.RLock()
+
   def __getstate__(self):
-    return {}
+    return True
 
   def __setstate__(self, _):
-    pass
+    self.lock = threading.RLock()
 
   def __enter__(self):
-    if self.lock is None:
-      self.lock = threading.RLock()
-
     return self.lock.__enter__()
 
   def __exit__(self, exc_type, exc_value, traceback):
-    if self.lock is None:
-      self.lock = threading.RLock()
-
     return self.lock.__exit__(exc_type, exc_value, traceback)
 
 
@@ -454,21 +479,6 @@ class AgeBasedCache(TimeBasedCache):
     return stored[1]
 
 
-class PickleableStore(FastStore):
-  """A Cache which can be pickled."""
-
-  @Synchronized
-  def __getstate__(self):
-    to_pickle = self.__dict__.copy()
-    to_pickle["lock"] = None
-    return to_pickle
-
-  def __setstate__(self, state):
-    self.__dict__ = state
-    self.lock = threading.RLock()
-
-
-# TODO(user): Eventually slot in Volatility parsing system in here
 class Struct(object):
   """A baseclass for parsing binary Structs."""
 
@@ -512,8 +522,8 @@ def GroupBy(items, key):
     key: A function which given each item will return the key.
 
   Returns:
-    Generator of tuples of (unique keys, list of items) where all items have the
-    same key.  session id.
+    A dict with keys being each unique key and values being a list of items of
+    that key.
   """
   key_map = {}
 
@@ -617,6 +627,8 @@ def NormalizePath(path, sep="/"):
      that would result in the system opening the same physical file will produce
      the same normalized path.
   """
+  if not path:
+    return sep
   path = SmartUnicode(path)
 
   path_list = path.split(sep)
@@ -653,13 +665,14 @@ def NormalizePath(path, sep="/"):
       return sep + sep.join(path_list)
 
 
-def JoinPath(*parts):
+def JoinPath(stem="", *parts):
   """A sane version of os.path.join.
 
   The intention here is to append the stem to the path. The standard module
   removes the path if the stem begins with a /.
 
   Args:
+     stem: The stem to join to.
      *parts: parts of the path to join. The first arg is always the root and
         directory traversal is not allowed.
 
@@ -669,7 +682,10 @@ def JoinPath(*parts):
   # Ensure all path components are unicode
   parts = [SmartUnicode(path) for path in parts]
 
-  return NormalizePath(u"/".join(parts))
+  result = (stem + NormalizePath(u"/".join(parts))).replace("//", "/")
+  result = result.rstrip("/")
+
+  return result or "/"
 
 
 def GuessWindowsFileNameFromString(str_in):
@@ -691,16 +707,42 @@ def GuessWindowsFileNameFromString(str_in):
 
   # If paths are quoted as recommended, just use that path.
   if str_in.startswith(("\"", "'")):
-    guesses = [shlex.split(str_in)[0]]
+    components = shlex.split(str_in)
+    guesses = [components[0]]
+
+    # If first component has something like "rundll" in it, we expect the
+    # next one to point at a DLL and a function. For example:
+    # rundll32.exe "C:\Windows\system32\advpack.dll",DelNodeRunDLL32
+    if "rundll" in guesses[0] and len(components) > 1:
+      guesses.append(components[1].rsplit(",", 1)[0])
   else:
-    for component in str_in.split(" "):
+    components = str_in.split(" ")
+    while components:
+      component = components.pop(0)
+
       if current_str:
         current_str = " ".join((current_str, component))
       else:
         current_str = component
+
       guesses.append(current_str)
+      # If current str contains something like "rundll" in it, we expect the
+      # rest of the string to point to a DLL and a function. We don't know
+      # if the rest of the string is quoted or not, so we continue
+      # recursively.
+      if "rundll" in current_str:
+        for guess in GuessWindowsFileNameFromString(" ".join(components)):
+          guesses.append(guess.rsplit(",", 1)[0])
+
+        break
 
   return guesses
+
+
+def ShellQuote(value):
+  """Escapes the string for the safe use inside shell command line."""
+  # TODO(user): replace pipes.quote with shlex.quote when time comes.
+  return pipes.quote(SmartUnicode(value))
 
 
 def Join(*parts):
@@ -736,7 +778,7 @@ def EncodeReasonString(reason):
 
 
 def DecodeReasonString(reason):
-  return base64.urlsafe_b64decode(SmartStr(reason))
+  return SmartUnicode(base64.urlsafe_b64decode(SmartStr(reason)))
 
 
 # Regex chars that should not be in a regex
@@ -807,13 +849,6 @@ def issubclass(obj, cls):    # pylint: disable=redefined-builtin,g-bad-name
   return isinstance(obj, type) and __builtin__.issubclass(obj, cls)
 
 
-def ConditionalImport(name):
-  try:
-    return __import__(name)
-  except ImportError:
-    pass
-
-
 class HeartbeatQueue(Queue.Queue):
   """A queue that periodically calls a provided callback while waiting."""
 
@@ -842,3 +877,337 @@ class HeartbeatQueue(Queue.Queue):
 
     self.last_item_time = time.time()
     return message
+
+
+class StreamingZipWriter(object):
+  """A streaming zip file writer which can copy from file like objects.
+
+  The streaming writer should be capable of compressing files of arbitrary
+  size without eating all the memory. It's built on top of Python's zipfile
+  module, but has to use some hacks, as standard library doesn't provide
+  all the necessary API to do streaming writes.
+  """
+
+  def __init__(self, fd_or_path, mode="w", compression=zipfile.ZIP_STORED):
+    """Open streaming ZIP file with mode read "r", write "w" or append "a".
+
+    Args:
+      fd_or_path: Either the path to the file, or a file-like object.
+                  If it is a path, the file will be opened and closed by
+                  ZipFile.
+      mode: The mode can be either read "r", write "w" or append "a".
+      compression: ZIP_STORED (no compression) or ZIP_DEFLATED (requires zlib).
+    """
+
+    self.zip_fd = zipfile.ZipFile(fd_or_path, mode,
+                                  compression=zipfile.ZIP_STORED,
+                                  allowZip64=True)
+    self.out_fd = self.zip_fd.fp
+    self.compression = compression
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Close()
+
+  def Close(self):
+    self.zip_fd.close()
+
+  def GenerateZipInfo(self, arcname=None, compress_type=None, st=None):
+    """Generate ZipInfo instance for the given name, compression and stat.
+
+    Args:
+      arcname: The name in the archive this should take.
+      compress_type: Compression type (zipfile.ZIP_DEFLATED, or ZIP_STORED)
+      st: An optional stat object to be used for setting headers.
+
+    Returns:
+      ZipInfo instance.
+
+    Raises:
+      ValueError: If arcname is not provided.
+    """
+    # Fake stat response.
+    if st is None:
+      st = os.stat_result((0100644, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    mtime = time.localtime(st.st_mtime or time.time())
+    date_time = mtime[0:6]
+    # Create ZipInfo instance to store file information
+    if arcname is None:
+      raise ValueError("An arcname must be provided.")
+
+    zinfo = zipfile.ZipInfo(arcname, date_time)
+    zinfo.external_attr = (st[0] & 0xFFFF) << 16L      # Unix attributes
+
+    if compress_type is None:
+      zinfo.compress_type = self.compression
+    else:
+      zinfo.compress_type = compress_type
+
+    zinfo.file_size = 0
+    zinfo.compress_size = 0
+    zinfo.flag_bits = 0x08  # Setting data descriptor flag.
+    zinfo.CRC = 0x08074b50  # Predefined CRC for archives using data
+                            # descriptors.
+    # This fills an empty Info-ZIP Unix extra field.
+    zinfo.extra = struct.pack("<HHIIHH", 0x5855, 12,
+                              0,  # time of last access (UTC/GMT)
+                              0,  # time of last modification (UTC/GMT)
+                              0,  # user ID
+                              0)  # group ID
+    return zinfo
+
+  def WriteSymlink(self, src_arcname, dst_arcname):
+    """Writes a symlink into the archive."""
+    # Inspired by:
+    # http://www.mail-archive.com/python-list@python.org/msg34223.html
+
+    src_arcname = SmartStr(src_arcname)
+    dst_arcname = SmartStr(dst_arcname)
+
+    zinfo = zipfile.ZipInfo(dst_arcname)
+    # This marks a symlink.
+    zinfo.external_attr = (0644 | 0120000) << 16
+    # This marks create_system as UNIX.
+    zinfo.create_system = 3
+
+    # This fills the ASi UNIX extra field, see:
+    # http://www.opensource.apple.com/source/zip/zip-6/unzip/unzip/proginfo/extra.fld
+    zinfo.extra = struct.pack("<HHIHIHHs", 0x756e, len(src_arcname) + 14,
+                              0,        # CRC-32 of the remaining data
+                              0120000,  # file permissions
+                              0,        # target file size
+                              0,        # user ID
+                              0,        # group ID
+                              src_arcname)
+
+    self.zip_fd.writestr(zinfo, src_arcname)
+
+  def WriteFromFD(self, src_fd, arcname=None, compress_type=None, st=None):
+    """Write a zip member from a file like object.
+
+    Args:
+      src_fd: A file like object, must support seek(), tell(), read().
+      arcname: The name in the archive this should take.
+      compress_type: Compression type (zipfile.ZIP_DEFLATED, or ZIP_STORED)
+      st: An optional stat object to be used for setting headers.
+
+    Raises:
+      RuntimeError: If the zip if already closed.
+    """
+    zinfo = self.GenerateZipInfo(arcname=arcname, compress_type=compress_type,
+                                 st=st)
+
+    crc = 0
+    compress_size = 0
+
+    if not self.out_fd:
+      raise RuntimeError(
+          "Attempt to write to ZIP archive that was already closed")
+
+    zinfo.header_offset = self.out_fd.tell()
+    # Call _writeCheck(zinfo) to do sanity checking on zinfo structure that
+    # we've constructed.
+    self.zip_fd._writecheck(zinfo)  # pylint: disable=protected-access
+    # Mark ZipFile as dirty. We have to keep self.zip_fd's internal state
+    # coherent so that it behaves correctly when close() is called.
+    self.zip_fd._didModify = True   # pylint: disable=protected-access
+
+    # Write FileHeader now. It's incomplete, but CRC and uncompressed/compressed
+    # sized will be written later in data descriptor.
+    self.out_fd.write(zinfo.FileHeader())
+
+    if zinfo.compress_type == zipfile.ZIP_DEFLATED:
+      cmpr = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION,
+                              zlib.DEFLATED, -15)
+    else:
+      cmpr = None
+
+    file_size = 0
+    while 1:
+      buf = src_fd.read(1024 * 8)
+      if not buf:
+        break
+      file_size += len(buf)
+      crc = zipfile.crc32(buf, crc) & 0xffffffff
+
+      if cmpr:
+        buf = cmpr.compress(buf)
+        compress_size += len(buf)
+      self.out_fd.write(buf)
+
+    if cmpr:
+      buf = cmpr.flush()
+      compress_size += len(buf)
+      zinfo.compress_size = compress_size
+      self.out_fd.write(buf)
+    else:
+      zinfo.compress_size = file_size
+
+    zinfo.CRC = crc
+    zinfo.file_size = file_size
+    if file_size > zipfile.ZIP64_LIMIT or compress_size > zipfile.ZIP64_LIMIT:
+      # Writing data descriptor ZIP64-way:
+      # crc-32                          8 bytes (little endian)
+      # compressed size                 8 bytes (little endian)
+      # uncompressed size               8 bytes (little endian)
+      self.out_fd.write(struct.pack("<LLL", crc, compress_size, file_size))
+    else:
+      # Writing data descriptor non-ZIP64-way:
+      # crc-32                          4 bytes (little endian)
+      # compressed size                 4 bytes (little endian)
+      # uncompressed size               4 bytes (little endian)
+      self.out_fd.write(struct.pack("<III", crc, compress_size, file_size))
+
+    # Register the file in the zip file, so that central directory gets
+    # written correctly.
+    self.zip_fd.filelist.append(zinfo)
+    self.zip_fd.NameToInfo[zinfo.filename] = zinfo
+
+
+class StreamingTarWriter(object):
+  """A streaming tar file writer which can copy from file like objects.
+
+  The streaming writer should be capable of compressing files of arbitrary
+  size without eating all the memory. It's built on top of Python's tarfile
+  module.
+  """
+
+  def __init__(self, fd_or_path, mode="w"):
+    if hasattr(fd_or_path, "write"):
+      self.tar_fd = tarfile.open(mode=mode, fileobj=fd_or_path,
+                                 encoding="utf-8")
+    else:
+      self.tar_fd = tarfile.open(name=fd_or_path, mode=mode, encoding="utf-8")
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Close()
+
+  def Close(self):
+    self.tar_fd.close()
+
+  def WriteSymlink(self, src_arcname, dst_arcname):
+    """Writes a symlink into the archive."""
+
+    info = self.tar_fd.tarinfo()
+    info.tarfile = self.tar_fd
+    info.name = SmartStr(dst_arcname)
+    info.size = 0
+    info.mtime = time.time()
+    info.type = tarfile.SYMTYPE
+    info.linkname = SmartStr(src_arcname)
+
+    self.tar_fd.addfile(info)
+
+  def WriteFromFD(self, src_fd, arcname=None, st=None):
+    """Write an archive member from a file like object.
+
+    Args:
+      src_fd: A file like object, must support seek(), tell(), read().
+      arcname: The name in the archive this should take.
+      st: A stat object to be used for setting headers.
+
+    Raises:
+      ValueError: If st is omitted.
+    """
+
+    if st is None:
+      raise ValueError("Stat object can't be None.")
+
+    info = self.tar_fd.tarinfo()
+    info.tarfile = self.tar_fd
+    info.type = tarfile.REGTYPE
+    info.name = SmartStr(arcname)
+    info.size = st.st_size
+    info.mode = st.st_mode
+    info.mtime = st.st_mtime or time.time()
+
+    self.tar_fd.addfile(info, src_fd)
+
+
+class Stubber(object):
+  """A context manager for doing simple stubs."""
+
+  def __init__(self, module, target_name, stub):
+    self.target_name = target_name
+    self.module = module
+    self.stub = stub
+
+  def __enter__(self):
+    self.Start()
+
+  def Stop(self):
+    setattr(self.module, self.target_name, self.old_target)
+
+  def Start(self):
+    self.old_target = getattr(self.module, self.target_name, None)
+    try:
+      self.stub.old_target = self.old_target
+    except AttributeError:
+      pass
+    setattr(self.module, self.target_name, self.stub)
+
+  def __exit__(self, unused_type, unused_value, unused_traceback):
+    self.Stop()
+
+
+class MultiStubber(object):
+  """A context manager for doing simple stubs."""
+
+  def __init__(self, *args):
+    self.stubbers = [Stubber(*x) for x in args]
+
+  def Start(self):
+    for x in self.stubbers:
+      x.Start()
+
+  def Stop(self):
+    for x in self.stubbers:
+      x.Stop()
+
+  def __enter__(self):
+    self.Start()
+
+  def __exit__(self, t, value, traceback):
+    self.Stop()
+
+
+class DataObject(dict):
+  """This class wraps a dict and provides easier access functions."""
+
+  def Register(self, item, value=None):
+    if item in self:
+      raise AttributeError("Item %s already registered." % item)
+
+    self[item] = value
+
+  def __setattr__(self, item, value):
+    self[item] = value
+
+  def __getattr__(self, item):
+    try:
+      return self[item]
+    except KeyError as e:
+      raise AttributeError(e)
+
+  def __dir__(self):
+    return sorted(self.keys()) + dir(self.__class__)
+
+  def __str__(self):
+    result = []
+    for k, v in self.items():
+      tmp = "  %s = " % k
+      try:
+        for line in SmartUnicode(v).splitlines():
+          tmp += "    %s\n" % line
+      except Exception as e:  # pylint: disable=broad-except
+        tmp += "Error: %s\n" % e
+
+      result.append(tmp)
+
+    return "{\n%s}\n" % "".join(result)

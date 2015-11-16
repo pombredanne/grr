@@ -1,7 +1,13 @@
 #!/usr/bin/env python
 # -*- mode: python; encoding: utf-8 -*-
 
-"""An implementation of a data store based on mongo."""
+"""An implementation of a data store based on mongo.
+
+--------------->>>>>>>>>>>>>>> DEPRECATED <<<<<<<<<<<<<<<---------------
+Do not use!!!!
+This datastore will be removed in a future version of GRR.
+
+"""
 
 
 import hashlib
@@ -22,6 +28,11 @@ class MongoDataStore(data_store.DataStore):
   """A Mongo based data store."""
 
   def __init__(self):
+    logging.warning("Starting MongoDataStore. This Datastore is DEPRECATED!")
+    logging.warning("This datastore will be removed!!!")
+    logging.warning("Recommended alternatives include MySQLAdvancedDataStore")
+    logging.warning("and HTTPDataStore.")
+
     # Support various versions on the pymongo connection object.
     try:
       connector = pymongo.MongoClient
@@ -61,8 +72,8 @@ class MongoDataStore(data_store.DataStore):
     elif isinstance(timestamp, tuple):
       collection = self.versioned_collection
       start, end = timestamp
-      spec = {"$and": [dict(timestamp={"$gte": start}),
-                       dict(timestamp={"$lte": end}),
+      spec = {"$and": [dict(timestamp={"$gte": int(start)}),
+                       dict(timestamp={"$lte": int(end)}),
                        spec]}
     else:
       raise data_store.Error("Undefined timestamp specification.")
@@ -74,21 +85,28 @@ class MongoDataStore(data_store.DataStore):
 
     return cursor
 
-  def ResolveMulti(self, subject, predicates, token=None,
-                   timestamp=None):
-    """Resolves multiple predicates at once for one subject."""
-    self.security_manager.CheckDataStoreAccess(token, [subject], "r")
+  def ResolveMulti(self, subject, attributes, timestamp=None, limit=None,
+                   token=None):
+    """Resolves multiple attributes at once for one subject."""
+    self.security_manager.CheckDataStoreAccess(
+        token, [subject], self.GetRequiredResolveAccess(attributes))
 
     # Build a query spec.
     spec = {"$and": [
         # Subject matches any of the requested subjects.
         dict(subject=utils.SmartUnicode(subject)),
-        {"$or": [dict(predicate=utils.SmartUnicode(x)) for x in predicates]},
-        ]}
+        {"$or": [dict(predicate=utils.SmartUnicode(x)) for x in attributes]},
+    ]}
 
+    results_returned = 0
     for document in self._GetCursor(spec, timestamp, 0):
       subject = document["subject"]
       value = Decode(document)
+      if limit:
+        if results_returned >= limit:
+          return
+        results_returned += 1
+
       yield (document["predicate"], value, document["timestamp"])
 
   def DeleteSubject(self, subject, sync=False, token=None):
@@ -99,9 +117,9 @@ class MongoDataStore(data_store.DataStore):
     self.latest_collection.remove(dict(subject=subject))
     self.versioned_collection.remove(dict(subject=subject))
 
-  def MultiSet(self, subject, values, timestamp=None, token=None,
-               replace=True, sync=True, to_delete=None):
-    """Set multiple predicates' values for this subject in one operation."""
+  def MultiSet(self, subject, values, timestamp=None, replace=True,
+               sync=True, to_delete=None, token=None):
+    """Set multiple attributes' values for this subject in one operation."""
     self.security_manager.CheckDataStoreAccess(token, [subject], "w")
 
     if timestamp is None:
@@ -125,14 +143,14 @@ class MongoDataStore(data_store.DataStore):
         if entry_timestamp is None:
           entry_timestamp = timestamp
 
-        predicate = utils.SmartUnicode(attribute)
-        prefix = predicate.split(":", 1)[0]
+        attribute = utils.SmartUnicode(attribute)
+        prefix = attribute.split(":", 1)[0]
 
         document = dict(subject=subject, timestamp=int(entry_timestamp),
-                        predicate=predicate, prefix=prefix)
+                        predicate=attribute, prefix=prefix)
         _Encode(document, value)
         documents.append(document)
-        latest[predicate] = document
+        latest[attribute] = document
 
         # Replacing means to delete all versions of the attribute first.
         if replace:
@@ -150,14 +168,14 @@ class MongoDataStore(data_store.DataStore):
         raise data_store.Error(utils.SmartUnicode(e))
 
       # Maintain the latest documents in the latest collection.
-      for predicate, document in latest.items():
+      for attribute, document in latest.items():
         document.pop("_id", None)
         self.latest_collection.update(
-            dict(subject=subject, predicate=predicate, prefix=prefix),
+            dict(subject=subject, predicate=attribute, prefix=prefix),
             document, upsert=True, w=1 if sync else 0)
 
   def DeleteAttributes(self, subject, attributes, start=None, end=None,
-                       token=None, sync=False):
+                       sync=True, token=None):
     """Remove all the attributes from this subject."""
     _ = sync  # Unused attribute, mongo is always synced.
     subject = utils.SmartUnicode(subject)
@@ -166,13 +184,13 @@ class MongoDataStore(data_store.DataStore):
       # Nothing to delete.
       return
 
-    # Build a spec to select the subject and any of the predicates.
+    # Build a spec to select the subject and any of the attributes.
     spec = {"$and": [
         dict(subject=subject),
         {"$or": [dict(predicate=utils.SmartUnicode(x)) for x in attributes]},
-        ]}
+    ]}
 
-    if not start and not end:
+    if start is None and end is None:
       # Just delete all the versions.
       self.versioned_collection.remove(spec)
       self.latest_collection.remove(spec)
@@ -181,64 +199,54 @@ class MongoDataStore(data_store.DataStore):
     unversioned_spec = {"$and": [
         dict(subject=subject),
         {"$or": [dict(predicate=utils.SmartUnicode(x)) for x in attributes]},
-        ]}
+    ]}
 
     if start:
-      spec["$and"].append(dict(timestamp={"$gte": start}))
+      spec["$and"].append(dict(timestamp={"$gte": int(start)}))
 
-    if not end:
+    if end is None:
       # We can optimize this case since the latest version will always
       # be unchanged or deleted.
       self.versioned_collection.remove(spec)
       self.latest_collection.remove(spec)
       return
 
-    spec["$and"].append(dict(timestamp={"$lte": end}))
+    spec["$and"].append(dict(timestamp={"$lte": int(end)}))
     self.versioned_collection.remove(spec)
 
     to_delete = set(attributes)
     to_set = {}
     cursor = self.versioned_collection.find(unversioned_spec).sort("timestamp")
     for document in cursor:
-      value = document["value"]
-      predicate = document["predicate"]
-      to_delete.discard(predicate)
+      value = Decode(document)
+      attribute = document["predicate"]
+      to_delete.discard(attribute)
       timestamp = document["timestamp"]
-      prefix = predicate.split(":", 1)[0]
+      prefix = attribute.split(":", 1)[0]
       document = dict(subject=subject, timestamp=timestamp,
-                      predicate=predicate, prefix=prefix, value=value)
-      to_set[predicate] = document
+                      predicate=attribute, prefix=prefix)
+      _Encode(document, value)
+      to_set[attribute] = document
 
     if to_delete:
       delete_spec = {"$and": [
           dict(subject=subject),
           {"$or": [dict(predicate=utils.SmartUnicode(x)) for x in attributes]},
-          ]}
+      ]}
       self.latest_collection.remove(delete_spec)
 
     if to_set:
       for document in to_set.itervalues():
         self.latest_collection.update(
-            dict(subject=subject, predicate=predicate, prefix=prefix),
+            dict(subject=subject, predicate=attribute, prefix=prefix),
             document, upsert=True, w=1 if sync else 0)
 
-  def DeleteAttributesRegex(self, subject, regexes, token=None):
-    """Remove the attributes from this subject by regex."""
-    self.security_manager.CheckDataStoreAccess(token, [subject], "w")
-
-    # Build a spec to select the subject and any of the predicates by the regex.
-    spec = {"$and": [
-        dict(subject=utils.SmartUnicode(subject)),
-        {"$or": [{"predicate": {"$regex": regex}} for regex in regexes]},
-        ]}
-
-    self.versioned_collection.remove(spec)
-    self.latest_collection.remove(spec)
-
-  def MultiResolveRegex(self, subjects, predicate_regex, token=None,
-                        timestamp=None, limit=None):
+  def MultiResolvePrefix(self, subjects, attribute_prefix, timestamp=None,
+                         limit=None, token=None):
     """Retrieves a bunch of subjects in one round trip."""
-    self.security_manager.CheckDataStoreAccess(token, subjects, "r")
+    self.security_manager.CheckDataStoreAccess(
+        token, subjects, self.GetRequiredResolveAccess(attribute_prefix))
+
     if not subjects:
       return {}
 
@@ -251,65 +259,48 @@ class MongoDataStore(data_store.DataStore):
 
     # For a wildcard we just select all attributes by not applying a condition
     # at all.
-    if isinstance(predicate_regex, basestring):
-      predicate_regex = [predicate_regex]
+    if isinstance(attribute_prefix, basestring):
+      attribute_regex = [attribute_prefix + ".*"]
+    else:
+      attribute_regex = [prefix + ".*" for prefix in attribute_prefix]
 
-    if predicate_regex != [".*"]:
+    if attribute_regex != [".*"]:
       spec = {"$and": [
           spec,
-          {"$or": [dict(predicate={"$regex": x}) for x in predicate_regex]},
-          ]}
+          {"$or": [dict(predicate={"$regex": x}) for x in attribute_regex]},
+      ]}
 
     for document in self._GetCursor(spec, timestamp, limit):
       subject = document["subject"]
       value = Decode(document)
-      predicate = document.get("predicate")
-      if predicate is None:
+      attribute = document.get("predicate")
+      if attribute is None:
         # This might not be a normal aff4 attribute - transactions are one
         # example for this.
         continue
 
       # Sometimes due to race conditions in mongodb itself (upsert operation is
       # not atomic), the latest_collection can contain multiple versions of the
-      # same predicate.
+      # same attribute.
       if ((timestamp == self.NEWEST_TIMESTAMP or timestamp is None) and
-          (subject, predicate) in dedup_set):
+          (subject, attribute) in dedup_set):
         continue
 
-      dedup_set.add((subject, predicate))
+      dedup_set.add((subject, attribute))
       result.setdefault(subject, []).append(
-          (predicate, value, document["timestamp"]))
+          (attribute, value, document["timestamp"]))
 
     return result.iteritems()
 
-  def MultiResolveLiteral(self, subjects, predicates, token=None,
-                          timestamp=None, limit=None):
-    """Retrieves a bunch of subjects in one round trip."""
-    self.security_manager.CheckDataStoreAccess(token, subjects, "r")
-    if not subjects:
-      return {}
-
-    result = {}
-
-    # Build a query spec.
-    spec = {"$and": [
-        dict(subject={"$in": [utils.SmartUnicode(x) for x in subjects]}),
-        dict(predicate={"$in": [utils.SmartUnicode(x) for x in predicates]}),
-        ]}
-
-    for document in self._GetCursor(spec, timestamp, limit):
-      subject = document["subject"]
-      value = Decode(document)
-      result.setdefault(subject, []).append(
-          (document["predicate"], value, document["timestamp"]))
-
-    return result
+  def Size(self):
+    info = self.db_handle.command("dbStats")
+    return info["storageSize"]
 
   def Transaction(self, subject, lease_time=None, token=None):
     return MongoTransaction(self, subject, lease_time=lease_time, token=token)
 
 
-class MongoTransaction(data_store.Transaction):
+class MongoTransaction(data_store.CommonTransaction):
   """The Mongo data store transaction object.
 
   This object does not aim to ensure ACID like consistently. We only ensure that
@@ -328,14 +319,11 @@ class MongoTransaction(data_store.Transaction):
 
   def __init__(self, store, subject, lease_time=None, token=None):
     """Ensure we can take a lock on this subject."""
-    self.store = store
-    self.token = token
-    self.subject = utils.SmartUnicode(subject)
+    super(MongoTransaction, self).__init__(store, subject,
+                                           lease_time=lease_time, token=token)
     self.object_id = objectid.ObjectId(
         hashlib.sha256(utils.SmartStr(self.subject)).digest()[:12])
 
-    self.to_set = {}
-    self.to_delete = set()
     if lease_time is None:
       lease_time = config_lib.CONFIG["Datastore.transaction_timeout"]
 
@@ -376,9 +364,6 @@ class MongoTransaction(data_store.Transaction):
 
     raise data_store.TransactionError("Subject %s is locked" % subject)
 
-  def CheckLease(self):
-    return max(0, self.expires - time.time())
-
   def UpdateLease(self, duration):
     self.expires = time.time() + duration
     self.store.latest_collection.save(
@@ -386,40 +371,13 @@ class MongoTransaction(data_store.Transaction):
     if self.document:
       self.document["expires"] = self.expires
 
-  def DeleteAttribute(self, predicate):
-    self.to_delete.add(predicate)
-
-  def Resolve(self, predicate):
-    if predicate in self.to_set:
-      return sorted(self.to_set[predicate], key=lambda vt: vt[1])[-1]
-    if predicate in self.to_delete:
-      return None
-    return self.store.Resolve(self.subject, predicate, token=self.token)
-
-  def ResolveRegex(self, predicate_regex, timestamp=None):
-    # TODO(user): Retrieve values from to_set as well.
-    return self.store.ResolveRegex(self.subject, predicate_regex,
-                                   token=self.token, timestamp=timestamp)
-
-  def Set(self, predicate, value, timestamp=None, replace=None):
-    if replace:
-      self.to_delete.add(predicate)
-
-    if timestamp is None:
-      timestamp = int(time.time() * 1e6)
-
-    self.to_set.setdefault(predicate, []).append((value, timestamp))
-
   def Abort(self):
     if self.locked:
       self._RemoveLock()
 
   def Commit(self):
     if self.locked:
-      self.store.DeleteAttributes(self.subject, self.to_delete, sync=True,
-                                  token=self.token)
-
-      self.store.MultiSet(self.subject, self.to_set, token=self.token)
+      super(MongoTransaction, self).Commit()
       self._RemoveLock()
 
   def _RemoveLock(self):
@@ -437,12 +395,6 @@ class MongoTransaction(data_store.Transaction):
       raise data_store.TransactionError(
           "Could not remove lock for %s." % self.subject)
     self.locked = False
-
-  def __del__(self):
-    try:
-      self.Abort()
-    except Exception:  # This can raise on cleanup pylint: disable=broad-except
-      pass
 
 
 def Decode(document):

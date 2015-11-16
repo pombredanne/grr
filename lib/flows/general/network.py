@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
-
 """These are network related flows."""
 
 
 from grr.lib import aff4
 from grr.lib import flow
+# pylint: disable=unused-import
+from grr.lib.aff4_objects import network
+# pylint: enable=unused-import
 
 
 class Netstat(flow.GRRFlow):

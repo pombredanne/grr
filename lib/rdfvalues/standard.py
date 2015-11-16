@@ -3,14 +3,20 @@
 
 
 import re
+import urlparse
+
 from grr.lib import config_lib
 from grr.lib import rdfvalue
 from grr.lib import type_info
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import jobs_pb2
+from grr.proto import sysinfo_pb2
 
 
 class RegularExpression(rdfvalue.RDFString):
   """A semantic regular expression."""
+
+  context_help_url = "user_manual.html#_regex_matches"
 
   def ParseFromString(self, value):
     super(RegularExpression, self).ParseFromString(value)
@@ -23,16 +29,31 @@ class RegularExpression(rdfvalue.RDFString):
 
   def Search(self, text):
     """Search the text for our value."""
+    if isinstance(text, rdfvalue.RDFString):
+      text = str(text)
+
     return self._regex.search(text)
 
   def Match(self, text):
+    if isinstance(text, rdfvalue.RDFString):
+      text = str(text)
+
     return self._regex.match(text)
 
   def FindIter(self, text):
+    if isinstance(text, rdfvalue.RDFString):
+      text = str(text)
+
     return self._regex.finditer(text)
 
   def __str__(self):
     return "<RegularExpression: %r/>" % self._value
+
+
+class LiteralExpression(rdfvalue.RDFBytes):
+  """A RDFBytes literal for use in GrepSpec."""
+
+  context_help_url = "user_manual.html#_literal_matches"
 
 
 class EmailAddress(rdfvalue.RDFString):
@@ -61,9 +82,32 @@ class DomainEmailAddress(EmailAddress):
           "domain '%s'" % (self._match.group(1), domain))
 
 
-class AuthenticodeSignedData(rdfvalue.RDFProtoStruct):
+class AuthenticodeSignedData(rdf_structs.RDFProtoStruct):
   protobuf = jobs_pb2.AuthenticodeSignedData
 
 
-class PersistenceFile(rdfvalue.RDFProtoStruct):
+class PersistenceFile(rdf_structs.RDFProtoStruct):
   protobuf = jobs_pb2.PersistenceFile
+
+
+class URI(rdf_structs.RDFProtoStruct):
+  """Represets a URI with its individual components seperated."""
+  protobuf = sysinfo_pb2.URI
+
+  def ParseFromString(self, value):
+    url = urlparse.urlparse(value)
+
+    if url.scheme:
+      self.transport = url.scheme
+    if url.netloc:
+      self.host = url.netloc
+    if url.path:
+      self.path = url.path
+    if url.query:
+      self.query = url.query
+    if url.fragment:
+      self.fragment = url.fragment
+
+  def SerializeToString(self):
+    url = (self.transport, self.host, self.path, self.query, self.fragment)
+    return str(urlparse.urlunsplit(url))

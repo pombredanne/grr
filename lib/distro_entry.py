@@ -13,17 +13,22 @@ from grr.lib import flags
 # Set custom options for each distro here.
 DISTRO_DEFAULTS = {
     "debian": {"flag_defaults": {"config": "/etc/grr/grr-server.yaml"},
-               "config_opts": {"Config.writeback": "/etc/grr/server.local.yaml"}
-              },
+               "config_opts": {"Config.writeback":
+                               "/etc/grr/server.local.yaml"}},
+    "redhat": {"flag_defaults": {"config": "/etc/grr/grr-server.yaml"},
+               "config_opts": {"Config.writeback":
+                               "/etc/grr/server.local.yaml"}},
 }
 
 
 def GetDistro():
   """Return the distro specific config to use."""
   if hasattr(platform, "linux_distribution"):
-    if platform.linux_distribution()[0].lower() in ["ubuntu", "debian"]:
+    distribution = platform.linux_distribution()[0].lower()
+    if distribution in ["ubuntu", "debian"]:
       return "debian"
-
+    if distribution in ["red hat enterprise linux server"]:
+      return "redhat"
   raise RuntimeError("Missing distro specific config. Please update "
                      "distro_entry.py.")
 
@@ -54,22 +59,29 @@ def GrrServer():
   flags.StartMain(grr_server.main)
 
 
+def EndToEndTests():
+  from grr.tools import end_to_end_tests
+  SetConfigOptions()
+  flags.StartMain(end_to_end_tests.main)
+
+
 def Export():
   from grr.tools import export
+  export.AddPluginsSubparsers()
   SetConfigOptions()
   flags.StartMain(export.main)
-
-
-def Enroller():
-  from grr.worker import enroller
-  SetConfigOptions()
-  flags.StartMain(enroller.main)
 
 
 def Worker():
   from grr.worker import worker
   SetConfigOptions()
   flags.StartMain(worker.main)
+
+
+def GRRFuse():
+  from grr.tools import fuse_mount
+  SetConfigOptions()
+  flags.StartMain(fuse_mount.main)
 
 
 def Client():

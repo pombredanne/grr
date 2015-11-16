@@ -16,7 +16,9 @@ from grr.lib import aff4
 from grr.lib import rdfvalue
 from grr.lib import utils
 from grr.lib.aff4_objects import aff4_grr
-from grr.lib.rdfvalues import structs
+from grr.lib.rdfvalues import crypto as rdf_crypto
+from grr.lib.rdfvalues import protodict as rdf_protodict
+from grr.lib.rdfvalues import structs as rdf_structs
 
 
 # Caches for FindRendererForObject(), We can have a renderer for a repeated
@@ -41,17 +43,17 @@ def FindRendererForObject(rdf_obj):
 
   # Try to find an RDFValueArray renderer for repeated types. This allows
   # renderers to be specified for repeated fields.
-  if isinstance(rdf_obj, rdfvalue.RDFValueArray):
+  if isinstance(rdf_obj, rdf_protodict.RDFValueArray):
     return repeated_renderer_cache.get(
         rdf_obj_classname, RDFValueArrayRenderer)(rdf_obj)
 
-  if isinstance(rdf_obj, structs.RepeatedFieldHelper):
+  if isinstance(rdf_obj, rdf_structs.RepeatedFieldHelper):
     rdf_obj_classname = rdf_obj.type_descriptor.type.__name__
     return repeated_renderer_cache.get(
         rdf_obj_classname, RDFValueArrayRenderer)(rdf_obj)
 
   # If it is a semantic proto, we just use the RDFProtoRenderer.
-  if isinstance(rdf_obj, structs.RDFProtoStruct):
+  if isinstance(rdf_obj, rdf_structs.RDFProtoStruct):
     return semantic_renderer_cache.get(
         rdf_obj_classname, RDFProtoRenderer)(rdf_obj)
 
@@ -170,18 +172,37 @@ class SubjectRenderer(RDFValueRenderer):
   classname = "Subject"
 
   layout_template = renderers.Template("""
-<span type=subject aff4_path='{{this.aff4_path|escape}}'>
+<span type=subject aff4_path='{{this.aff4_path|escape}}'
+  tree_node_id='{{this.tree_node_id|escape}}'>
   {{this.basename|escape}}
 </span>
 """)
 
   def Layout(self, request, response):
+    if not self.proxy:
+      return
+
     aff4_path = request.REQ.get("aff4_path", "")
     aff4_path = rdfvalue.RDFURN(aff4_path)
     self.basename = self.proxy.RelativeName(aff4_path) or self.proxy
     self.aff4_path = self.proxy
+    self.tree_node_id = renderers.DeriveIDFromPath(
+        "/".join(self.aff4_path.Split()[1:]))
 
     return super(SubjectRenderer, self).Layout(request, response)
+
+
+class RDFBytesRenderer(RDFValueRenderer):
+  """A renderer for RDFBytes."""
+  classname = "RDFBytes"
+
+  def Layout(self, request, response):
+    self.proxy = utils.SmartStr(self.proxy).encode("string-escape")
+    super(RDFBytesRenderer, self).Layout(request, response)
+
+
+class LiteralExpressionRenderer(RDFBytesRenderer):
+  classname = "LiteralExpression"
 
 
 class RDFURNRenderer(RDFValueRenderer):
@@ -275,7 +296,7 @@ class RDFProtoRenderer(RDFValueRenderer):
   def Layout(self, request, response):
     """Render the protobuf as a table."""
     self.result = []
-    for descriptor, value in self.proxy.ListFields():
+    for descriptor, value in self.proxy.ListSetFields():
       name = descriptor.name
       friendly_name = descriptor.friendly_name or name
 
@@ -320,21 +341,12 @@ class RDFValueArrayRenderer(RDFValueRenderer):
 {% endfor %}
 {% if this.next_start %}
 <tr class="proto_separator"></tr>
-<tr id="{{unique}}">
- <td> (<a>Additional data available</a>) </td>
+<tr>
+ <td><div id="{{unique}}"> (<a>Additional data available</a>) </div></td>
 </tr>
 {% endif %}
 </tbody>
 </table>
-<script>
- $("#{{unique}} a").click(function () {
-   grr.layout("RDFValueArrayRenderer", "{{unique}}", {
-     start: "{{this.next_start}}",
-     cache: "{{this.cache.urn}}",
-     length: "{{this.length}}"
-   });
- });
-</script>
 """)
 
   def Layout(self, request, response):
@@ -348,20 +360,21 @@ class RDFValueArrayRenderer(RDFValueRenderer):
     cache = request.REQ.pop("cache", None)
     if cache:
       self.cache = aff4.FACTORY.Open(cache, token=request.token)
-      self.proxy = rdfvalue.RDFValueArray(self.cache.Read(1000000))
+      self.proxy = rdf_protodict.RDFValueArray(self.cache.Read(1000000))
 
     else:
       # We need to create a cache if this is too long.
       if len(self.proxy) > length:
         # Make a cache
-        with aff4.FACTORY.Create(None, "TempFile",
+        with aff4.FACTORY.Create(None, "TempMemoryFile",
                                  token=request.token) as self.cache:
-          data = rdfvalue.RDFValueArray()
+          data = rdf_protodict.RDFValueArray()
           data.Extend(self.proxy)
           self.cache.Write(data.SerializeToString())
 
     self.data = []
 
+    self.next_start = 0
     for i, element in enumerate(self.proxy):
       if i < start:
         continue
@@ -379,7 +392,13 @@ class RDFValueArrayRenderer(RDFValueRenderer):
           logging.error(
               "Unable to render %s with %s: %s", type(element), renderer, e)
 
-    return super(RDFValueArrayRenderer, self).Layout(request, response)
+    response = super(RDFValueArrayRenderer, self).Layout(request, response)
+    if self.next_start:
+      response = self.CallJavascript(response, "RDFValueArrayRenderer.Layout",
+                                     next_start=self.next_start,
+                                     cache_urn=self.cache.urn,
+                                     array_length=self.length)
+    return response
 
 
 class DictRenderer(RDFValueRenderer):
@@ -417,24 +436,27 @@ class DictRenderer(RDFValueRenderer):
     self.data = []
 
     for key, value in sorted(self.proxy.items()):
+      rendered_value = None
+
       if key in self.filter_keys:
         continue
       try:
         renderer = FindRendererForObject(value)
         if renderer:
-          value = renderer.RawHTML(request)
+          rendered_value = renderer.RawHTML(request)
         else:
           raise TypeError("Unknown renderer")
 
       # If the translation fails for whatever reason, just output the string
       # value literally (after escaping)
       except TypeError:
-        value = self.FormatFromTemplate(self.translator_error_template,
-                                        value=value)
+        rendered_value = self.FormatFromTemplate(self.translator_error_template,
+                                                 value=value)
       except Exception as e:
         logging.warn("Failed to render {0}. Err: {1}".format(type(value), e))
 
-      self.data.append((key, value))
+      if rendered_value is not None:
+        self.data.append((key, rendered_value))
 
     return super(DictRenderer, self).Layout(request, response)
 
@@ -447,7 +469,8 @@ class IconRenderer(RDFValueRenderer):
   width = 0
   layout_template = renderers.Template("""
 <div class="centered">
-<img class='grr-icon' src='/static/images/{{this.proxy.icon}}.png'
+<img class='grr-icon {{this.proxy.icon}}'
+ src='/static/images/{{this.proxy.icon}}.png'
  alt='{{this.proxy.description}}' title='{{this.proxy.description}}'
  /></div>""")
 
@@ -457,6 +480,14 @@ class RDFValueCollectionRenderer(renderers.TableRenderer):
 
   post_parameters = ["aff4_path"]
   size = 0
+  show_total_count = True
+  layout_template = """
+{% if this.size > 0 %}
+  {% if this.show_total_count %}
+    <h5>{{this.size}} Entries</h5>
+  {% endif %}
+{% endif %}
+""" + renderers.TableRenderer.layout_template
 
   def __init__(self, **kwargs):
     super(RDFValueCollectionRenderer, self).__init__(**kwargs)
@@ -472,7 +503,10 @@ class RDFValueCollectionRenderer(renderers.TableRenderer):
     except IOError:
       return
 
-    self.size = len(collection)
+    try:
+      self.size = len(collection)
+    except AttributeError:
+      self.show_total_count = False
 
     row_index = start_row
     for value in itertools.islice(collection, start_row, end_row):
@@ -482,6 +516,14 @@ class RDFValueCollectionRenderer(renderers.TableRenderer):
   def Layout(self, request, response, aff4_path=None):
     if aff4_path:
       self.state["aff4_path"] = str(aff4_path)
+      collection = aff4.FACTORY.Create(aff4_path, mode="r",
+                                       aff4_type="RDFValueCollection",
+                                       token=request.token)
+
+      try:
+        self.size = len(collection)
+      except AttributeError:
+        self.show_total_count = False
 
     return super(RDFValueCollectionRenderer, self).Layout(
         request, response)
@@ -498,18 +540,13 @@ Open a graph showing the download progress in a new window:
 <button id="{{ unique|escape }}">
  Generate
 </button>
-<script>
-  var button = $("#{{ unique|escapejs }}").button();
-
-  var state = {flow_id: '{{this.flow_id|escapejs}}'};
-  grr.downloadHandler(button, state, false,
-                      '/render/Download/ProgressGraphRenderer');
-</script>
 """)
 
   def Layout(self, request, response):
     self.flow_id = request.REQ.get("flow")
-    return super(ProgressButtonRenderer, self).Layout(request, response)
+    response = super(ProgressButtonRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "ProgressButtonRenderer.Layout",
+                               flow_id=self.flow_id)
 
 
 class FlowStateRenderer(DictRenderer):
@@ -525,10 +562,10 @@ class DataObjectRenderer(DictRenderer):
 class AES128KeyFormRenderer(forms.StringTypeFormRenderer):
   """Renders an encryption key."""
 
-  type = rdfvalue.AES128Key
+  type = rdf_crypto.AES128Key
 
   layout_template = """
-<div class="control-group">
+<div class="form-group">
 """ + forms.TypeDescriptorFormRenderer.default_description_view + """
   <div class="controls">
     <input id='{{this.prefix}}'
@@ -537,14 +574,13 @@ class AES128KeyFormRenderer(forms.StringTypeFormRenderer):
     />
   </div>
 </div>
-<script>
-$("#{{this.prefix}}").change();
-</script>
 """
 
   def Layout(self, request, response):
     self.default = str(self.descriptor.type().Generate())
-    return super(AES128KeyFormRenderer, self).Layout(request, response)
+    response = super(AES128KeyFormRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "AES128KeyFormRenderer.Layout",
+                               prefix=self.prefix)
 
 
 class ClientURNRenderer(RDFValueRenderer):
@@ -569,14 +605,14 @@ class ClientURNRenderer(RDFValueRenderer):
      </button>
      <h4 class="modal-title">Client {{this.proxy}}</h4>
     </div>
-    <div id="ClientInfoContent_{{unique|escape}}" class="modal-body"/>
+    <div id="ClientInfoContent_{{unique|escape}}" class="modal-body"/></div>
    </div>
   </div>
 </div>
 
 <button
- class="btn btn-default btn-mini" id="ClientInfoButton_{{unique}}">
- <span class="icon-glyphicon icon-info-sign"></span>
+ class="btn btn-default btn-xs" id="ClientInfoButton_{{unique}}">
+ <span class="glyphicon glyphicon-info-sign"></span>
 </button>
 """)
 
@@ -602,9 +638,9 @@ class ClientURNRenderer(RDFValueRenderer):
 
 class KeyValueFormRenderer(forms.TypeDescriptorFormRenderer):
   """A renderer for a Dict's KeyValue protobuf."""
-  type = rdfvalue.KeyValue
+  type = rdf_protodict.KeyValue
 
-  layout_template = renderers.Template("""<div class="control-group">
+  layout_template = renderers.Template("""<div class="form-group">
 <div id="{{unique}}" class="control input-append">
  <input id='{{this.prefix}}_key'
   type=text
@@ -622,7 +658,7 @@ class KeyValueFormRenderer(forms.TypeDescriptorFormRenderer):
   class="unset"/>
 
  <div class="btn-group">
-  <button class="btn dropdown-toggle" data-toggle="dropdown">
+  <button class="btn btn-default dropdown-toggle" data-toggle="dropdown">
     <span class="Type">Auto</span>  <span class="caret"></span>
   </button>
 
@@ -633,6 +669,7 @@ class KeyValueFormRenderer(forms.TypeDescriptorFormRenderer):
    <li><a data-type="Float">Float</a></li>
    <li><a data-type="Boolean">Boolean</a></li>
   </ul>
+ </div>
  </div>
 </div>
 """)
@@ -646,10 +683,10 @@ class KeyValueFormRenderer(forms.TypeDescriptorFormRenderer):
     if value in ["None", "none", None]:
       return None
 
-    if value in ["true", "yes"]:
+    if value in ["True", "true", "yes"]:
       return True
 
-    if value in ["false", "no"]:
+    if value in ["False", "false", "no"]:
       return False
 
     try:
@@ -672,7 +709,7 @@ class KeyValueFormRenderer(forms.TypeDescriptorFormRenderer):
     if key is None:
       return
 
-    result = rdfvalue.KeyValue()
+    result = rdf_protodict.KeyValue()
     result.k.SetValue(key)
 
     # Automatically try to detect the value
@@ -683,10 +720,10 @@ class KeyValueFormRenderer(forms.TypeDescriptorFormRenderer):
     elif value_type == "Float":
       value = float(value)
     elif value_type == "Boolean":
-      if value in ["true", "yes"]:
+      if value in ["True", "true", "yes", "1"]:
         value = True
 
-      elif value in ["false", "no"]:
+      elif value in ["False", "false", "no", "0"]:
         value = False
 
       else:

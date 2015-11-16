@@ -14,55 +14,54 @@ import os
 from grr.client import client_plugins
 # pylint: enable=unused-import
 
-from grr.client import vfs
 from grr.lib import flags
 from grr.lib import plist as plist_lib
-from grr.lib import rdfvalue
 from grr.lib import test_lib
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import plist as rdf_plist
 
 
 # This variable holds the same contents as the ondisk test plist
 test_plist_dict = {
     "date": 978307200000000,
     "nested1":
-    {
-        "nested11":
         {
-            "data113": "\xde\xad\xbe\xef",
-            "key111": "value111",
-            "key112": "value112"
-        }
-    },
+            "nested11":
+                {
+                    "data113": "\xde\xad\xbe\xef",
+                    "key111": "value111",
+                    "key112": "value112"
+                }
+        },
     "numbers": [1, "2", "3"]
 }
 
 # y Safari History plist
 safari_plist_dict = {
     "WebHistoryDates":
-    [
-        {"": "http://www.google.com",
-         "title": "Google",
-         "lastVisited": "374606652.9",
-         "visitCount": 2,
-        },
-        {"": "http://www.apple.com",
-         "title": "Apple",
-         "lastVisited": "374606652.9",
-         "visitCount": 1,
-        },
-    ],
+        [
+            {"": "http://www.google.com",
+             "title": "Google",
+             "lastVisited": "374606652.9",
+             "visitCount": 2},
+            {"": "http://www.apple.com",
+             "title": "Apple",
+             "lastVisited": "374606652.9",
+             "visitCount": 1},
+        ],
     "WebHistoryFileVersion": 1,
-    }
+}
 
 
 class PlistTest(test_lib.EmptyActionTest):
+
   def testParseFilter(self):
     queries = [
         ('bla is "red"', True),
         ('bla.bla is "red"', True),
         ('bla."bla bliek" is "red"', True),
         ('bla.bla bliek is "red"', False),
-        ]
+    ]
     for query, result in queries:
       if result:
         plist_lib.PlistFilterParser(query).Parse()
@@ -125,9 +124,9 @@ class PlistTest(test_lib.EmptyActionTest):
 
   def _RunQuery(self, plist="test.plist", query="", context=""):
     path = os.path.join(self.base_path, plist)
-    pathspec = rdfvalue.PathSpec(path=path,
-                                 pathtype=rdfvalue.PathSpec.PathType.OS)
-    plistrequest = rdfvalue.PlistRequest()
+    pathspec = rdf_paths.PathSpec(path=path,
+                                  pathtype=rdf_paths.PathSpec.PathType.OS)
+    plistrequest = rdf_plist.PlistRequest()
     plistrequest.query = query
     plistrequest.context = context
     plistrequest.pathspec = pathspec
@@ -135,9 +134,6 @@ class PlistTest(test_lib.EmptyActionTest):
 
 
 def main(argv):
-  # Initialize the VFS system
-  vfs.VFSInit()
-
   test_lib.main(argv)
 
 if __name__ == "__main__":

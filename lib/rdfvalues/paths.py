@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2012 Google Inc. All Rights Reserved.
 """Pathspecs are methods of specifying the path on the client.
 
 The GRR client has a number of drivers to virtualize access to different objects
@@ -17,23 +16,28 @@ On the server the PathSpec is represented as a PathSpec object, and stored
 as an attribute of the AFF4 object. This module defines this abstraction.
 """
 
+
 import fnmatch
 import itertools
 import posixpath
 import re
 
+import logging
+
+from grr.lib import artifact_utils
 from grr.lib import rdfvalue
 from grr.lib import utils
-from grr.lib.rdfvalues import structs
+from grr.lib.rdfvalues import standard as rdf_standard
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import jobs_pb2
 
 INTERPOLATED_REGEX = re.compile(r"%%([^%]+?)%%")
 
 # Grouping pattern: e.g. {test.exe,foo.doc,bar.txt}
-GROUPING_PATTERN = re.compile("{([^}]+)}")
+GROUPING_PATTERN = re.compile("{([^}]+,[^}]+)}")
 
 
-class PathSpec(structs.RDFProtoStruct):
+class PathSpec(rdf_structs.RDFProtoStruct):
   """A path specification.
 
   The pathspec protobuf is a recursive protobuf which contains components. This
@@ -47,7 +51,9 @@ class PathSpec(structs.RDFProtoStruct):
 
     # Instantiate from another PathSpec.
     if isinstance(initializer, PathSpec):
-      self.SetRawData(initializer.Copy().GetRawData())
+      # pylint: disable=protected-access
+      self.SetRawData(initializer._CopyRawData())
+      # pylint: enable=protected-access
       self.age = initializer.age
 
     # Allow initialization from a list of protobufs each representing a
@@ -109,7 +115,7 @@ class PathSpec(structs.RDFProtoStruct):
       # Append the temp copy to the end.
       self.last.nested_path = nested_proto
     else:
-      previous = self[index-1]
+      previous = self[index - 1]
       rdfpathspec.last.nested_path = previous.nested_path
       previous.nested_path = rdfpathspec
 
@@ -125,14 +131,6 @@ class PathSpec(structs.RDFProtoStruct):
         setattr(self, k, v)
 
       self.SetRawData(component.GetRawData())
-
-    return self
-
-  def AppendPath(self, path_component):
-    self.last.path = utils.JoinPath(self.last.path, path_component)
-
-    # Clear any inode caches.
-    self.last.inode = None
 
     return self
 
@@ -152,7 +150,7 @@ class PathSpec(structs.RDFProtoStruct):
 
     else:
       # Get the raw protobufs for the previous member.
-      previous = self[index-1]
+      previous = self[index - 1]
 
       result = previous.nested_path
 
@@ -194,7 +192,8 @@ class PathSpec(structs.RDFProtoStruct):
   def Basename(self):
     for component in reversed(self):
       basename = posixpath.basename(component.path)
-      if basename: return basename
+      if basename:
+        return basename
 
     return ""
 
@@ -216,11 +215,33 @@ class GlobExpression(rdfvalue.RDFString):
   3) Wild cards like * and ?
   """
 
-  def __str__(self):
-    return "<GlobExpression: %s>" % self._value
+  context_help_url = "user_manual.html#_path_globbing"
+
+  RECURSION_REGEX = re.compile(r"\*\*(\d*)")
+
+  def Validate(self):
+    """GlobExpression is valid."""
+    if len(self.RECURSION_REGEX.findall(self._value)) > 1:
+      raise ValueError("Only one ** is permitted per path: %s." %
+                       self._value)
 
   def Interpolate(self, client=None):
-    for pattern in self.InterpolateClientAttributes(client=client):
+    try:
+      kb = client.Get(client.Schema.KNOWLEDGE_BASE)
+      if not kb:
+        raise artifact_utils.KnowledgeBaseInterpolationError(
+            "Client has no knowledge base")
+
+      patterns = artifact_utils.InterpolateKbAttributes(self._value, kb)
+    except artifact_utils.KnowledgeBaseInterpolationError:
+      # TODO(user): Deprecate InterpolateClientAttributes() support and
+      # make KnowledgeBase the default and only option as soon as we're
+      # confident that it's fully populated.
+      logging.debug("Can't interpolate glob %s with knowledge base attributes, "
+                    "reverting to client attributes.", utils.SmartUnicode(self))
+      patterns = self.InterpolateClientAttributes(client=client)
+
+    for pattern in patterns:
       # Normalize the component path (this allows us to resolve ../
       # sequences).
       pattern = utils.NormalizePath(pattern.replace("\\", "/"))
@@ -259,7 +280,7 @@ class GlobExpression(rdfvalue.RDFString):
       # Only get the newest attribute that matches the pattern.
       for rdf_value in attr_accessor(match.group(1)):
 
-      # Treat string as special because its an iterable :-(
+        # Treat string as special because its an iterable :-(
         if isinstance(rdf_value, basestring):
           alternatives.append(rdf_value)
         else:
@@ -304,4 +325,5 @@ class GlobExpression(rdfvalue.RDFString):
     Returns:
       A RegularExpression() object.
     """
-    return rdfvalue.RegularExpression("(?i)^" + fnmatch.translate(self._value))
+    return rdf_standard.RegularExpression(
+        "(?i)^" + fnmatch.translate(self._value))

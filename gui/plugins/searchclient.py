@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """This plugin renders the client search page."""
+
 import time
 
 from django.utils import datastructures
@@ -8,11 +9,15 @@ from grr.gui import renderers
 from grr.gui.plugins import semantic
 from grr.lib import access_control
 from grr.lib import aff4
+from grr.lib import data_store
+from grr.lib import flow
+from grr.lib import ip_resolver
 from grr.lib import rdfvalue
 from grr.lib import registry
-from grr.lib import search
 from grr.lib import stats
-from grr.lib import utils
+from grr.lib.aff4_objects import aff4_grr
+from grr.lib.aff4_objects import users as aff4_users
+from grr.lib.rdfvalues import client as rdf_client
 
 
 class SearchHostInit(registry.InitHook):
@@ -32,13 +37,120 @@ class ContentView(renderers.Splitter2WayVertical):
   min_left_pane_width = 210
   max_left_pane_width = 210
 
-  layout_template = """
-<script>
-  if (grr.hash.c) {
-    grr.state.client_id = grr.hash.c;
-  };
-</script>
-""" + renderers.Splitter2WayVertical.layout_template
+  layout_template = ("""<div id="global-notification"></div>""" +
+                     renderers.Splitter2WayVertical.layout_template)
+
+  def Layout(self, request, response):
+    canary_mode = False
+
+    user_record = aff4.FACTORY.Create(
+        aff4.ROOT_URN.Add("users").Add(request.user), aff4_type="GRRUser",
+        mode="r", token=request.token)
+    canary_mode = user_record.Get(
+        user_record.Schema.GUI_SETTINGS).canary_mode
+
+    if canary_mode:
+      response.set_cookie("canary_mode", "true")
+    else:
+      response.delete_cookie("canary_mode")
+
+    # Ensure that Javascript will be executed before the rest of the template
+    # gets processed.
+    response = self.CallJavascript(
+        response, "ContentView.Layout",
+        global_notification_poll_time=GlobalNotificationBar.POLL_TIME,
+        canary=int(canary_mode))
+    response = super(ContentView, self).Layout(request, response)
+    return response
+
+
+class SetGlobalNotification(flow.GRRGlobalFlow):
+  """Updates user's global notification timestamp."""
+
+  # This is an administrative flow.
+  category = "/Administrative/"
+
+  # Only admins can run this flow.
+  AUTHORIZED_LABELS = ["admin"]
+
+  # This flow is a SUID flow.
+  ACL_ENFORCED = False
+
+  args_type = aff4_users.GlobalNotification
+
+  @flow.StateHandler()
+  def Start(self):
+    with aff4.FACTORY.Create(aff4.GlobalNotificationStorage.DEFAULT_PATH,
+                             aff4_type="GlobalNotificationStorage",
+                             mode="rw", token=self.token) as storage:
+      storage.AddNotification(self.args)
+
+
+class MarkGlobalNotificationAsShown(flow.GRRFlow):
+  """Updates user's global notification timestamp."""
+
+  # This flow is a SUID flow.
+  ACL_ENFORCED = False
+
+  args_type = aff4_users.GlobalNotification
+
+  @flow.StateHandler()
+  def Start(self):
+    with aff4.FACTORY.Create(
+        aff4.ROOT_URN.Add("users").Add(self.token.username), "GRRUser",
+        token=self.token, mode="rw") as user_record:
+      user_record.MarkGlobalNotificationAsShown(self.args)
+
+
+class GlobalNotificationBar(renderers.TemplateRenderer):
+  """Renders global notification bar on top of the admin UI."""
+
+  POLL_TIME = 5 * 60 * 1000
+
+  layout_template = renderers.Template("""
+{% for notification in this.notifications %}
+<div class="alert alert-block alert-{{notification.type_name|lower|escape}}">
+  <button type="button" notification-hash="{{notification.hash|escape}}"
+    class="close">&times;</button>
+  <h4>{{notification.header|escape}}</h4>
+  <p>{{notification.content|escape}}</h4>
+  {% if notification.link %}
+    <p><a href="{{notification.link|escape}}" target="_blank">More...</a></p>
+  {% endif %}
+</div>
+{% endfor %}
+""")
+
+  def Layout(self, request, response):
+    try:
+      user_record = aff4.FACTORY.Open(
+          aff4.ROOT_URN.Add("users").Add(request.user), "GRRUser",
+          token=request.token)
+
+      self.notifications = user_record.GetPendingGlobalNotifications()
+    except IOError:
+      self.notifications = []
+
+    return super(GlobalNotificationBar, self).Layout(request, response)
+
+  def RenderAjax(self, request, response):
+    # If notification_hash is part of request, remove notification with a
+    # given hash, otherwise just render list of notifications as usual.
+    if "notification_hash" in request.REQ:
+      hash_to_remove = int(request.REQ["notification_hash"])
+
+      user_record = aff4.FACTORY.Create(
+          aff4.ROOT_URN.Add("users").Add(request.user), "GRRUser",
+          mode="r", token=request.token)
+
+      notifications = user_record.GetPendingGlobalNotifications()
+      for notification in notifications:
+        if notification.hash == hash_to_remove:
+          flow.GRRFlow.StartFlow(flow_name="MarkGlobalNotificationAsShown",
+                                 args=notification, token=request.token)
+          break
+    else:
+      return self.Layout(request, response)
 
 
 def FormatLastSeenTime(age):
@@ -59,15 +171,56 @@ def FormatLastSeenTime(age):
     return "%d days ago" % int(time_last_seen // (60 * 60 * 24))
 
 
+def GetLowDiskWarnings(client):
+  """Check disk free space for a client.
+
+  Args:
+    client: client object open for reading
+  Returns:
+    array of warning strings, empty if no warnings
+  """
+  warnings = []
+  volumes = client.Get(client.Schema.VOLUMES)
+
+  # Avoid showing warnings for the CDROM.  This is isn't a problem for linux and
+  # OS X since we only check usage on the disk mounted at "/".
+  exclude_windows_types = [
+      rdf_client.WindowsVolume.WindowsDriveTypeEnum.DRIVE_CDROM]
+
+  if volumes:
+    for volume in volumes:
+      if volume.windowsvolume.drive_type not in exclude_windows_types:
+        freespace = volume.FreeSpacePercent()
+        if freespace < 5.0:
+          warnings.append("{0} {1:.0f}% free".format(volume.Name(),
+                                                     freespace))
+  return warnings
+
+
 class StatusRenderer(renderers.TemplateRenderer):
   """A renderer for the online status line."""
+
+  MAX_TIME_SINCE_CRASH = rdfvalue.Duration("1w")
 
   layout_template = renderers.Template("""
 Status: {{this.icon|safe}}
 {{this.last_seen_msg|escape}}.
 {% if this.ip_description %}
-<br>
-{{this.ip_icon|safe}} {{this.ip_description|escape}}
+  <br>
+  {{this.ip_icon|safe}} {{this.ip_description|escape}}
+{% endif %}
+{% if this.last_crash %}
+  <br>
+  <strong>Last crash:</strong><br>
+  <img class='grr-icon' src='/static/images/skull-icon.png'> {{this.last_crash}}<br/>
+{% endif %}
+{% if this.disk_full %}
+  <br>
+  <img class='grr-icon' src='/static/images/hdd-bang-icon.png'>
+  <strong>Disk free space low:</strong><br>
+  {% for message in this.disk_full %}
+    {{message|escape}}<br/>
+  {% endfor %}
 {% endif %}
 <br>
 """)
@@ -77,7 +230,18 @@ Status: {{this.icon|safe}}
 
     client_id = request.REQ.get("client_id")
     if client_id:
+      client_id = rdf_client.ClientURN(client_id)
       client = aff4.FACTORY.Open(client_id, token=request.token)
+
+      self.last_crash = None
+      crash = client.Get(client.Schema.LAST_CRASH)
+      if crash:
+        time_since_crash = rdfvalue.RDFDatetime().Now() - crash.timestamp
+        if time_since_crash < self.MAX_TIME_SINCE_CRASH:
+          self.last_crash = FormatLastSeenTime(crash.timestamp)
+
+      self.disk_full = GetLowDiskWarnings(client)
+
       ping = client.Get(client.Schema.PING)
       if ping:
         age = ping
@@ -91,7 +255,7 @@ Status: {{this.icon|safe}}
       self.last_seen_msg = FormatLastSeenTime(age)
 
       ip = client.Get(client.Schema.CLIENT_IP)
-      (status, description) = utils.RetrieveIPInfo(ip)
+      (status, description) = ip_resolver.IP_RESOLVER.RetrieveIPInfo(ip)
       self.ip_icon = IPStatusIcon(status).RawHTML(request)
       self.ip_description = description
 
@@ -184,34 +348,6 @@ class Navigator(renderers.TemplateRenderer):
 </div>
 
 </div>
-<script>
-
- grr.installNavigationActions("nav_{{unique|escapejs}}");
- if(!grr.hash.main) {
-   $('a[grrtarget=HostInformation]').click();
- } else {
-   $('a[grrtarget=' + grr.hash.main + ']').click();
- };
-
- grr.poll("StatusRenderer", "infoline_{{unique|escapejs}}",
-   function(data) {
-     $("#infoline_{{unique|escapejs}}").html(data);
-     return true;
-   }, {{this.poll_time|escapejs}}, grr.state, null,
-   function() {
-      $("#infoline_{{unique|escapejs}}").html("Client status not available.");
-   });
-
-  // Reload the navigator when a new client is selected.
-  grr.subscribe("client_selection", function () {
-    grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}");
-  }, "{{unique|escapejs}}");
-
-  if(grr.hash.c && grr.hash.c != "{{this.client_id|escapejs}}") {
-    grr.publish("client_selection", grr.hash.c);
-  };
-
-</script>
 """)
 
   def Layout(self, request, response):
@@ -276,7 +412,10 @@ class Navigator(renderers.TemplateRenderer):
       renderers.Renderer.GetPlugin("UnauthorizedRenderer")().Layout(
           request, response, exception=e)
 
-    return response
+    return self.CallJavascript(response, "Navigator.Layout",
+                               renderer=self.__class__.__name__,
+                               client_id=self.client_id,
+                               poll_time=self.poll_time)
 
 
 class OnlineStateIcon(semantic.RDFValueRenderer):
@@ -317,159 +456,97 @@ class IPStatusIcon(semantic.RDFValueRenderer):
 <img class="grr-icon-small {{this.cls|escape}}"
      src="/static/images/{{this.ip_icon|escape}}"/>""")
 
-  icons = {utils.IPInfo.UNKNOWN: "ip_unknown.png",
-           utils.IPInfo.INTERNAL: "ip_internal.png",
-           utils.IPInfo.EXTERNAL: "ip_external.png",
-           utils.IPInfo.VPN: "ip_unknown.png"}
+  icons = {ip_resolver.IPInfo.UNKNOWN: "ip_unknown.png",
+           ip_resolver.IPInfo.INTERNAL: "ip_internal.png",
+           ip_resolver.IPInfo.EXTERNAL: "ip_external.png",
+           ip_resolver.IPInfo.VPN: "ip_unknown.png"}
 
   def Layout(self, request, response):
     self.ip_icon = self.icons.setdefault(int(self.proxy), "ip_unknown.png")
     return super(IPStatusIcon, self).Layout(request, response)
 
 
-class CenteredOnlineStateIcon(OnlineStateIcon):
-  """Render the online state by using a centered icon."""
-
-  layout_template = ("<div class=\"centered\">" +
-                     OnlineStateIcon.layout_template +
-                     "</div>")
-
-
-class HostTable(renderers.TableRenderer):
-  """Render a table for searching hosts."""
-
-  fixed_columns = False
-
-  # Update the table if any messages appear in these queues:
-  vfs_table_template = renderers.Template("""<script>
-     //Receive the selection event and emit a client_id
-     grr.subscribe("select_table_{{ id|escapejs }}", function(node) {
-          var aff4_path = $("span[aff4_path]", node).attr("aff4_path");
-          var cn = aff4_path.replace("aff4:/", "");
-          grr.state.client_id = cn;
-          grr.publish("hash_state", "c", cn);
-
-          // Clear the authorization for new clients.
-          grr.publish("hash_state", "reason", "");
-          grr.state.reason = "";
-
-          grr.publish("hash_state", "main", null);
-          grr.publish("client_selection", cn);
-     }, "{{ unique|escapejs }}");
- </script>""")
+class FilestoreTable(renderers.TableRenderer):
+  """Render filestore hits."""
 
   def __init__(self, **kwargs):
-    renderers.TableRenderer.__init__(self, **kwargs)
-    self.AddColumn(semantic.RDFValueColumn("Online", width="40px",
-                                           renderer=CenteredOnlineStateIcon))
-    self.AddColumn(semantic.AttributeColumn("subject", width="13em"))
-    self.AddColumn(semantic.AttributeColumn("Host", width="13em"))
-    self.AddColumn(semantic.AttributeColumn("Version", width="20%"))
-    self.AddColumn(semantic.AttributeColumn("MAC", width="10%"))
-    self.AddColumn(semantic.AttributeColumn("Usernames", width="20%"))
-    self.AddColumn(semantic.AttributeColumn("FirstSeen", width="15%",
-                                            header="First Seen"))
-    self.AddColumn(semantic.AttributeColumn("Install", width="15%",
-                                            header="OS Install Date"))
-    self.AddColumn(semantic.AttributeColumn("Labels", width="8%"))
-    self.AddColumn(semantic.AttributeColumn("Clock", width="15%",
-                                            header="Last Checkin"))
+    super(FilestoreTable, self).__init__(**kwargs)
 
-  @renderers.ErrorHandler()
-  def Layout(self, request, response):
-    response = super(HostTable, self).Layout(request, response)
+    self.AddColumn(semantic.RDFValueColumn("Client"))
+    self.AddColumn(semantic.RDFValueColumn("File"))
+    self.AddColumn(semantic.RDFValueColumn("Timestamp"))
 
-    return self.RenderFromTemplate(
-        self.vfs_table_template,
-        response,
-        event_queue=self.event_queue,
-        unique=self.unique, id=self.id)
-
-  @stats.Timed("grr_gui_search_host_time")
   def BuildTable(self, start, end, request):
-    """Draw table cells."""
-    row_count = 0
-
     query_string = request.REQ.get("q", "")
     if not query_string:
       raise RuntimeError("A query string must be provided.")
 
-    result_urns = search.SearchClients(query_string, start=start,
-                                       max_results=end-start,
-                                       token=request.token)
-    result_set = aff4.FACTORY.MultiOpen(result_urns, token=request.token)
+    hash_urn = rdfvalue.RDFURN("aff4:/files/hash/generic/sha256/").Add(
+        query_string)
 
-    self.message = "Searched for %s" % query_string
+    for i, (_, value, timestamp) in enumerate(data_store.DB.ResolvePrefix(
+        hash_urn, "index:", token=request.token)):
 
-    for child in result_set:
-      # Add the fd to all the columns
-      for column in self.columns:
-        try:
-          column.AddRowFromFd(row_count + start, child)
-        except AttributeError:
-          pass
+      if i > end:
+        break
 
-      # Also update the online status.
-      ping = child.Get(child.Schema.PING) or 0
-      self.columns[0].AddElement(row_count + start, long(ping))
+      self.AddRow(row_index=i, File=value,
+                  Client=aff4_grr.VFSGRRClient.ClientURNFromURN(value),
+                  Timestamp=rdfvalue.RDFDatetime(timestamp))
 
-      row_count += 1
-
-    return row_count
+    # We only display 50 entries.
+    return False
 
 
-class SearchHostView(renderers.Renderer):
-  """Show a search screen for the host."""
+class ClientLabelsRenderer(semantic.RDFValueRenderer):
+  """Renders client labels."""
 
-  title = "Search Client"
+  layout_template = renderers.Template("""
+{% for label in this.labels %}
 
-  template = renderers.Template("""
-<form id="search_host" class="navbar-search pull-left">
-  <input type="text" name="q" class="search-query" placeholder="Search">
-</form>
+{% if label.owner == 'GRR' %}
+<span class="label label-default">{{label.name|escape}}</span>
+{% else %}
+<span class="label label-success">{{label.name|escape}}</span>
+{% endif %}
 
-<script>
- $("#search_host").submit(function () {
-   grr.layout("HostTable", "main", {q: $('input[name="q"]').val()});
-   return false;
- }).find("input[name=q]").focus();
-</script>
+{% endfor %}
 """)
 
   def Layout(self, request, response):
-    """Display a search screen for the host."""
-    response = super(SearchHostView, self).Layout(request, response)
+    labels_list = self.proxy.Get(self.proxy.Schema.LABELS)
+    if labels_list:
+      self.labels = labels_list.labels
+    else:
+      self.labels = []
 
-    return self.RenderFromTemplate(
-        self.template, response, title=self.title,
-        id=self.id)
+    return super(ClientLabelsRenderer, self).Layout(request, response)
+
+
+class HostTable(renderers.AngularDirectiveRenderer):
+  directive = "grr-clients-list"
+
+  def Layout(self, request, response):
+    self.directive_args = {}
+    self.directive_args["query"] = request.REQ.get("q")
+    return super(HostTable, self).Layout(request, response)
+
+
+class SearchHostView(renderers.AngularDirectiveRenderer):
+  directive = "grr-client-search-box"
 
 
 class FrontPage(renderers.TemplateRenderer):
   """The front page of the GRR application."""
 
   layout_template = renderers.Template("""
-  <div id="main">
-
-   <div class="container-fluid">
-     <div class="row-fluid">
-  <div id='front'><h2>Welcome to GRR</h2></div>
-  Query for a system to view in the search box above.
-
-  <p>
-  Type a search term to search for a machine using either a hostname,
-  mac address or username.
-  </p>
-     </div>  <!-- row -->
-   </div>  <!-- container -->
-
-  </div>
-
-<script>
- // Update main's state from the hash
- if (grr.hash.main) {
-   grr.layout(grr.hash.main, "main");
- };
-
-</script>
+  <div id="main"></div>
 """)
+
+  def Layout(self, request, response):
+    response = super(FrontPage, self).Layout(request, response)
+    return self.CallJavascript(response, "FrontPage.Layout")
+
+
+class UserDashboard(renderers.AngularDirectiveRenderer):
+  directive = "grr-user-dashboard"

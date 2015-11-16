@@ -17,8 +17,9 @@ from grr.client import client_utils_common
 from grr.client import client_utils_linux
 from grr.client import client_utils_osx
 from grr.lib import flags
-from grr.lib import rdfvalue
 from grr.lib import test_lib
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 def GetVolumePathName(_):
@@ -62,13 +63,13 @@ server.nfs:/vol/home /home/user nfs rw,nosuid,relatime 0 0
 
     for filename, expected_device, expected_path, device_type in [
         ("/etc/passwd", "/dev/mapper/root", "/etc/passwd",
-         rdfvalue.PathSpec.PathType.OS),
+         rdf_paths.PathSpec.PathType.OS),
         ("/usr/local/bin/ls", "/dev/mapper/usr", "/bin/ls",
-         rdfvalue.PathSpec.PathType.OS),
+         rdf_paths.PathSpec.PathType.OS),
         ("/proc/net/sys", "none", "/net/sys",
-         rdfvalue.PathSpec.PathType.UNSET),
+         rdf_paths.PathSpec.PathType.UNSET),
         ("/home/user/test.txt", "server.nfs:/vol/home", "/test.txt",
-         rdfvalue.PathSpec.PathType.UNSET)]:
+         rdf_paths.PathSpec.PathType.UNSET)]:
       raw_pathspec, path = client_utils_linux.LinGetRawDevice(
           filename)
 
@@ -89,14 +90,13 @@ server.nfs:/vol/home /home/user nfs rw,nosuid,relatime 0 0
 
     testdata = [(r"C:\Windows", "\\\\?\\Volume{11111}", "/Windows"),
                 (r"C:\\Windows\\", "\\\\?\\Volume{11111}", "/Windows"),
-                (r"C:\\", "\\\\?\\Volume{11111}", "/"),
-               ]
+                (r"C:\\", "\\\\?\\Volume{11111}", "/")]
 
     for filename, expected_device, expected_path in testdata:
       raw_pathspec, path = client_utils_windows.WinGetRawDevice(filename)
 
       # Pathspec paths are always absolute and therefore must have a leading /.
-      self.assertEqual("/" + expected_device, raw_pathspec.path)
+      self.assertEqual(expected_device, raw_pathspec.path)
       self.assertEqual(expected_path, path)
 
   def SetupWinEnvironment(self):
@@ -205,10 +205,11 @@ server.nfs:/vol/home /home/user nfs rw,nosuid,relatime 0 0
     with tempfile.NamedTemporaryFile() as fd:
       nanny_controller = client_utils_linux.NannyController()
       nanny_controller.StartNanny(nanny_logfile=fd.name)
-      grr_message = rdfvalue.GrrMessage(session_id="W:test")
+      grr_message = rdf_flows.GrrMessage(session_id="W:test")
 
       nanny_controller.WriteTransactionLog(grr_message)
-      self.assertProtoEqual(grr_message, nanny_controller.GetTransactionLog())
+      self.assertRDFValueEqual(grr_message,
+                               nanny_controller.GetTransactionLog())
       nanny_controller.CleanTransactionLog()
 
       self.assert_(nanny_controller.GetTransactionLog() is None)
@@ -236,12 +237,6 @@ class OSXVersionTests(test_lib.GRRBaseTest):
     self.mox.ReplayAll()
     osversion = client_utils_osx.OSXVersion()
     self.assertEqual(osversion.VersionString(), "10.8.1")
-    self.mox.VerifyAll()
-
-  def testVersionAsFloat(self):
-    self.mox.ReplayAll()
-    osversion = client_utils_osx.OSXVersion()
-    self.assertEqual(osversion.VersionAsFloat(), 10.8)
     self.mox.VerifyAll()
 
   def tearDown(self):

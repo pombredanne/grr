@@ -1,0 +1,209 @@
+[
+  {
+   "name": "TestAggregationArtifact",
+    "sources": [
+      { "type": "ARTIFACT",
+        "attributes": { "names": ["TestOSAgnostic"] },
+        "returned_types": ["Process"]
+      },
+      { "type": "ARTIFACT",
+        "attributes": { "names": [ "TestCmdArtifact" ]
+        },
+        "returned_types": [ "SoftwarePackage" ]
+      }
+    ],
+    "doc": "Test artifact aggregation.",
+    "labels": [ "Software" ],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "TestAggregationArtifactDeps",
+    "sources": [
+      { "type": "ARTIFACT",
+        "attributes": { "names": [ "TestAggregationArtifact" ]
+        },
+        "returned_types": [ "Process" ]
+      }
+    ],
+    "doc": "Test artifact aggregation dependencies.",
+    "labels": [ "Software" ],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "TestCmdArtifact",
+    "sources": [
+      { "type": "COMMAND",
+        "attributes": { "cmd": "/usr/bin/dpkg",
+                  "args": ["--list"]
+        },
+        "returned_types": [ "SoftwarePackage" ]
+      }
+    ],
+    "doc": "Test command artifact for dpkg.",
+    "labels": [ "Software" ],
+    "supported_os": [ "Linux" ]
+  },
+
+  { "name": "TestOSAgnostic",
+    "sources": [
+      { "type": "GRR_CLIENT_ACTION",
+        "attributes": { "client_action": {"GetHostname"}}
+      }
+    ],
+    "doc": "Test no OS means all OSes.",
+    "labels": [ "Software" ],
+    "supported_os": []
+  },
+
+  { "name": "TestFilesArtifact",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/var/log/auth.log"] }
+      }
+    ],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Linux" ]
+  },
+
+  { "name": "NullArtifact",
+    "doc": "Null"
+  },
+
+  { "name": "FakeArtifact",
+    "doc": "My first artifact.",
+    "labels": [ "Logs", "Authentication" ],
+    "supported_os": [ "Linux" ]
+  },
+
+  { "name": "FakeArtifact2",
+    "doc": "My second artifact.",
+    "labels": [ "System"],
+    "supported_os": [ "Linux" ]
+  },
+
+
+  { "name": "BadPathspecArtifact",
+    "sources": [
+      { "type": "ARTIFACT_FILES",
+        "attributes": { "artifact_list": [ "WindowsPersistenceMechanisms" ],
+          "pathspec_attribute": "broken"
+        },
+        "returned_types": ["StatEntry"]
+      }
+    ],
+    "doc": "Broken pathspec_attribute.",
+    "labels": [ "Software" ],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsParent",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/test/%%users.desktop%%"] }
+      }
+    ],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsDesktop",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/test/%%users.homedir%%"] }
+      }
+    ],
+    "provides": ["users.desktop"],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsHomedir",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/test/%%environ_windir%%/%%current_control_set%%"] }
+      }
+    ],
+    "provides": ["users.homedir"],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsHomedir2",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/test/blah"] }
+      }
+    ],
+    "provides": ["users.homedir"],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsWindir",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/test/%%current_control_set%%"] }
+      }
+    ],
+    "provides": ["environ_windir"],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsWindirRegex",
+    "sources": [
+      { "type": "GREP",
+        "attributes": { "paths": ["/test/%%current_control_set%%"],
+                  "content_regex_list": ["%%users.username%%"]}
+      }
+    ],
+    "provides": ["environ_windir"],
+    "doc": "Test content_regex_list interpolation",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsControlSet",
+    "sources": [
+      { "type": "FILE",
+        "attributes": { "paths": ["/test/controlset"] }
+      }
+    ],
+    "provides": ["current_control_set"],
+    "doc": "Test files artifact.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "DepsProvidesMultiple",
+    "sources": [
+      { "type": "REGISTRY_VALUE",
+        "attributes": { "key_value_pairs": [{"key": 'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion', "value": 'SystemRoot'}]}
+      }
+    ],
+    "provides": ["environ_path", "environ_temp"],
+    "doc": "Test multiple provide values.",
+    "labels": ["Logs", "Authentication"],
+    "supported_os": [ "Windows" ]
+  },
+
+  { "name": "WMIActiveScriptEventConsumer",
+    "doc": "List all ActiveScript Event Consumers.",
+    "sources": [
+      { "type": "WMI",
+        "attributes": { "base_object": "winmgmts:\\root\\subscription",
+                        "query": "SELECT * FROM ActiveScriptEventConsumer"
+                      }
+      }
+    ],
+    "labels": [ "Software" ],
+    "supported_os": [ "Windows" ],
+    "urls": [ "https://msdn.microsoft.com/en-us/library/aa384749%28v=vs.85%29.aspx" ],
+  }
+]

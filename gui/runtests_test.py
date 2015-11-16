@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 """This is a selenium test harness."""
+import os
 
+
+import portpicker
 from selenium import webdriver
 
 import logging
 
 from grr.gui import runtests
-from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import test_lib
 
@@ -18,15 +20,12 @@ class SeleniumTestLoader(test_lib.GRRTestLoader):
 
 class SeleniumTestProgram(test_lib.GrrTestProgram):
 
-  def __init__(self, argv=None):
-    super(SeleniumTestProgram, self).__init__(
-        argv=argv, testLoader=SeleniumTestLoader())
+  def SetupSelenium(self, port):
+    os.environ.pop("http_proxy", None)
 
-  def SetupSelenium(self):
     # This is very expensive to start up - we make it a class attribute so it
     # can be shared with all the classes.
-    test_lib.GRRSeleniumTest.base_url = (
-        "http://localhost:%s" % config_lib.CONFIG["AdminUI.port"])
+    test_lib.GRRSeleniumTest.base_url = ("http://localhost:%s" % port)
 
     options = webdriver.ChromeOptions()
     test_lib.GRRSeleniumTest.driver = webdriver.Chrome(chrome_options=options)
@@ -40,20 +39,24 @@ class SeleniumTestProgram(test_lib.GrrTestProgram):
       logging.exception(e)
 
   def setUp(self):
+    super(SeleniumTestProgram, self).setUp()
+    # Select a free port
+    port = portpicker.PickUnusedPort()
+    logging.info("Picked free AdminUI port %d.", port)
 
     # Start up a server in another thread
-    self.trd = runtests.DjangoThread()
-    self.trd.start()
-    self.SetupSelenium()
+    self.trd = runtests.DjangoThread(port)
+    self.trd.StartAndWaitUntilServing()
+    self.SetupSelenium(port)
 
   def tearDown(self):
-    self.trd.Stop()
+    super(SeleniumTestProgram, self).tearDown()
     self.TearDownSelenium()
 
 
 def main(argv):
   # Run the full test suite
-  SeleniumTestProgram(argv=argv)
+  SeleniumTestProgram(argv=argv, testLoader=SeleniumTestLoader())
 
 if __name__ == "__main__":
   flags.StartMain(main)

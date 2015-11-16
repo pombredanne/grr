@@ -9,74 +9,73 @@ from grr.gui.plugins import hunt_view
 
 from grr.lib import access_control
 from grr.lib import aff4
+from grr.lib import config_lib
 from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib import utils
+
+from grr.lib.rdfvalues import client as rdf_client
 
 
 class UnauthorizedRenderer(renderers.TemplateRenderer):
   """Send UnauthorizedAccess Exceptions to the queue."""
 
-  layout_template = renderers.Template("""
-<script>
-  var subject = null;
-  {% if this.subject %}
-  subject = "{{this.subject|escapejs}}";
-  {% endif %}
-  grr.publish("unauthorized", subject, "{{this.message|escapejs}}");
-  grr.publish("grr_messages", "{{this.message|escapejs}}");
-</script>
-""")
-
   def Layout(self, request, response, exception=None):
+    subject = message = ""
+
     exception = exception or request.REQ.get("e", "")
     if exception:
-      self.subject = exception.subject
-      self.message = str(exception)
+      subject = str(exception.subject)
+      message = str(exception)
 
-    return super(UnauthorizedRenderer, self).Layout(request, response)
+    response = super(UnauthorizedRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "UnauthorizedRenderer.Layout",
+                               subject=subject, message=message)
 
 
 class ACLDialog(renderers.TemplateRenderer):
   """Render the ACL dialogbox."""
 
   layout_template = renderers.Template("""
-<div id="acl_dialog" class="modal hide" tabindex="-1" role="dialog"
+<div id="acl_dialog" class="modal" tabindex="-1" role="dialog"
   aria-hidden="true">
-
-  <div class="modal-header">
-    <button type="button" class="close" data-dismiss="modal" aria-hidden="true">
-      x
-    </button>
-    <h3>Authorization Required</h3>
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <button type="button" class="close" data-dismiss="modal"
+          aria-hidden="true">
+          x
+        </button>
+        <h3>Authorization Required</h3>
+      </div>
+      <div class="modal-body">
+        <p class="text-info">The server requires authorization to access this
+          resource
+        <div id="acl_form"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="acl_dialog_submit" name="Submit" class="btn btn-success">
+          Submit</button>
+        <button class="btn btn-default" data-dismiss="modal" name="Close"
+          aria-hidden="true">
+          Close
+        </button>
+      </div>
+    </div>
   </div>
-  <div class="modal-body">
-    <p class="text-info">The server requires authorization to access this
-      resource
-    <div id="acl_form"></div>
-  </div>
-  <div class="modal-footer">
-    <button id="acl_dialog_submit" name="Submit" class="btn btn-success">
-      Submit</button>
-    <button class="btn" data-dismiss="modal" name="Close" aria-hidden="true">
-      Close</button>
-  </div>
-
 </div>
-
-<script>
-$("#acl_dialog_submit").click(function (event) {
-  $("#acl_form form").submit();
-});
-
-grr.subscribe("unauthorized", function(subject, message) {
-  if (subject) {
-    grr.layout("CheckAccess", "acl_form", {subject: subject});
-  };
-}, "acl_dialog");
-
-</script>
 """)
+
+  def Layout(self, request, response, exception=None):
+    response = super(ACLDialog, self).Layout(request, response)
+    return self.CallJavascript(response, "ACLDialog.Layout")
+
+
+def _GetEmailCCAddress(request):
+  if request.REQ.get("cc_approval"):
+    return config_lib.CONFIG.Get("Email.approval_optional_cc_address")
+  else:
+    return None
 
 
 class ClientApprovalRequestRenderer(renderers.TemplateRenderer):
@@ -91,6 +90,7 @@ Client Access Request created. Please try again once an approval is granted.
     subject = request.REQ.get("subject")
     reason = request.REQ.get("reason")
     approver = request.REQ.get("approver")
+    keepalive = bool(request.REQ.get("keepalive"))
 
     client_id, _ = rdfvalue.RDFURN(subject).Split(2)
 
@@ -102,7 +102,12 @@ Client Access Request created. Please try again once an approval is granted.
                              flow_name="RequestClientApprovalFlow",
                              reason=reason, approver=approver,
                              token=request.token,
-                             subject_urn=rdfvalue.ClientURN(client_id))
+                             email_cc_address=_GetEmailCCAddress(request),
+                             subject_urn=rdf_client.ClientURN(client_id))
+
+    if keepalive:
+      flow.GRRFlow.StartFlow(client_id=client_id, flow_name="KeepAlive",
+                             duration=3600, token=request.token)
 
     super(ClientApprovalRequestRenderer, self).Layout(request, response)
 
@@ -125,6 +130,7 @@ Hunt Access Request created. Please try again once an approval is granted.
       flow.GRRFlow.StartFlow(flow_name="RequestHuntApprovalFlow",
                              reason=reason, approver=approver,
                              token=request.token,
+                             email_cc_address=_GetEmailCCAddress(request),
                              subject_urn=rdfvalue.RDFURN(subject))
     super(HuntApprovalRequestRenderer, self).Layout(request, response)
 
@@ -147,6 +153,7 @@ Cron Job Access Request created. Please try again once an approval is granted.
       flow.GRRFlow.StartFlow(flow_name="RequestCronJobApprovalFlow",
                              reason=reason, approver=approver,
                              token=request.token,
+                             email_cc_address=_GetEmailCCAddress(request),
                              subject_urn=rdfvalue.RDFURN(subject))
     super(CronJobApprovalRequestRenderer, self).Layout(request, response)
 
@@ -164,7 +171,7 @@ class ClientApprovalDetailsRenderer(fileview.HostInformation):
     # We skip the direct super class to avoid the access control check.
     super(fileview.HostInformation, self).Layout(
         request, response, client_id=client_id,
-        aff4_path=rdfvalue.RDFURN(client_id))
+        aff4_path=rdf_client.ClientURN(client_id))
 
 
 class HuntApprovalDetailsRenderer(hunt_view.HuntOverviewRenderer):
@@ -205,37 +212,19 @@ class GrantAccess(fileview.HostInformation):
   <blockquote>
     {{this.reason|escape}}
   </blockquote>
-  <p>Details:</p>
-  <div id="details_{{unique|escape}}" class="well"></div>
-
   <button id="{{unique|escape}}_approve" class="btn btn-success">
     Approve
   </button>
+  <h3>{{this.detail_header|escape}}</h3>
+  <div id="details_{{unique|escape}}" class="well"></div>
 </div>
-
-<script>
-  $("#{{unique|escapejs}}_approve").click(function () {
-    grr.update("{{renderer|escapejs}}", "{{unique|escapejs}}_container", {
-      acl: "{{this.acl|escapejs}}",
-    });
-  });
-  grr.layout("{{this.details_renderer|escapejs}}",
-    "details_{{unique|escapejs}}",
-    { acl: "{{this.acl|escapejs}}" });
-</script>
 """)
 
   ajax_template = renderers.Template("""
 You have granted access for {{this.subject|escape}} to {{this.user|escape}}
 """)
 
-  refresh_from_hash_template = renderers.Template("""
-<script>
-  var state = grr.parseHashState();
-  state.source = 'hash';
-  grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}", state);
-</script>
-""")
+  detail_header = "Details"
 
   def Layout(self, request, response):
     """Launch the RequestApproval flow on the backend."""
@@ -244,9 +233,11 @@ You have granted access for {{this.subject|escape}} to {{this.user|escape}}
     source = request.REQ.get("source")
 
     if self.acl is None and source != "hash":
-      return renderers.TemplateRenderer.Layout(
-          self, request, response,
-          apply_template=self.refresh_from_hash_template)
+      # NOTE: we have to pass id explicitly because super().Layout() wasn't
+      # called yet, and therefore self.id is None.
+      return self.CallJavascript(response, "GrantAccess.RefreshFromHash",
+                                 renderer=self.__class__.__name__,
+                                 id=request.REQ.get("id", hash(self)))
 
     # There is a bug in Firefox that strips trailing "="s from get parameters
     # which is a problem with the base64 padding. To pass the selenium tests,
@@ -264,12 +255,15 @@ You have granted access for {{this.subject|escape}} to {{this.user|escape}}
     if namespace == "hunts":
       self.details_renderer = "HuntApprovalDetailsRenderer"
       self.user = components[3]
+      self.detail_header = "Hunt Information"
     elif namespace == "cron":
       self.details_renderer = "CronJobApprovalDetailsRenderer"
       self.user = components[3]
+      self.detail_header = "Cronjob Information"
     elif aff4.AFF4Object.VFSGRRClient.CLIENT_ID_RE.match(namespace):
       self.details_renderer = "ClientApprovalDetailsRenderer"
       self.user = components[2]
+      self.detail_header = "Client Information"
     else:
       raise access_control.UnauthorizedAccess(
           "Approval object is not well formed.")
@@ -279,7 +273,11 @@ You have granted access for {{this.subject|escape}} to {{this.user|escape}}
 
     self.user = username
     self.reason = approval_request.Get(approval_request.Schema.REASON)
-    return renderers.TemplateRenderer.Layout(self, request, response)
+    response = renderers.TemplateRenderer.Layout(self, request, response)
+    return self.CallJavascript(response, "GrantAccess.Layout",
+                               renderer=self.__class__.__name__,
+                               acl=self.acl,
+                               details_renderer=self.details_renderer)
 
   def RenderAjax(self, request, response):
     """Run the flow for granting access."""
@@ -325,7 +323,7 @@ You have granted access for {{this.subject|escape}} to {{this.user|escape}}
       flow.GRRFlow.StartFlow(client_id=client_id,
                              flow_name="GrantClientApprovalFlow",
                              reason=self.reason, delegate=self.user,
-                             subject_urn=rdfvalue.ClientURN(self.subject),
+                             subject_urn=rdf_client.ClientURN(self.subject),
                              token=request.token)
     else:
       raise access_control.UnauthorizedAccess(
@@ -337,6 +335,8 @@ You have granted access for {{this.subject|escape}} to {{this.user|escape}}
 
 class CheckAccess(renderers.TemplateRenderer):
   """Check the level of access the user has for a specified client."""
+
+  show_keepalive_option = False
 
   # Allow the user to request access to the client.
   layout_template = renderers.Template("""
@@ -350,70 +350,49 @@ class CheckAccess(renderers.TemplateRenderer):
 {% endif %}
 <h3>Create a new approval request.</h3>
 <form id="acl_form_{{unique|escape}}" class="form-horizontal acl-form">
-  <div class="control-group">
+  <div class="form-group">
     <label class="control-label" for="acl_approver">Approvers</label>
     <div class="controls">
-      <input type="text" id="acl_approver"
+      <input type="text" id="acl_approver" class="form-control"
         placeholder="approver1,approver2,approver3" />
     </div>
   </div>
-  <div class="control-group">
-    <label class="control-label" for="acl_reason">Reason</label>
+  {% if this.cc_address %}
+  <div class="form-group">
     <div class="controls">
-      <input type=text id="acl_reason" />
+      <input id="acl_cc_approval" type=checkbox class="unset"
+       name="cc_approval" value="yesplease" class="form-control" checked />
+      <label for="acl_cc_approval">CC {{this.cc_address}}</label>
     </div>
   </div>
-  <div id="acl_reason_warning" class="alert alert-error hide">
+  {% endif %}
+  <div class="form-group">
+    <label class="control-label" for="acl_recent_reasons">Reason</label>
+    <div class="controls">
+      <select id="acl_recent_reasons" class="form-control">
+        <option value="new_reason">Enter New Reason...</option>
+      </select>
+    </div>
+  </div>
+  <div class="form-group">
+    <label class="control-label" for="acl_reason"></label>
+    <div class="controls">
+      <input type="text" id="acl_reason" class="form-control" />
+    </div>
+  </div>
+  <div id="acl_reason_warning" class="alert alert-danger hide">
     Please enter the reason.
   </div>
+  {% if this.show_keepalive_option %}
+  <div class="form-group">
+    <div class="controls">
+      <input id="acl_keepalive" type=checkbox class="unset"
+       name="keepalive" value="yesplease" class="form-control" />
+      <label for="acl_keepalive">Keep this client alive as soon as it comes online.</label>
+    </div>
+  </div>
+  {% endif %}
 </form>
-
-<script>
-(function() {
-
-$("#acl_form_{{unique|escapejs}}").submit(function (event) {
-  if ($.trim($("#acl_reason").val()) == "") {
-    $("#acl_reason_warning").show();
-    event.preventDefault();
-    return;
-  }
-
-  var state = {
-    subject: "{{this.subject|escapejs}}",
-    approver: $("#acl_approver").val(),
-    reason: $("#acl_reason").val()
-  };
-
-  // When we complete the request refresh to the main screen.
-  grr.layout("{{this.approval_renderer|escapejs}}", "acl_server_message", state,
-    function () {
-      {% if this.refresh_after_form_submit %}
-        window.location = "/";
-      {% else %}
-        $("#acl_dialog").modal("hide");
-      {% endif %}
-    });
-
-  event.preventDefault();
-});
-
-if ($("#acl_dialog[aria-hidden=false]").size() == 0) {
-
-$("#acl_dialog").detach().appendTo('body');
-
-// TODO(mbushkov): cleanup a bit. We use update_on_show attribute in
-// NewHunt wizard to avoid reloading the modal when it's hidden and shown
-// again because ACL dialog interrupted the UI flow.
-var openedModal = $(".modal[aria-hidden=false]");
-openedModal.attr("update_on_show", "false");
-openedModal.modal("hide");
-
-// Allow the user to request access through the dialog.
-$("#acl_dialog").modal('toggle');
-}
-
-})();
-</script>
 """)
 
   silent_template = renderers.Template("""
@@ -423,17 +402,6 @@ Authorization request ({{this.reason|escape}}) failed:
 {{this.error|escape}}
 </p>
 {% endif %}
-""")
-
-  # This will be shown when the user already has access.
-  access_ok_template = renderers.Template("""
-<script>
-  grr.publish("hash_state", "reason", "{{this.reason|escapejs}}");
-  grr.state.reason = "{{this.reason|escapejs}}";
-  {% if not this.silent %}
-    grr.publish("client_selection", grr.state.client_id);
-  {% endif %}
-</script>
 """)
 
   def CheckObjectAccess(self, object_urn, token):
@@ -447,7 +415,9 @@ Authorization request ({{this.reason|escape}}) failed:
 
     if approved_token:
       self.reason = approved_token.reason
-      self.layout_template = self.access_ok_template
+      return True
+    else:
+      return False
 
   def Layout(self, request, response):
     """Checks the level of access the user has to this client."""
@@ -466,7 +436,12 @@ Authorization request ({{this.reason|escape}}) failed:
 
     subject_urn = rdfvalue.RDFURN(self.subject)
     namespace, _ = subject_urn.Split(2)
-    self.CheckObjectAccess(subject_urn, token)
+    if self.CheckObjectAccess(subject_urn, token):
+      return self.CallJavascript(response, "CheckAccess.AccessOk",
+                                 reason=self.reason,
+                                 silent=self.silent)
+
+    self.cc_address = config_lib.CONFIG["Email.approval_optional_cc_address"]
 
     if namespace == "hunts":
       self.approval_renderer = "HuntApprovalRequestRenderer"
@@ -476,9 +451,17 @@ Authorization request ({{this.reason|escape}}) failed:
       self.refresh_after_form_submit = False
     elif aff4.AFF4Object.VFSGRRClient.CLIENT_ID_RE.match(namespace):
       self.approval_renderer = "ClientApprovalRequestRenderer"
+      self.show_keepalive_option = True
     else:
       raise RuntimeError(
           "Unexpected namespace for access check: %s (subject=%s)." %
           (namespace, self.subject))
 
-    return super(CheckAccess, self).Layout(request, response)
+    response = super(CheckAccess, self).Layout(request, response)
+    if not self.silent:
+      return self.CallJavascript(
+          response, "CheckAccess.Layout", subject=self.subject,
+          refresh_after_form_submit=self.refresh_after_form_submit,
+          approval_renderer=self.approval_renderer)
+    else:
+      return response

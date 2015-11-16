@@ -17,8 +17,11 @@ config_lib.DEFINE_string("MemoryDriver.driver_display_name",
                          "%(Client.name) Pmem",
                          "The SCCM display name for the driver.")
 
-config_lib.DEFINE_string("MemoryDriver.aff4_path", "",
-                         "The AFF4 path to the driver object.")
+config_lib.DEFINE_list("MemoryDriver.driver_files", [],
+                       "The default drivers to use.")
+
+config_lib.DEFINE_list("MemoryDriver.aff4_paths", [],
+                       "The AFF4 paths to the driver objects.")
 
 config_lib.DEFINE_string("MemoryDriver.device_path", r"\\\\.\\pmem",
                          "The device path which the client will open after "
@@ -59,6 +62,16 @@ config_lib.DEFINE_string(
              "%(ClientBuilder.output_extension)"),
     help="The location of the generated installer in the config directory.")
 
+config_lib.DEFINE_string(
+    name="ClientBuilder.output_extension",
+    default=None,
+    help="The file extension for the client (OS dependent).")
+
+config_lib.DEFINE_string(
+    name="ClientBuilder.package_dir",
+    default=None,
+    help="OSX package name.")
+
 
 class PathTypeInfo(type_info.String):
   """A path to a file or a directory."""
@@ -86,37 +99,58 @@ config_lib.DEFINE_option(PathTypeInfo(
     help="Path to the main pyinstaller.py file."))
 
 config_lib.DEFINE_string(
+    name="PyInstaller.distorm_lib",
+    help="The name of the distorm library in this system.",
+    default="libdistorm3.so")
+
+config_lib.DEFINE_string(
     name="PyInstaller.spec",
     help="The spec file contents to use for building the client.",
     default=r"""
+import os
+import distorm3
+
 # By default build in one dir mode.
+client_path = os.path.join\(r"%(%(ClientBuilder.source)|fixpathsep)", "grr", "client", "client.py"\)
 a = Analysis\(
-    ["%(%(ClientBuilder.source)|unixpath)/grr/client/client.py"],
+    [client_path],
     hiddenimports=[],
     hookspath=None\)
+
+# Remove some optional libraries that would be packed but serve no purpose.
+for prefix in ["IPython"]:
+  for collection in [a.binaries, a.datas, a.pure]:
+    for item in collection[:]:
+      if item[0].startswith\(prefix\):
+        collection.remove\(item\)
+
+# Workaround for distorm conditional imports
+    LIBDISTORM3 = os.path.join\(distorm3.__path__[0], r"%(PyInstaller.distorm_lib)"\)
+
 pyz = PYZ\(
     a.pure\)
 exe = EXE\(
     pyz,
     a.scripts,
     exclude_binaries=1,
-    name='build/grr-client',
+    name=os.path.join\("build", "grr-client"\),
     debug=False,
     strip=False,
     upx=False,
     console=True,
-    version='%(PyInstaller.build_dir)/version.txt',
-    icon='%(PyInstaller.build_dir)/grr.ico'\)
+    version=os.path.join\(r"%(PyInstaller.build_dir)", "version.txt"\),
+    icon=os.path.join\(r"%(PyInstaller.build_dir)", "grr.ico"\)\)
 
 coll = COLLECT\(
     exe,
-    a.binaries,
+    a.binaries + [\(os.path.join\("distorm3", r"%(PyInstaller.distorm_lib)"\), LIBDISTORM3, "BINARY"\)],
     a.zipfiles,
     a.datas,
     strip=False,
     upx=False,
-    name='grr-client'
-\)""")
+    name="grr-client"
+\)
+""")
 
 config_lib.DEFINE_string(
     name="PyInstaller.distpath",
@@ -175,12 +209,27 @@ config_lib.DEFINE_bytes(
 
 config_lib.DEFINE_string(
     "PyInstaller.build_dir",
-    "./build",
-    "The path to the build directory.")
+    default="%(ClientBuilder.build_root_dir)/%(ClientBuilder.build_dest)",
+    help="The path to the build directory.")
+
+config_lib.DEFINE_string(
+    "PyInstaller.dpkg_root",
+    default="%(ClientBuilder.build_root_dir)/dist",
+    help="Pyinstaller dpkg root.")
+
+config_lib.DEFINE_string(
+    "PyInstaller.workpath_dir",
+    default="%(ClientBuilder.build_root_dir)/workpath",
+    help="Pyinstaller working directory.")
+
+config_lib.DEFINE_string(
+    name="Client.prefix", default="",
+    help="A prefix for the client name, usually dbg_ for debug builds.")
 
 config_lib.DEFINE_string(
     name="ClientBuilder.output_basename",
-    default="%(Client.name)_%(Client.version_string)_%(Client.arch)",
+    default=("%(Client.prefix)%(Client.name)_"
+             "%(Client.version_string)_%(Client.arch)"),
     help="The base name of the output package.")
 
 # Windows client specific options.
@@ -205,15 +254,26 @@ config_lib.DEFINE_string(name="ClientBuilder.template_extension",
                          help="The extension to appear on templates.")
 
 config_lib.DEFINE_string(
+    "ClientBuilder.make_command",
+    default="make",
+    help="The make command.")
+
+config_lib.DEFINE_string(
     name="PyInstaller.template_basename",
-    default=("grr-client_%(Client.version_string)_%(Client.arch)"),
+    default=("%(Client.name)_%(Client.version_string)_%(Client.arch)"),
     help="The template name of the output package.")
+
+config_lib.DEFINE_string(
+    name="PyInstaller.template_filename",
+    default=(
+        "%(PyInstaller.template_basename)%(ClientBuilder.template_extension)"),
+    help="The template file name of the output package.")
 
 config_lib.DEFINE_option(type_info.PathTypeInfo(
     name="ClientBuilder.template_path", must_exist=False,
     default=(
         "%(ClientBuilder.executables_path)/%(Client.platform)/templates/"
-        "%(PyInstaller.template_basename)%(ClientBuilder.template_extension)"),
+        "%(PyInstaller.template_filename)"),
     help="The full path to the executable template file."))
 
 config_lib.DEFINE_option(type_info.PathTypeInfo(
@@ -222,11 +282,16 @@ config_lib.DEFINE_option(type_info.PathTypeInfo(
     help="The path to the grr executables directory."))
 
 config_lib.DEFINE_option(type_info.PathTypeInfo(
+    name="ClientBuilder.output_filename", must_exist=False,
+    default=(
+        "%(ClientBuilder.output_basename)%(ClientBuilder.output_extension)"),
+    help="The filename of the generated installer file."))
+
+config_lib.DEFINE_option(type_info.PathTypeInfo(
     name="ClientBuilder.output_path", must_exist=False,
     default=(
         "%(ClientBuilder.executables_path)/%(Client.platform)"
-        "/installers/%(ClientBuilder.output_basename)"
-        "%(ClientBuilder.output_extension)"),
+        "/installers/%(ClientBuilder.output_filename)"),
     help="The full path to the generated installer file."))
 
 config_lib.DEFINE_option(type_info.PathTypeInfo(
@@ -269,7 +334,7 @@ config_lib.DEFINE_list(
 
 config_lib.DEFINE_string(
     name="ClientBuilder.client_logging_filename",
-    default="%(Logging.path)/GRRlog.txt",
+    default="%(Logging.path)/%(Client.name)_log.txt",
     help="Filename for logging, to be copied to Client section in the client "
     "that gets built.")
 
@@ -345,3 +410,86 @@ config_lib.DEFINE_string(
     default=("/Developer/Applications/Utilities/PackageMaker.app/Contents"
              "/MacOS/PackageMaker"),
     help="Location of the PackageMaker executable.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.vs_arch",
+    default=None,
+    help="Visual studio architecture string.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.vs_env_script",
+    default=None,
+    help="Path to visual studio environment variables bat file.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.vs_dir",
+    default=None,
+    help="Path to visual studio installation dir.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.build_root_dir",
+    default=None,
+    help="Root directory for client builds.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.build_dest",
+    default="%(Client.name)-build",
+    help="Output directory for client building.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.install_dir",
+    default=None,
+    help="Target installation directory for client builds.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.mangled_output_basename",
+    default=None,
+    help="OS X package maker mangled name.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.package_maker_organization",
+    default=None,
+    help="OS X package maker organization name.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.package_maker_path",
+    default=None,
+    help="Path to OS X package maker binary.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.target_dir",
+    default=None,
+    help="ClientBuilder target directory.")
+
+config_lib.DEFINE_string(
+    "ClientBuilder.daemon_link",
+    default=None,
+    help="ClientBuilder daemon link.")
+
+# These options will be used by client.client_build when running buildanddeploy
+# and can be used to customize what is built for each client label.
+config_lib.DEFINE_multichoice(
+    name="ClientBuilder.target_platforms",
+    default=[],
+    choices=["darwin_amd64_dmg", "linux_amd64_deb", "linux_i386_deb",
+             "linux_amd64_rpm", "linux_i386_rpm", "windows_amd64_exe",
+             "windows_i386_exe"],
+    help="Platforms that will be built by client_build buildanddeploy")
+
+config_lib.DEFINE_list(name="ClientBuilder.BuildTargets", default=[],
+                       help="List of context names that should be built by "
+                       "buildanddeploy")
+
+config_lib.DEFINE_string("ClientBuilder.windows_signing_key",
+                         default="/etc/alternatives/grr_windows_signing_key",
+                         help="Path to GRR signing key. Should symlink "
+                         "to actual key.")
+
+config_lib.DEFINE_string("ClientBuilder.windows_signing_cert",
+                         default="/etc/alternatives/grr_windows_signing_cert",
+                         help="Path to GRR signing cert. Should symlink "
+                         "to actual cert.")
+
+config_lib.DEFINE_string("ClientBuilder.windows_signing_application_name",
+                         default="GRR",
+                         help="Signing cert application name.")

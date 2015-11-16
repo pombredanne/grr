@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """Implement low level disk access using the sleuthkit."""
 
 
@@ -10,8 +9,9 @@ import pytsk3
 
 from grr.client import client_utils
 from grr.client import vfs
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 class CachedFilesystem(object):
@@ -25,11 +25,16 @@ class CachedFilesystem(object):
 class MyImgInfo(pytsk3.Img_Info):
   """An Img_Info class using the regular python file handling."""
 
-  def __init__(self, fd=None):
+  def __init__(self, fd=None, progress_callback=None):
     pytsk3.Img_Info.__init__(self)
+    self.progress_callback = progress_callback
     self.fd = fd
 
   def read(self, offset, length):  # pylint: disable=g-bad-name
+    # Sleuthkit operations might take a long time so we periodically call the
+    # progress indicator callback as long as there are still data reads.
+    if self.progress_callback:
+      self.progress_callback()
     self.fd.seek(offset)
     return self.fd.read(length)
 
@@ -43,7 +48,7 @@ class MyImgInfo(pytsk3.Img_Info):
 class TSKFile(vfs.VFSHandler):
   """Read a regular file."""
 
-  supported_pathtype = rdfvalue.PathSpec.PathType.TSK
+  supported_pathtype = rdf_paths.PathSpec.PathType.TSK
   auto_register = True
 
   # A mapping to encode TSK types to a stat.st_mode
@@ -56,7 +61,7 @@ class TSKFile(vfs.VFSHandler):
       pytsk3.TSK_FS_NAME_TYPE_REG: stat.S_IFREG,
       pytsk3.TSK_FS_NAME_TYPE_LNK: stat.S_IFLNK,
       pytsk3.TSK_FS_NAME_TYPE_SOCK: stat.S_IFSOCK,
-      }
+  }
 
   META_TYPE_LOOKUP = {
       pytsk3.TSK_FS_META_TYPE_BLK: 0,
@@ -66,7 +71,7 @@ class TSKFile(vfs.VFSHandler):
       pytsk3.TSK_FS_META_TYPE_LNK: stat.S_IFLNK,
       pytsk3.TSK_FS_META_TYPE_REG: stat.S_IFREG,
       pytsk3.TSK_FS_META_TYPE_SOCK: stat.S_IFSOCK,
-      }
+  }
 
   # Files we won't return in directories.
   BLACKLIST_FILES = ["$OrphanFiles"  # Special TSK dir that invokes processing.
@@ -78,16 +83,27 @@ class TSKFile(vfs.VFSHandler):
   # NTFS files carry an attribute identified by ntfs_type and ntfs_id.
   tsk_attribute = None
 
-  def __init__(self, base_fd, pathspec=None):
+  # This is all bits that define the type of the file in the stat mode. Equal to
+  # 0b1111000000000000.
+  stat_type_mask = (stat.S_IFREG | stat.S_IFDIR | stat.S_IFLNK | stat.S_IFBLK |
+                    stat.S_IFCHR | stat.S_IFIFO | stat.S_IFSOCK)
+
+  def __init__(self, base_fd, pathspec=None, progress_callback=None,
+               full_pathspec=None):
     """Use TSK to read the pathspec.
 
     Args:
       base_fd: The file like object we read this component from.
       pathspec: An optional pathspec to open directly.
+      progress_callback: A callback to indicate that the open call is still
+                         working but needs more time.
+      full_pathspec: The full pathspec we are trying to open.
     Raises:
       IOError: If the file can not be opened.
     """
-    super(TSKFile, self).__init__(base_fd, pathspec=pathspec)
+    super(TSKFile, self).__init__(base_fd, pathspec=pathspec,
+                                  progress_callback=progress_callback,
+                                  full_pathspec=full_pathspec)
     if self.base_fd is None:
       raise IOError("TSK driver must have a file base.")
 
@@ -112,12 +128,9 @@ class TSKFile(vfs.VFSHandler):
       # know what to do with it.
       raise IOError("Unable to parse base using Sleuthkit.")
 
-    # This is the path we try to open.
-    self.tsk_path = self.pathspec.last.path
-
     # If we are successful in opening this path below the path casing is
     # correct.
-    self.pathspec.last.path_options = rdfvalue.PathSpec.Options.CASE_LITERAL
+    self.pathspec.last.path_options = rdf_paths.PathSpec.Options.CASE_LITERAL
 
     fd_hash = self.tsk_raw_device.pathspec.SerializeToString()
 
@@ -126,7 +139,8 @@ class TSKFile(vfs.VFSHandler):
       self.filesystem = vfs.DEVICE_CACHE.Get(fd_hash)
       self.fs = self.filesystem.fs
     except KeyError:
-      self.img = MyImgInfo(fd=self.tsk_raw_device)
+      self.img = MyImgInfo(fd=self.tsk_raw_device,
+                           progress_callback=progress_callback)
 
       self.fs = pytsk3.FS_Info(self.img, 0)
       self.filesystem = CachedFilesystem(self.fs, self.img)
@@ -170,7 +184,7 @@ class TSKFile(vfs.VFSHandler):
       yield utils.SmartUnicode(f.info.name.name)
 
   def MakeStatResponse(self, tsk_file, tsk_attribute=None, append_name=False):
-    """Given a TSK info object make a StatResponse.
+    """Given a TSK info object make a StatEntry.
 
     Note that tsk uses two things to uniquely identify a data stream - the inode
     object given in tsk_file and the attribute object which may correspond to an
@@ -187,14 +201,22 @@ class TSKFile(vfs.VFSHandler):
         pathspec.
 
     Returns:
-      A StatResponse protobuf which can be used to re-open this exact VFS node.
+      A StatEntry which can be used to re-open this exact VFS node.
     """
     info = tsk_file.info
-    response = rdfvalue.StatEntry()
+    response = rdf_client.StatEntry()
     meta = info.meta
     if meta:
       response.st_ino = meta.addr
-      for attribute in "mode nlink uid gid size atime mtime ctime".split():
+      for attribute in ["mode",
+                        "nlink",
+                        "uid",
+                        "gid",
+                        "size",
+                        "atime",
+                        "mtime",
+                        "ctime",
+                        "crtime"]:
         try:
           value = int(getattr(meta, attribute))
           if value < 0: value &= 0xFFFFFFFF
@@ -219,6 +241,19 @@ class TSKFile(vfs.VFSHandler):
 
       # Update the size with the attribute size.
       response.st_size = tsk_attribute.info.size
+
+      default = rdf_paths.PathSpec.tsk_fs_attr_type.TSK_FS_ATTR_TYPE_DEFAULT
+      last = child_pathspec.last
+      if last.ntfs_type != default or last.ntfs_id:
+        # This is an ads and should be treated as a file.
+        # Clear all file type bits.
+        response.st_mode &= ~self.stat_type_mask
+        response.st_mode |= stat.S_IFREG
+
+    else:
+      child_pathspec.last.ntfs_type = None
+      child_pathspec.last.ntfs_id = None
+      child_pathspec.last.stream_name = None
 
     if name:
       # Encode the type onto the st_mode response
@@ -283,16 +318,29 @@ class TSKFile(vfs.VFSHandler):
       raise IOError("%s is not a directory" % self.pathspec.CollapsePath())
 
   def IsDirectory(self):
+    last = self.pathspec.last
+    default = rdf_paths.PathSpec.tsk_fs_attr_type.TSK_FS_ATTR_TYPE_DEFAULT
+    if last.ntfs_type != default or last.ntfs_id:
+      # This is an ads so treat as a file.
+      return False
+
     return self.fd.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR
 
   def IsFile(self):
+    last = self.pathspec.last
+    default = rdf_paths.PathSpec.tsk_fs_attr_type.TSK_FS_ATTR_TYPE_DEFAULT
+    if last.ntfs_type != default or last.ntfs_id:
+      # This is an ads so treat as a file.
+      return True
+
     return self.fd.info.meta.type == pytsk3.TSK_FS_META_TYPE_REG
 
   @classmethod
-  def Open(cls, fd, component, pathspec):
+  def Open(cls, fd, component, pathspec=None, progress_callback=None,
+           full_pathspec=None):
     # A Pathspec which starts with TSK means we need to resolve the mount point
     # at runtime.
-    if fd is None and component.pathtype == rdfvalue.PathSpec.PathType.TSK:
+    if fd is None and component.pathtype == rdf_paths.PathSpec.PathType.TSK:
       # We are the top level handler. This means we need to check the system
       # mounts to work out the exact mount point and device we need to
       # open. We then modify the pathspec so we get nested in the raw
@@ -318,8 +366,11 @@ class TSKFile(vfs.VFSHandler):
 
     # If an inode is specified, just use it directly.
     elif component.HasField("inode"):
-      return TSKFile(fd, component)
+      return TSKFile(fd, component, progress_callback=progress_callback,
+                     full_pathspec=full_pathspec)
 
     # Otherwise do the usual case folding.
     else:
-      return vfs.VFSHandler.Open(fd, component, pathspec)
+      return vfs.VFSHandler.Open(fd, component, pathspec=pathspec,
+                                 progress_callback=progress_callback,
+                                 full_pathspec=full_pathspec)

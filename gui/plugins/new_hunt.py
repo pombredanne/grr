@@ -2,19 +2,24 @@
 """Implementation of "New Hunt" wizard."""
 
 
-import logging
 import os
 
+import logging
 
 from grr.gui import renderers
 from grr.gui.plugins import flow_management
 from grr.gui.plugins import forms
 from grr.gui.plugins import wizards
+from grr.lib import aff4
+from grr.lib import config_lib
 from grr.lib import flow
-from grr.lib import rdfvalue
-
+from grr.lib import flow_runner
+from grr.lib import output_plugin
+from grr.lib import type_info
 from grr.lib.hunts import implementation
-from grr.lib.hunts import output_plugins
+from grr.lib.hunts import standard
+from grr.lib.rdfvalues import aff4_rdfvalues
+from grr.lib.rdfvalues import foreman as rdf_foreman
 
 
 class HuntArgsParser(object):
@@ -35,9 +40,9 @@ class HuntArgsParser(object):
 
     for option in ConfigureHuntRules().ParseArgs(self.request):
       # Options can be either regex or integer rules.
-      if option.__class__ is rdfvalue.ForemanAttributeRegex:
+      if option.__class__ is rdf_foreman.ForemanAttributeRegex:
         hunt_runner_args.regex_rules.Append(option)
-      elif option.__class__ is rdfvalue.ForemanAttributeInteger:
+      elif option.__class__ is rdf_foreman.ForemanAttributeInteger:
         hunt_runner_args.integer_rules.Append(option)
 
   def ParseFlowArgs(self):
@@ -55,7 +60,7 @@ class HuntArgsParser(object):
         flow_cls.args_type(), prefix="args").ParseArgs(self.request)
 
     self.flow_runner_args = forms.SemanticProtoFormRenderer(
-        flow.FlowRunnerArgs(), prefix="runner").ParseArgs(self.request)
+        flow_runner.FlowRunnerArgs(), prefix="runner").ParseArgs(self.request)
 
     self.flow_runner_args.flow_name = flow_name
 
@@ -70,7 +75,7 @@ class HuntArgsParser(object):
       return self.hunt_runner_args
 
     self.hunt_runner_args = forms.SemanticProtoFormRenderer(
-        rdfvalue.HuntRunnerArgs(), prefix="hunt_runner").ParseArgs(
+        implementation.HuntRunnerArgs(), prefix="hunt_runner").ParseArgs(
             self.request)
 
     self.hunt_runner_args.hunt_name = "GenericHunt"
@@ -87,7 +92,7 @@ class HuntArgsParser(object):
 
     flow_runner_args, flow_args = self.ParseFlowArgs()
 
-    self.hunt_args = rdfvalue.GenericHuntArgs(
+    self.hunt_args = standard.GenericHuntArgs(
         flow_runner_args=flow_runner_args,
         flow_args=flow_args,
         output_plugins=self.ParseOutputPlugins())
@@ -141,7 +146,10 @@ class HuntFlowForm(flow_management.SemanticProtoFlowForm):
 {% else %}
   <p class="text-info">Nothing to configure for the Flow.</p>
 {% endif %}
-<legend>Hunt Parameters</legend>
+<legend>Hunt Parameters
+  <a href="/help/user_manual.html#hunt-parameters" target="_blank">
+  <i class="glyphicon glyphicon-question-sign"></i></a>
+</legend>
 {{this.hunt_params_form|safe}}
 
 <legend>Description</legend>
@@ -159,7 +167,7 @@ class HuntFlowForm(flow_management.SemanticProtoFlowForm):
     self.flow_name = os.path.basename(self.flow_path)
 
     hunt_runner_form = forms.SemanticProtoFormRenderer(
-        rdfvalue.HuntRunnerArgs(), id=self.id,
+        implementation.HuntRunnerArgs(), id=self.id,
         supressions=self.suppressions, prefix="hunt_runner")
 
     self.hunt_params_form = hunt_runner_form.RawHTML(request)
@@ -182,17 +190,17 @@ class OutputPluginsForm(forms.OptionFormRenderer):
   @property
   def options(self):
     """Only include output plugins with descriptions."""
-    for name in sorted(output_plugins.HuntOutputPlugin.classes.keys()):
-      cls = output_plugins.HuntOutputPlugin.classes[name]
+    for name in sorted(output_plugin.OutputPlugin.classes.keys()):
+      cls = output_plugin.OutputPlugin.classes[name]
       if cls.description:
         yield name, cls.description
 
   def ParseOption(self, option, request):
     # Depending on the plugin we parse a different protobuf.
-    plugin = output_plugins.HuntOutputPlugin.classes.get(option)
+    plugin = output_plugin.OutputPlugin.classes.get(option)
 
     if plugin and plugin.description:
-      result = output_plugins.OutputPlugin(plugin_name=option)
+      result = output_plugin.OutputPluginDescriptor(plugin_name=option)
       result.plugin_args = forms.SemanticProtoFormRenderer(
           plugin.args_type(), id=self.id, prefix=self.prefix).ParseArgs(request)
       result.plugin_args.Validate()
@@ -201,7 +209,7 @@ class OutputPluginsForm(forms.OptionFormRenderer):
 
   def RenderOption(self, option, request, response):
     # Depending on the plugin we render a different protobuf.
-    plugin = output_plugins.HuntOutputPlugin.classes.get(option)
+    plugin = output_plugin.OutputPlugin.classes.get(option)
 
     if plugin and plugin.description:
       return forms.SemanticProtoFormRenderer(
@@ -218,6 +226,13 @@ class HuntConfigureOutputPlugins(forms.MultiFormRenderer):
   description = "Define Output Processing"
   add_one_default = False
 
+  def Layout(self, request, response):
+    response = super(HuntConfigureOutputPlugins, self).Layout(request, response)
+    return self.CallJavascript(
+        response, "HuntConfigureOutputPlugins.Layout",
+        default_output_plugin=config_lib.CONFIG[
+            "AdminUI.new_hunt_wizard.default_output_plugin"])
+
   def Validate(self, request, _):
     # Check each plugin for validity.
     parser = HuntArgsParser(request)
@@ -225,11 +240,47 @@ class HuntConfigureOutputPlugins(forms.MultiFormRenderer):
       plugin.Validate()
 
 
+class ClientLabelNameFormRenderer(forms.TypeDescriptorFormRenderer):
+  """A renderer for AFF4 object label name."""
+
+  layout_template = """<div class="form-group">
+""" + forms.TypeDescriptorFormRenderer.default_description_view + """
+<div class="controls">
+
+<select id="{{this.prefix}}" class="unset"
+  onchange="grr.forms.inputOnChange(this)"
+  >
+{% for label in this.labels %}
+   <option {% if forloop.first %}selected{% endif %}
+     value="{{label|escape}}">
+     {{label|escape}}
+   </option>
+{% endfor %}
+</select>
+</div>
+</div>
+"""
+
+  def Layout(self, request, response):
+    labels_index = aff4.FACTORY.Create(
+        standard.LabelSet.CLIENT_LABELS_URN, "LabelSet",
+        mode="r", token=request.token)
+    self.labels = sorted(list(
+        set([label.name for label in labels_index.ListUsedLabels()])))
+
+    response = super(ClientLabelNameFormRenderer, self).Layout(
+        request, response)
+    return self.CallJavascript(response,
+                               "AFF4ObjectLabelNameFormRenderer.Layout",
+                               prefix=self.prefix)
+
+
 class RuleOptionRenderer(forms.OptionFormRenderer):
   """Make a rule form based on rule type."""
   options = (("Windows", "Windows"),
              ("Linux", "Linux"),
              ("OSX", "OSX"),
+             ("Label", "Clients With Label"),
              ("Regex", "Regular Expressions"),
              ("Integer", "Integer Rule"))
 
@@ -256,16 +307,22 @@ This rule will match all <strong>{{system}}</strong> systems.
       return self.RenderFromTemplate(self.match_system_template, response,
                                      system="OSX")
 
+    elif option == "Label":
+      return self.RenderFromTemplate(
+          self.form_template, response, form=ClientLabelNameFormRenderer(
+              descriptor=type_info.TypeInfoObject(friendly_name="Label"),
+              default="", prefix=self.prefix).RawHTML(request))
+
     elif option == "Regex":
       return self.RenderFromTemplate(
           self.form_template, response, form=forms.SemanticProtoFormRenderer(
-              rdfvalue.ForemanAttributeRegex(),
+              rdf_foreman.ForemanAttributeRegex(),
               prefix=self.prefix).RawHTML(request))
 
     elif option == "Integer":
       return self.RenderFromTemplate(
           self.form_template, response, form=forms.SemanticProtoFormRenderer(
-              rdfvalue.ForemanAttributeInteger(),
+              rdf_foreman.ForemanAttributeInteger(),
               prefix=self.prefix).RawHTML(request))
 
   def ParseOption(self, option, request):
@@ -279,14 +336,25 @@ This rule will match all <strong>{{system}}</strong> systems.
     elif option == "OSX":
       return implementation.GRRHunt.MATCH_DARWIN
 
+    elif option == "Label":
+      label_name = ClientLabelNameFormRenderer(
+          descriptor=type_info.TypeInfoObject(),
+          default="", prefix=self.prefix).ParseArgs(request)
+      regex = aff4_rdfvalues.AFF4ObjectLabelsList.RegexForStringifiedValueMatch(
+          label_name)
+
+      return rdf_foreman.ForemanAttributeRegex(
+          attribute_name="Labels",
+          attribute_regex=regex)
+
     elif option == "Regex":
       return forms.SemanticProtoFormRenderer(
-          rdfvalue.ForemanAttributeRegex(),
+          rdf_foreman.ForemanAttributeRegex(),
           prefix=self.prefix).ParseArgs(request)
 
     elif option == "Integer":
       return forms.SemanticProtoFormRenderer(
-          rdfvalue.ForemanAttributeInteger(),
+          rdf_foreman.ForemanAttributeInteger(),
           prefix=self.prefix).ParseArgs(request)
 
 
@@ -314,16 +382,13 @@ class HuntInformation(renderers.TemplateRenderer):
 <div class="HuntInformation padded" id="{{unique|escape}}">
  Loading...
 </div>
-<script>
-$("#{{unique|escapejs}}").closest(".WizardPage").on('show', function () {
-  grr.update("{{renderer}}", "{{unique|escapejs}}",
-              $("#{{unique}}").closest(".FormData").data());
-});
-</script>
 """)
 
   ajax_template = renderers.Template("""
-  <h3>Hunt Parameters</h3>
+  <h3>Hunt Parameters
+    <a href="/help/user_manual.html#hunt-parameters" target="_blank">
+    <i class="glyphicon glyphicon-question-sign"></i></a>
+  </h3>
   {{this.rendered_hunt_runner_args|safe}}
 
   {{this.rendered_hunt_args|safe}}
@@ -331,6 +396,12 @@ $("#{{unique|escapejs}}").closest(".WizardPage").on('show', function () {
 
   def Validate(self, request, response):
     pass
+
+  def Layout(self, request, response, apply_template=None):
+    response = super(HuntInformation, self).Layout(
+        request, response, apply_template=apply_template)
+    return self.CallJavascript(response, "HuntInformation.Layout",
+                               renderer=self.__class__.__name__)
 
   def RenderAjax(self, request, response):
     """Layout the hunt information."""
@@ -396,6 +467,7 @@ class HuntRunStatus(HuntInformation):
 
 class NewHunt(wizards.WizardRenderer):
   """A wizard to create a new hunt."""
+  render_as_modal = False
   wizard_name = "hunt_run"
   title = "New Hunt"
   pages = [
@@ -404,4 +476,4 @@ class NewHunt(wizards.WizardRenderer):
       ConfigureHuntRules,
       HuntInformation,
       HuntRunStatus,
-      ]
+  ]

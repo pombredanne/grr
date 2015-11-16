@@ -26,14 +26,14 @@ grr.Renderer('NotificationBar', {
     $('#notification_dialog').detach().appendTo('body');
     $('#user_settings_dialog').detach().appendTo('body');
 
-    $('#notification_dialog').on('show', function() {
+    $('#notification_dialog').on('show.bs.modal', function() {
       grr.layout('ViewNotifications', 'notification_dialog_body');
       grr.publish('NotificationCount', 0);
     });
 
-    $('#user_settings_dialog').on('show', function() {
+    $('#user_settings_dialog').on('show.bs.modal', function() {
       grr.layout('UserSettingsDialog', 'user_settings_dialog');
-    }).on('hidden', function() {
+    }).on('hidden.bs.modal', function() {
       $(this).html('');
     });
   }
@@ -54,7 +54,15 @@ grr.Renderer('ViewNotifications', {
       if (node) {
         var element = node.find('a');
         if (element) {
-          grr.loadFromHash(element.attr('target_hash'));
+          if (element.attr('notification_type') == 'DownloadFile') {
+            var parsedHash = grr.parseHashState(element.attr('target_hash'));
+            var fileState = { aff4_path: parsedHash['aff4_path']};
+            grr.downloadHandler(element, fileState, false,
+                                '/render/Download/DownloadView');
+            element.trigger('download');
+          } else {
+            grr.loadFromHash(element.attr('target_hash'));
+          }
         }
       }
     }, state['unique']);

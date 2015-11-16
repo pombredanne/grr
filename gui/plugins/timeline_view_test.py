@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 # -*- mode: python; encoding: utf-8 -*-
 
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Tests for the Timeline viewer flow."""
 
 
 
-from grr.client import vfs
-
 from grr.gui import runtests_test
 
 from grr.lib import access_control
+from grr.lib import action_mocks
 from grr.lib import aff4
 from grr.lib import config_lib
 from grr.lib import flags
-from grr.lib import rdfvalue
 from grr.lib import test_lib
+from grr.lib.flows.general import timelines
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import crypto as rdf_crypto
+from grr.lib.rdfvalues import paths as rdf_paths
 
 
 class TestTimelineView(test_lib.GRRSeleniumTest):
@@ -24,35 +25,34 @@ class TestTimelineView(test_lib.GRRSeleniumTest):
   def CreateTimelineFixture(self):
     """Creates a new timeline fixture we can play with."""
     # Create a client for testing
-    client_id = rdfvalue.ClientURN("C.0000000000000001")
+    client_id = rdf_client.ClientURN("C.0000000000000001")
 
     token = access_control.ACLToken(username="test", reason="fixture")
 
     fd = aff4.FACTORY.Create(client_id, "VFSGRRClient", token=token)
     cert = self.ClientCertFromPrivateKey(
         config_lib.CONFIG["Client.private_key"])
-    client_cert = rdfvalue.RDFX509Cert(cert.as_pem())
+    client_cert = rdf_crypto.RDFX509Cert(cert.as_pem())
     fd.Set(fd.Schema.CERT(client_cert))
     fd.Close()
 
-    # Install the mock
-    vfs.VFS_HANDLERS[
-        rdfvalue.PathSpec.PathType.OS] = test_lib.ClientVFSHandlerFixture
-    client_mock = test_lib.ActionMock("ListDirectory")
-    output_path = "analysis/Timeline/MAC"
+    with test_lib.VFSOverrider(
+        rdf_paths.PathSpec.PathType.OS, test_lib.ClientVFSHandlerFixture):
+      client_mock = action_mocks.ActionMock("ListDirectory")
+      output_path = "analysis/Timeline/MAC"
 
-    for _ in test_lib.TestFlowHelper(
-        "RecursiveListDirectory", client_mock, client_id=client_id,
-        pathspec=rdfvalue.PathSpec(
-            path="/", pathtype=rdfvalue.PathSpec.PathType.OS),
-        token=token):
-      pass
+      for _ in test_lib.TestFlowHelper(
+          "RecursiveListDirectory", client_mock, client_id=client_id,
+          pathspec=rdf_paths.PathSpec(
+              path="/", pathtype=rdf_paths.PathSpec.PathType.OS),
+          token=token):
+        pass
 
-    # Now make a timeline
-    for _ in test_lib.TestFlowHelper(
-        "MACTimes", client_mock, client_id=client_id, token=token,
-        path="/", output=output_path):
-      pass
+      # Now make a timeline
+      for _ in test_lib.TestFlowHelper(
+          timelines.MACTimes.__name__, client_mock, client_id=client_id,
+          token=token, path="/", output=output_path):
+        pass
 
   def setUp(self):
     test_lib.GRRSeleniumTest.setUp(self)
@@ -66,7 +66,7 @@ class TestTimelineView(test_lib.GRRSeleniumTest):
     # Open the main page
     self.Open("/")
 
-    self.Type("client_query", "0001")
+    self.Type("client_query", "C.0000000000000001")
     self.Click("client_query_submit")
 
     self.WaitUntilEqual(u"C.0000000000000001",

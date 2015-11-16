@@ -4,25 +4,20 @@
 import copy
 import socket
 import threading
-import urllib
 from wsgiref import simple_server
 
-# pylint: disable=unused-import
-
-# pylint: disable=g-bad-import-order
-from grr.gui import admin_ui
-from grr.gui import django_lib
-# pylint: enable=g-bad-import-order
 
 import logging
 
+# pylint: disable=g-bad-import-order
+from grr.gui import django_lib
+# pylint: enable=g-bad-import-order
+
 from grr.lib import access_control
-from grr.lib import aff4
 from grr.lib import config_lib
 from grr.lib import data_store
 from grr.lib import flags
 from grr.lib import ipshell
-from grr.lib import rdfvalue
 from grr.lib import registry
 from grr.lib import startup
 from grr.lib import test_lib
@@ -32,15 +27,23 @@ class DjangoThread(threading.Thread):
   """A class to run the wsgi server in another thread."""
 
   keep_running = True
+  daemon = True
 
-  def __init__(self, **kwargs):
+  def __init__(self, port, **kwargs):
     super(DjangoThread, self).__init__(**kwargs)
-    self.base_url = "http://127.0.0.1:%d" % config_lib.CONFIG["AdminUI.port"]
+    self.base_url = "http://127.0.0.1:%d" % port
+    self.ready_to_serve = threading.Event()
+    self.port = port
+
+  def StartAndWaitUntilServing(self):
+    self.start()
+    if not self.ready_to_serve.wait(60.0):
+      raise RuntimeError("Djangothread did not initialize properly.")
 
   def run(self):
     """Run the django server in a thread."""
     logging.info("Base URL is %s", self.base_url)
-    port = config_lib.CONFIG["AdminUI.port"]
+    port = self.port
     logging.info("Django listening on port %d.", port)
     try:
       # Make a simple reference implementation WSGI server
@@ -50,18 +53,11 @@ class DjangoThread(threading.Thread):
       raise socket.error(
           "Error while listening on port %d: %s." % (port, str(e)))
 
+    # We want to notify other threads that we are now ready to serve right
+    # before we enter the serving loop.
+    self.ready_to_serve.set()
     while self.keep_running:
       server.handle_request()
-
-  def Stop(self):
-    self.keep_running = False
-    try:
-      # Force a request so the socket leaves accept()
-      urllib.urlopen(self.base_url + "/quitmenow").read()
-    except IOError:
-      pass
-
-    self.join()
 
 
 class RunTestsInit(registry.InitHook):
@@ -115,37 +111,26 @@ class TestPluginInit(registry.InitHook):
 
   def RunOnce(self):
     # pylint: disable=unused-variable,g-import-not-at-top
+    from grr.gui import gui_testonly_plugins
     from grr.gui.plugins import tests
     # pylint: enable=unused-variable,g-import-not-at-top
 
 
 def main(_):
   """Run the main test harness."""
-  # For testing we use the test config file.
-  flags.FLAGS.config = config_lib.CONFIG["Test.config"]
-
-  # We are running a test so let the config system know that.
-  config_lib.CONFIG.AddContext(
-      "Test Context",
-      "Context applied when we run tests.")
-
-  # This is a standalone program and might need to use the config
-  # file.
   startup.TestInit()
 
   # Start up a server in another thread
-  trd = DjangoThread()
-  trd.start()
-  try:
-    user_ns = dict()
-    user_ns.update(globals())
-    user_ns.update(locals())
+  trd = DjangoThread(config_lib.CONFIG["AdminUI.port"])
+  trd.StartAndWaitUntilServing()
 
-    # Wait in the shell so selenium IDE can be used.
-    ipshell.IPShell(argv=[], user_ns=user_ns)
-  finally:
-    # Kill the server thread
-    trd.Stop()
+  user_ns = dict()
+  user_ns.update(globals())
+  user_ns.update(locals())
+
+  # Wait in the shell so selenium IDE can be used.
+  ipshell.IPShell(argv=[], user_ns=user_ns)
+
 
 if __name__ == "__main__":
   flags.StartMain(main)

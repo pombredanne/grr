@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """An LL(1) lexer. This lexer is very tolerant of errors and can resync."""
 
-import logging
+
 import re
 
+import logging
 
 from grr.lib import utils
 
@@ -53,30 +54,40 @@ class Lexer(object):
   """A generic feed lexer."""
   # A list of Token() instances.
   tokens = []
-
-  # The first state
-  state = "INITIAL"
-
-  # The buffer we are parsing now
-  buffer = ""
-  error = 0
-  verbose = 0
-
-  # The index into the buffer where we are currently pointing
-  processed = 0
-  processed_buffer = ""
-
   # Regex flags
   flags = 0
 
   def __init__(self, data=""):
+    # Set the lexer up to process a new data feed.
+    self.Reset()
+    # Populate internal token list with class tokens, if defined.
+    self._tokens = self.tokens[:]
+    # Populate the lexer with any data we got.
     self.buffer = utils.SmartStr(data)
+
+  def Reset(self):
+    """Reset the lexer to process a new data feed."""
+    # The first state
+    self.state = "INITIAL"
     self.state_stack = []
+
+    # The buffer we are parsing now
+    self.buffer = ""
+    self.error = 0
+    self.verbose = 0
+
+    # The index into the buffer where we are currently pointing
+    self.processed = 0
+    self.processed_buffer = ""
 
   def NextToken(self):
     """Fetch the next token by trying to match any of the regexes in order."""
+    # Nothing in the input stream - no token can match.
+    if not self.buffer:
+      return
+
     current_state = self.state
-    for token in self.tokens:
+    for token in self._tokens:
       # Does the rule apply to us?
       if token.state_regex and not token.state_regex.match(current_state):
         continue
@@ -91,6 +102,11 @@ class Lexer(object):
 
       if self.verbose:
         logging.debug("%s matched %s", token.re_str, m.group(0))
+
+      # A token matched the empty string. We can not consume the token from the
+      # input stream.
+      if m.end() == 0:
+        raise RuntimeError("Lexer bug! Token can not match the empty string.")
 
       # The match consumes the data off the buffer (the handler can put it back
       # if it likes)
@@ -266,7 +282,8 @@ class BinaryExpression(Expression):
 
   def AddOperands(self, lhs, rhs):
     if isinstance(lhs, Expression) and isinstance(rhs, Expression):
-      self.args = [lhs, rhs]
+      self.args.insert(0, lhs)
+      self.args.append(rhs)
     else:
       raise ParseError("Expected expression, got %s %s %s" % (
           lhs, self.operator, rhs))
@@ -343,7 +360,7 @@ class SearchParser(Lexer):
 
       # Skip whitespace.
       Token(".", r"\s+", None, None),
-      ]
+  ]
 
   def __init__(self, data):
     # Holds expression
@@ -392,7 +409,8 @@ class SearchParser(Lexer):
       return self.InsertArg(string=self.string)
 
   def StoreAttribute(self, string="", **_):
-    logging.debug("Storing attribute %r", string)
+    if self.verbose:
+      logging.debug("Storing attribute %r", string)
 
     # TODO(user): Update the expected number_of_args
     try:
@@ -403,12 +421,14 @@ class SearchParser(Lexer):
     return "OPERATOR"
 
   def StoreOperator(self, string="", **_):
-    logging.debug("Storing operator %r", string)
+    if self.verbose:
+      logging.debug("Storing operator %r", string)
     self.current_expression.SetOperator(string)
 
   def InsertArg(self, string="", **_):
     """Insert an arg to the current expression."""
-    logging.debug("Storing Argument %s", utils.SmartUnicode(string))
+    if self.verbose:
+      logging.debug("Storing Argument %s", utils.SmartUnicode(string))
 
     # This expression is complete
     if self.current_expression.AddArg(string):
@@ -417,26 +437,26 @@ class SearchParser(Lexer):
       return self.PopState()
 
   def _CombineBinaryExpressions(self, operator):
-    for i in range(1, len(self.stack)-1):
+    for i in range(1, len(self.stack) - 1):
       item = self.stack[i]
       if (isinstance(item, BinaryExpression) and item.operator == operator and
-          isinstance(self.stack[i-1], Expression) and
-          isinstance(self.stack[i+1], Expression)):
-        lhs = self.stack[i-1]
-        rhs = self.stack[i+1]
+          isinstance(self.stack[i - 1], Expression) and
+          isinstance(self.stack[i + 1], Expression)):
+        lhs = self.stack[i - 1]
+        rhs = self.stack[i + 1]
 
         self.stack[i].AddOperands(lhs, rhs)
-        self.stack[i-1] = None
-        self.stack[i+1] = None
+        self.stack[i - 1] = None
+        self.stack[i + 1] = None
 
     self.stack = filter(None, self.stack)
 
   def _CombineParenthesis(self):
-    for i in range(len(self.stack)-2):
-      if (self.stack[i] == "(" and self.stack[i+2] == ")" and
-          isinstance(self.stack[i+1], Expression)):
+    for i in range(len(self.stack) - 2):
+      if (self.stack[i] == "(" and self.stack[i + 2] == ")" and
+          isinstance(self.stack[i + 1], Expression)):
         self.stack[i] = None
-        self.stack[i+2] = None
+        self.stack[i + 2] = None
 
     self.stack = filter(None, self.stack)
 

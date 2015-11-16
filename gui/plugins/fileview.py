@@ -14,14 +14,18 @@ from M2Crypto import X509
 
 from grr.gui import renderers
 from grr.gui.plugins import fileview_widgets
+from grr.gui.plugins import forms
 from grr.gui.plugins import semantic
 from grr.lib import aff4
+from grr.lib import config_lib
 from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.flows.general import export
+from grr.lib.flows.general import filesystem
+from grr.lib.rdfvalues import client as rdf_client
 
 
-# pylint: disable=g-bad-name
 class BufferReferenceRenderer(semantic.RDFProtoRenderer):
   """Render the buffer reference."""
   classname = "BufferReference"
@@ -94,6 +98,36 @@ class GrrMessageRenderer(semantic.RDFProtoRenderer):
     return semantic.FindRendererForObject(rdf_object).RawHTML(request)
 
   translator = dict(args=RenderPayload)
+
+
+class VolumeRenderer(semantic.RDFProtoRenderer):
+  """Make the disk volume values human readable."""
+  classname = "Volume"
+  name = "Disk Volume"
+
+  def Layout(self, request, response):
+    """Render the protobuf as a table."""
+    self.result = []
+    for descriptor, value in self.proxy.ListSetFields():
+      name = descriptor.name
+      friendly_name = descriptor.friendly_name or name
+
+      if name == "total_allocation_units" and value is not None:
+        value_str = "{0} ({1:.2f} GB)".format(
+            value, self.proxy.AUToGBytes(value))
+        self.result.append((friendly_name, descriptor.description, value_str))
+
+      elif name == "actual_available_allocation_units" and value is not None:
+        value_str = "{0} ({1:.2f} GB, {2:.0f}% free)".format(
+            value, self.proxy.AUToGBytes(value), self.proxy.FreeSpacePercent())
+        self.result.append((friendly_name, descriptor.description, value_str))
+      else:
+        renderer = semantic.FindRendererForObject(value)
+
+        self.result.append((friendly_name, descriptor.description,
+                            renderer.RawHTML(request)))
+
+    return super(semantic.RDFProtoRenderer, self).Layout(request, response)
 
 
 class CollectionRenderer(StatEntryRenderer):
@@ -176,173 +210,6 @@ class GrepResultRenderer(semantic.RDFProtoRenderer):
     return renderers.TemplateRenderer.Layout(self, request, response)
 
 
-class VolatilityFormatstringRenderer(semantic.RDFProtoRenderer):
-  """Formats a volatility result string."""
-
-  layout_template = renderers.Template("""
-{% for line in this.lines %}
-  {{line|safe}}
-{% endfor %}
-""")
-
-  def GenerateLine(self, formatted_value):
-    format_string = formatted_value.formatstring.replace("\n", "<br>")
-    values = [VolatilityValue.GetValue()
-              for VolatilityValue in formatted_value.data.values]
-    return format_string.format(*values)
-
-  def Layout(self, request, response):
-    """Prepare the data."""
-    self.lines = []
-    for formatted_value in self.proxy.formatted_values:
-      self.lines.append(self.GenerateLine(formatted_value))
-    return renderers.TemplateRenderer.Layout(self, request, response)
-
-
-class VolatilityTableRenderer(semantic.RDFProtoRenderer):
-  """Formats a volatility result table."""
-
-  layout_template = renderers.Template("""
-<table class="full-width">
-<thead>
-<tr>
-  {% for header in this.headers %}
-<th class="proto_header">{{header|escape}}</th>
-  {% endfor %}
-</tr>
-</thead>
-<tbody>
-  {% for row in this.rows %}
-    <tr>
-  {% for value in row %}
-      <td class="proto_value">
-        {{value|escape}}
-      </td>
-  {% endfor %}
-    </tr>
-  {% endfor %}
-</tbody>
-</table>
-""")
-
-  def GenerateField(self, table, idx, field):
-    if table.headers[idx].format_hint == "[addrpad]":
-      return utils.FormatAsHexString(field, 12)
-    try:
-      int(field)
-      return utils.FormatAsHexString(field)
-    except ValueError:
-      return field
-
-  def GenerateRows(self, volatility_table):
-    self.headers = [header.print_name for header in volatility_table.headers]
-    self.rows = []
-    for row in volatility_table.rows:
-      this_row = []
-      idx = 0
-      for value in row.values:
-        this_value = ""
-        for field in ["svalue", "value"]:
-          try:
-            if value.HasField(field):
-              this_value = self.GenerateField(volatility_table, idx,
-                                              getattr(value, field))
-              break
-          except TypeError:
-            pass
-        this_row.append(this_value)
-        idx += 1
-      self.rows.append(this_row)
-
-  def Layout(self, request, response):
-    """Prepare the data."""
-    self.GenerateRows(self.proxy)
-    return renderers.TemplateRenderer.Layout(self, request, response)
-
-
-class GenericVolatilityResultRenderer(semantic.RDFProtoRenderer):
-  """Nicely format results of volatility plugins."""
-  name = "Volatility Result Listing"
-
-  layout_template = renderers.Template("""
-{% for section in this.section_html %}
-  {{section|safe}}
-<hr>
-{% endfor %}
-
-{% if this.proxy.error %}
-Error:
-{{this.proxy.error|escape}}
-{% endif %}
-""")
-
-  def Layout(self, request, response):
-    """Layout."""
-    self.section_html = []
-    for section in self.proxy.sections:
-      if section.HasField("table"):
-        self.section_html.append(
-            VolatilityTableRenderer(section.table).RawHTML(request))
-      else:
-        self.section_html.append(
-            VolatilityFormatstringRenderer(
-                section.formatted_value_list).RawHTML(request))
-    return renderers.TemplateRenderer.Layout(self, request, response)
-
-
-class MutantscanResultRenderer(VolatilityTableRenderer):
-  """Nicely format results of the Mutexes flow."""
-  name = "Mutexes Result Listing"
-
-  layout_template = renderers.Template("""
-Names:<br>
-<br>
-<table style="width:100%">
-<tbody>
-  {% for name in this.names %}
-<tr>
-<td class="proto_value">
-{{name|escape}}
-</td>
-</tr>
-  {% endfor %}
-</tbody>
-</table>
-<br>
-Details:<br>
-<br>
-{{this.details|safe}}
-""")
-
-  def Layout(self, request, response):
-    """Prepare the data."""
-    table = self.proxy.sections[0].table
-    self.GenerateRows(table)
-    self.names = sorted(set([values[-1] for values in self.rows if values[-1]]))
-    self.details = VolatilityTableRenderer(table).RawHTML(request)
-    return renderers.TemplateRenderer.Layout(self, request, response)
-
-
-class VolatilityResultRenderer(semantic.RDFProtoRenderer):
-  """Nicely format results of volatility plugins."""
-  classname = "VolatilityResult"
-
-  subrenderers = {
-      "mutantscan": MutantscanResultRenderer,
-      }
-
-  def Layout(self, request, response):
-    """Produces a layout as returned by the subrenderer."""
-
-    # This is the standard renderer for now.
-    plugin = self.proxy.plugin
-    subrenderer = self.subrenderers.get(plugin, GenericVolatilityResultRenderer)
-
-    self.layout_template = subrenderer.layout_template
-    subrenderer(self.proxy).Layout(request, response)
-    return super(VolatilityResultRenderer, self).Layout(request, response)
-
-
 class UsersRenderer(semantic.RDFValueArrayRenderer):
   classname = "Users"
   name = "Users"
@@ -376,11 +243,6 @@ class InterfaceRenderer(semantic.RDFProtoRenderer):
   translator = dict(ip4_addresses=TranslateIp4Addresses,
                     ip6_addresses=TranslateIp6Addresses,
                     mac_address=TranslateMacAddress)
-
-
-class ConfigRenderer(semantic.RDFProtoRenderer):
-  classname = "GRRConfig"
-  name = "GRR Configuration"
 
 
 class StringListRenderer(renderers.TemplateRenderer):
@@ -439,7 +301,7 @@ class ConnectionsRenderer(semantic.RDFValueArrayRenderer):
       (10, 2): "udp6",
       (23, 2): "udp6",
       (30, 2): "udp6",
-      }
+  }
 
   def Layout(self, request, response):
     """Render the connection as a table."""
@@ -512,20 +374,14 @@ class CertificateRenderer(semantic.RDFValueRenderer):
     </pre>
   </div>
 </div>
-
-<script>
-$('#certificate_viewer_{{unique|escape}}').click(function () {
-  $(this).find('ins').toggleClass('ui-icon-plus ui-icon-minus');
-  $(this).find('.contents').toggle();
-}).click();
-</script>
 """)
 
   def Layout(self, request, response):
     # Present the certificate as text
     self.cert = X509.load_cert_string(str(self.proxy)).as_text()
 
-    return super(CertificateRenderer, self).Layout(request, response)
+    response = super(CertificateRenderer, self).RenderAjax(request, response)
+    return self.CallJavascript(response, "CertificateRenderer.Layout")
 
 
 class BlobArrayRenderer(semantic.RDFValueRenderer):
@@ -590,80 +446,9 @@ class AbstractFileTable(renderers.TableRenderer):
     - client_id.
   """
 
-  # When the table is selected we emit a selection event formed by combining the
-  # tree with the table.
-  table_selection_template = renderers.Template("""
-<script>
-  //Receive the selection event and emit a path
-  grr.subscribe("select_table_{{ id|escapejs }}", function(node) {
-    if (node) {
-      var aff4_path = node.find("span[aff4_path]").attr("aff4_path");
-      var age = node.find("span[age]").attr('age');
-      grr.publish("file_select", aff4_path, age);
-    };
-  }, '{{ unique|escapejs }}');
-
-  // Allow the age to be updated for a basename.
-  grr.subscribe("update_age", function(aff4_path, age, age_string) {
-    var cell = $("#{{unique}} span[aff4_path='" + aff4_path + "']")
-      .parents("tr")
-      .find("span[age]");
-    cell.attr("age", age).text(age_string);
-    grr.publish("file_select", aff4_path, age);
-  }, '{{unique|escapejs}}');
-
-</script>""")
-
-  # Subscribe for the tree event queue and when events arrive refresh the table.
-  tree_event_template = renderers.Template("""
-<script>
-  // Update the table when the tree changes
-  grr.subscribe("tree_select", function(aff4_path, selected_id,
-    update_hash) {
-    // Replace ourselves with a new table.
-    grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}", {
-      client_id: '{{this.state.client_id|escapejs}}',
-      aff4_path: aff4_path,
-    });
-    grr.state.tree_path = aff4_path;
-
-    // If the user really clicked the tree, we reset the hash
-    if (update_hash != 'no_hash') {
-      grr.publish('hash_state', 'tb', undefined);
-    }
-  }, '{{ unique|escapejs }}');
-
-  // Allow the table content to be restored from the hash.
-  $("span[aff4_path='" + grr.hash.aff4_path + "']").click()
-
-</script>""")
-
-  layout_template = (renderers.TableRenderer.layout_template +
-                     table_selection_template +
-                     tree_event_template)
-
-  ajax_template = (renderers.TableRenderer.ajax_template + """
+  layout_template = (renderers.TableRenderer.layout_template + """
 <div id="version_selector_dialog_{{unique|escape}}"
-  class="version-selector-dialog modal wide-modal high-modal hide"></div>
-<script>
-(function () {
-  $("img.version-selector").unbind("click").click(function (event) {
-    $("#version_selector_{{unique|escapejs}}").modal("show");
-
-    var aff4_path =
-      $(this).parents('tr').find('span[aff4_path]').attr('aff4_path');
-    var state = $.extend({
-      aff4_path: aff4_path
-    }, grr.state);
-
-    grr.layout('VersionSelectorDialog',
-      'version_selector_dialog_{{unique|escapejs}}', state);
-    $('#version_selector_dialog_{{unique|escapejs}}').modal('show');
-
-    event.stopPropagation();
-  });
-})();
-</script>
+  class="version-selector-dialog modal wide-modal high-modal"></div>
 """)
 
   toolbar = None    # Toolbar class to render above table.
@@ -681,13 +466,21 @@ class AbstractFileTable(renderers.TableRenderer):
     if AbstractFileTable.content_cache is None:
       AbstractFileTable.content_cache = utils.TimeBasedCache()
 
+  def RenderAjax(self, request, response):
+    response = super(AbstractFileTable, self).RenderAjax(request, response)
+    return self.CallJavascript(response, "AbstractFileTable.RenderAjax")
+
   def Layout(self, request, response):
     """Populate the table state with the request."""
     # Draw the toolbar first
     if self.toolbar:
       tb_cls = renderers.Renderer.classes[self.toolbar]
       tb_cls().Layout(request, response)
-    return super(AbstractFileTable, self).Layout(request, response)
+
+    response = super(AbstractFileTable, self).Layout(request, response)
+    return self.CallJavascript(response, "AbstractFileTable.Layout",
+                               renderer=self.__class__.__name__,
+                               client_id=self.state.get("client_id", ""))
 
   def BuildTable(self, start_row, end_row, request):
     """Populate the table."""
@@ -720,6 +513,7 @@ class AbstractFileTable(renderers.TableRenderer):
       key = utils.SmartUnicode(urn)
       if filter_string:
         key += ":" + filter_string
+
       # Open the directory as a directory.
       directory_node = aff4.FACTORY.Open(urn, token=request.token).Upgrade(
           "VFSDirectory")
@@ -851,7 +645,8 @@ class FileSystemTree(renderers.TreeRenderer):
     self.state["client_id"] = client_id = request.REQ.get("client_id")
     self.state["aff4_root"] = request.REQ.get("aff4_root", client_id)
 
-    return super(FileSystemTree, self).Layout(request, response)
+    response = super(FileSystemTree, self).Layout(request, response)
+    return self.CallJavascript(response, "FileSystemTree.Layout")
 
   def RenderBranch(self, path, request):
     """Renders tree leafs for filesystem path."""
@@ -881,6 +676,43 @@ class FileSystemTree(renderers.TreeRenderer):
       self.message = "Error fetching %s: %s" % (urn, e)
 
 
+class RecursiveRefreshDialog(renderers.ConfirmationDialogRenderer):
+  """Dialog that allows user to recursively update directories."""
+  post_parameters = ["aff4_path"]
+
+  header = "Recursive Refresh"
+  proceed_button_title = "Refresh!"
+
+  content_template = renderers.Template("""
+{{this.recursive_refresh_form|safe}}
+""")
+
+  ajax_template = renderers.Template("""
+<p class="text-info">Refresh started successfully!</p>
+""")
+
+  def Layout(self, request, response):
+    args = filesystem.RecursiveListDirectoryArgs()
+    self.recursive_refresh_form = forms.SemanticProtoFormRenderer(
+        args, supressions=["pathspec"]).RawHTML(request)
+    return super(RecursiveRefreshDialog, self).Layout(request, response)
+
+  def RenderAjax(self, request, response):
+    aff4_path = rdfvalue.RDFURN(request.REQ.get("aff4_path"))
+    args = forms.SemanticProtoFormRenderer(
+        filesystem.RecursiveListDirectoryArgs()).ParseArgs(request)
+
+    fd = aff4.FACTORY.Open(aff4_path, token=request.token)
+    args.pathspec = fd.real_pathspec
+
+    flow.GRRFlow.StartFlow(client_id=aff4_path.Split()[0],
+                           flow_name="RecursiveListDirectory",
+                           args=args,
+                           notify_to_user=True,
+                           token=request.token)
+    return self.RenderFromTemplate(self.ajax_template, response)
+
+
 class Toolbar(renderers.TemplateRenderer):
   """A navigation enhancing toolbar.
 
@@ -899,82 +731,63 @@ class Toolbar(renderers.TemplateRenderer):
 
   layout_template = renderers.Template("""
 
-<ul class="breadcrumb">
-  <li class="pull-right">
-    <button class="btn" id='refresh_{{unique|escape}}'
-      title='Refresh this directory listing.'>
+<div class="navbar navbar-default">
+<div class="navbar-inner">
+
+<div class="navbar-form pull-right">
+    <button class="btn btn-default" id='refresh_{{unique|escape}}'
+      name="Refresh" title='Refresh this directory listing.'>
       <img src='/static/images/stock_refresh.png' class="toolbar_icon" />
     </button>
-  </li>
-  <li class="pull-right">
-    <button class="btn" id='rweowned' title='Is this machine pwned?'>
+    <button class="btn btn-default" id='recursive_refresh_{{unique|escape}}'
+      title='Refresh this directory listing.' style='position: relative'
+      name="RecursiveRefresh" data-toggle="modal"
+      data-target="#recursive_refresh_dialog_{{unique|escape}}">
+      <img src='/static/images/stock_refresh.png' class="toolbar_icon" />
+      <span style='position: absolute; left: 23px; top: 5px; font-weight: bold;
+       font-size: 18px; -webkit-text-stroke: 1px #000; color: #fff'>R</span>
+    </button>
+
+    <button class="btn btn-default" id='rweowned'
+      title='Is this machine pwned?'>
       <img src='/static/images/stock_dialog_question.png'
         class="toolbar_icon" />
     </button>
-  </li>
+</div>
+
+<ul class="breadcrumb">
 {% for path, fullpath, fullpath_id, i, last in this.paths %}
   <li {% if forloop.last %}class="active"{% endif %}>
     {% if forloop.last %}
       {{path|escape}}
     {% else %}
     <a id="path_{{i|escape}}">{{path|escape}}</a>
-    <span class="divider">&gt;</span>
     {% endif %}
   </li>
 {% endfor %}
   <div class="clearfix"></div>
 </ul>
+
+</div>
+</div>
+
 <div id="refresh_action" class="hide"></div>
-<div id="rweowned_dialog" class="modal hide"></div>
-
-<script>
-$('#refresh_{{unique|escapejs}}').click(function (){
-  $('#refresh_{{unique|escapejs}}').attr('disabled', 'disabled');
-  grr.layout("UpdateAttribute", "refresh_action", {
-   aff4_path: "{{this.aff4_path|escapejs}}",
-   attribute: "aff4:contains"
-  });
-});
-
-$('#rweowned').click(function (){
-  grr.layout("RWeOwned", "rweowned_dialog");
-});
-
-grr.dialog("RWeOwned", "rweowned_dialog", "rweowned", {
-     width: "500px", height: "auto",
-     title: "Is this machine pwned?",
-});
-
-// When the attribute is updated, refresh the views
-grr.subscribe("AttributeUpdated", function(path, attribute) {
-  $('#refresh_{{unique|escapejs}}').attr('disabled', null);
-  if (attribute == "aff4:contains") {
-    // Update the table
-    grr.publish("tree_select", path);
-    grr.publish("file_select", path);
-  };
-}, 'refresh_{{unique|escapejs}}');
-
-{% for path, fullpath, fullpath_id, i in this.paths %}
-$('#path_{{i|escapejs}}').click(function () {
-   grr.publish("tree_select", "{{ fullpath|escapejs }}");
-   grr.publish("file_select", "{{ fullpath|escapejs }}");
-   grr.publish("hash_state", "t", "{{ fullpath_id|escapejs }}");
-});
-{% endfor %}
-</script>
+<div id="rweowned_dialog" class="modal"></div>
+<div id="recursive_refresh_dialog_{{unique|escape}}"
+  class="modal" tabindex="-1" role="dialog" aria-hidden="true">
+</div>
 """)
 
   def Layout(self, request, response):
     """Render the toolbar."""
     self.state["client_id"] = client_id = request.REQ.get("client_id")
-    self.state["aff4_path"] = self.aff4_path = request.REQ.get(
+    self.state["aff4_path"] = aff4_path = request.REQ.get(
         "aff4_path", client_id)
 
-    client_urn = rdfvalue.ClientURN(client_id)
+    client_urn = rdf_client.ClientURN(client_id)
 
     self.paths = [("/", client_urn, "_", 0)]
-    for path in rdfvalue.RDFURN(self.aff4_path).Split()[1:]:
+    for path in rdfvalue.RDFURN(aff4_path).Split()[1:]:
       previous = self.paths[-1]
       fullpath = previous[1].Add(path)
 
@@ -983,7 +796,10 @@ $('#path_{{i|escapejs}}').click(function () {
                              fullpath.RelativeName(client_urn)),
                          previous[3] + 1))
 
-    return super(Toolbar, self).Layout(request, response)
+    response = super(Toolbar, self).Layout(request, response)
+    return self.CallJavascript(response, "Toolbar.Layout",
+                               aff4_path=utils.SmartUnicode(aff4_path),
+                               paths=self.paths)
 
 
 class UpdateAttribute(renderers.TemplateRenderer):
@@ -1006,33 +822,12 @@ class UpdateAttribute(renderers.TemplateRenderer):
   # Number of ms to wait
   poll_time = 1000
 
-  layout_template = renderers.Template("""
-<script>
-window.setTimeout(function () {
-  grr.update('{{renderer|escapejs}}', '{{id|escapejs}}',
-    {'flow_urn': '{{this.flow_urn|escapejs}}',
-     'aff4_path': '{{this.aff4_path|escapejs}}',
-     'attribute': '{{this.attribute_to_refresh|escapejs}}'
-    });
-}, {{this.poll_time|escapejs}});
-</script>
-""")
-
-  completed_template = renderers.Template("""
-<script>
- grr.publish("AttributeUpdated", "{{this.aff4_path|escapejs}}",
-    "{{this.attribute_to_refresh|escapejs}}");
- $("#{{this.id|escapejs}}").remove();
-</script>
-""")
-
   def ParseRequest(self, request):
     """Parses parameters from the request."""
     self.aff4_path = request.REQ.get("aff4_path")
     self.flow_urn = request.REQ.get("flow_urn")
     # Refresh the contains attribute
-    self.attribute_to_refresh = request.REQ.get(
-        "attribute", str(aff4.AFF4Volume.SchemaCls.CONTAINS))
+    self.attribute_to_refresh = request.REQ.get("attribute", "CONTAINS")
 
   def Layout(self, request, response):
     """Render the toolbar."""
@@ -1047,12 +842,18 @@ window.setTimeout(function () {
 
       update_flow = aff4.FACTORY.Open(
           update_flow_urn, aff4_type="UpdateVFSFile", token=request.token)
-      self.flow_urn = update_flow.state.get_file_flow_urn
+      self.flow_urn = str(update_flow.state.get_file_flow_urn)
     except IOError as e:
       raise IOError("Sorry. This path cannot be refreshed due to %s" % e)
 
     if self.flow_urn:
-      return super(UpdateAttribute, self).Layout(request, response)
+      response = super(UpdateAttribute, self).Layout(request, response)
+      return self.CallJavascript(response,
+                                 "UpdateAttribute.Layout",
+                                 aff4_path=self.aff4_path,
+                                 flow_urn=self.flow_urn,
+                                 attribute_to_refresh=self.attribute_to_refresh,
+                                 poll_time=self.poll_time)
 
   def RenderAjax(self, request, response):
     """Continue polling as long as the flow is in flight."""
@@ -1062,19 +863,14 @@ window.setTimeout(function () {
     # Check if the flow is still in flight.
     try:
       flow_obj = aff4.FACTORY.Open(self.flow_urn, token=request.token)
-      with flow_obj.GetRunner() as runner:
-        complete = not runner.IsRunning()
+      complete = not flow_obj.GetRunner().IsRunning()
 
     except IOError:
       # Something went wrong, stop polling.
       complete = True
 
     if complete:
-      return renderers.TemplateRenderer.Layout(self, request, response,
-                                               self.completed_template)
-
-    return renderers.TemplateRenderer.Layout(self, request, response,
-                                             self.layout_template)
+      return renderers.JsonResponse("1")
 
 
 class AFF4ReaderMixin(object):
@@ -1137,71 +933,40 @@ Hash was {{ this.hash|escape }}.
 {% if this.file_exists %}
 As downloaded on {{ this.age|escape }}.<br>
 <p>
-<button id="{{ unique|escape }}_2" class="btn">
+<button id="{{ unique|escape }}_2" class="btn btn-default">
  Download ({{this.size|escape}} bytes)
 </button>
 </p>
+<p>or download using command line export tool:</p>
+<pre>
+{{ this.export_command_str|escape }}
+</pre>
+<hr/>
 {% endif %}
-
-<button id="{{ unique|escape }}" class="btn">Get a new Version</button>
+<button id="{{ unique|escape }}" class="btn btn-default">
+  Get a new Version
+</button>
 </div>
-<script>
-  var button = $("#{{ unique|escapejs }}").button();
-  var download_button = $("#{{ unique|escapejs }}_2").button();
-
-  button.click(function (event) {
-    $('#{{unique|escapejs}}').attr('disabled', 'disabled');
-    grr.layout("UpdateAttribute", "{{unique|escapejs}}_action", {
-      attribute: 'aff4:content',
-      aff4_type: 'VFSFile',
-      aff4_path: '{{this.aff4_path|escapejs}}',
-      reason: '{{this.token.reason|escapejs}}',
-      client_id: grr.state.client_id,
-    });
-
-    event.preventDefault();
-  });
-
-  // When the attribute is updated, refresh the views
-  grr.subscribe("AttributeUpdated", function(path, attribute) {
-    if (attribute == "aff4:content") {
-      // Update the download screen
-      grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}", {
-        aff4_path: path,
-        reason: '{{this.token.reason|escapejs}}',
-      });
-    };
-  }, '{{unique|escapejs}}_action');
-
-  {% if this.file_exists %}
-  // Attach a handler to the Download button.
-  var state = {aff4_path: '{{this.aff4_path|escapejs}}',
-               reason: '{{this.token.reason|escapejs}}',
-               client_id: grr.state.client_id,
-               age: '{{this.age_int|escapejs}}'
-              }
-  grr.downloadHandler(download_button, state, false,
-                      '/render/Download/DownloadView');
-  {% endif %}
-</script>""")
+""")
 
   error_template = renderers.Template("""
-<h1>Error</h1>{{this.urn|escape}} does not appear to be a file object.
+<div class="alert alert-danger alert-block">
+  <h4>Error!</h4> {{this.path|escape}} does not appear to be a file object.
+  <p><em>{{this.error_message|escape}}</em></p>
+</div>
 """)
   bad_extensions = [".bat", ".cmd", ".exe", ".com", ".pif", ".py", ".pl",
                     ".scr", ".vbs"]
 
   def Layout(self, request, response):
     """Present a download form."""
-    self.client_id = request.REQ.get("client_id")
-    self.aff4_path = request.REQ.get("aff4_path", self.client_id)
     self.age = rdfvalue.RDFDatetime(request.REQ.get("age"))
-    self.age_int = int(self.age)
-    self.token = request.token
+
+    client_id = request.REQ.get("client_id")
+    aff4_path = request.REQ.get("aff4_path", client_id)
 
     try:
-      fd = aff4.FACTORY.Open(self.aff4_path, token=request.token,
-                             age=self.age)
+      fd = aff4.FACTORY.Open(aff4_path, token=request.token, age=self.age)
       self.path = fd.urn
       self.hash = fd.Get(fd.Schema.HASH, None)
       self.size = fd.Get(fd.Schema.SIZE)
@@ -1214,11 +979,27 @@ As downloaded on {{ this.age|escape }}.<br>
       except (IOError, AttributeError):
         pass
 
-    except (AttributeError, IOError):
-      # Install the error template instead.
-      self.layout_template = self.error_template
+      self.export_command_str = u" ".join([
+          config_lib.CONFIG["AdminUI.export_command"],
+          "--username", utils.ShellQuote(request.token.username),
+          "--reason", utils.ShellQuote(request.token.reason),
+          "file",
+          "--path", utils.ShellQuote(aff4_path),
+          "--output", "."])
 
-    return super(DownloadView, self).Layout(request, response)
+      response = super(DownloadView, self).Layout(request, response)
+      return self.CallJavascript(response, "DownloadView.Layout",
+                                 aff4_path=aff4_path,
+                                 client_id=client_id,
+                                 age_int=int(self.age),
+                                 file_exists=self.file_exists,
+                                 renderer=self.__class__.__name__,
+                                 reason=request.token.reason)
+    except (AttributeError, IOError) as e:
+      # Render the error template instead.
+      self.error_message = e.message
+      return renderers.TemplateRenderer.Layout(self, request, response,
+                                               self.error_template)
 
   def Download(self, request, _):
     """Stream the file into the browser."""
@@ -1252,6 +1033,7 @@ As downloaded on {{ this.age|escape }}.<br>
                                    content_type="binary/octet-stream")
       # This must be a string.
       response["Content-Disposition"] = ("attachment; filename=%s" % filename)
+      response["Content-Length"] = len(response.content)
 
       return response
 
@@ -1267,38 +1049,22 @@ class UploadView(renderers.TemplateRenderer):
 <h3>Upload to {{ grr.state.tree_path|escape }}</h3>
 {% endif %}
 <form id="{{unique|escape}}_form" enctype="multipart/form-data">
-<input class="btn btn-file" id="{{ unique|escape }}_file" type="file" name="uploadFile" />
+<input class="btn btn-default btn-file" id="{{ unique|escape }}_file"
+  type="file" name="uploadFile" />
 </form>
-<button class="btn" id="{{ unique|escape }}_upload_button">Upload</button>
+<button class="btn btn-default" id="{{ unique|escape }}_upload_button">
+  Upload
+</button>
 <br/><br/>
 <div id="{{ unique|escape }}_upload_results"/>
 <div id="{{ unique|escape }}_upload_progress"/>
-
-<script>
-  var u_button = $("#{{ unique|escapejs }}_upload_button").button();
-  var u_file = $("#{{ unique|escapejs }}_file");
-  var state = {{this.state_json|safe}};
-  state.tree_path = grr.state.tree_path;
-
-  u_button.click(function (event) {
-    grr.uploadHandler("{{ this.upload_handler|escapejs }}",
-      "{{ unique|escapejs }}_form",
-      "{{ unique|escapejs }}_upload_progress",
-      function (dat) {
-        $("#{{ unique|escapejs }}_upload_results").text(dat);
-      },
-      function (jqxhr, dat, error_val) {
-        var data = jqxhr.responseText;
-        data = $.parseJSON(data.substring(4, data.length));
-        $("#{{ unique|escapejs }}_upload_results").text(data.msg);
-        },
-      state
-    );
-
-    return false;
-  });
-</script>
 """)
+
+  def Layout(self, request, response):
+    response = super(UploadView, self).Layout(request, response)
+    return self.CallJavascript(response, "UploadView.Layout",
+                               upload_handler=self.upload_handler,
+                               upload_state=self.state)
 
 
 class UploadHandler(renderers.TemplateRenderer):
@@ -1371,7 +1137,7 @@ class AFF4Stats(renderers.TemplateRenderer):
 
   layout_template = renderers.Template("""
 <div class="container-fluid">
-<div class="row-fluid">
+<div class="row horizontally-padded">
 
 <div id="{{unique|escape}}" class="{{this.css_class}}">
 <h3>{{ this.path|escape }} @ {{this.age|escape}}</h3>
@@ -1417,30 +1183,6 @@ class AFF4Stats(renderers.TemplateRenderer):
 
 </div>
 </div>
-
-<script>
-$('.attribute_opener').click(function () {
-  var jthis = $(this);
-  var ins = jthis.children("ins");
-  var value = jthis.next("td");
-  var historical = value.children(".historical_view");
-  var historical_id = historical.attr("id");
-
-  if(ins.hasClass('ui-icon-plus')) {
-    ins.removeClass('ui-icon-plus').addClass('ui-icon-minus');
-    historical.show();
-    var state = {{this.state_json|safe}};
-    state.attribute = jthis.attr("attribute");
-
-    grr.layout("{{this.historical_renderer|escapejs}}", historical_id, state);
-    value.children(".default_view").hide();
-  } else {
-    ins.removeClass('ui-icon-minus').addClass('ui-icon-plus');
-    value.children(".default_view").show();
-    historical.html('').hide();
-  };
-});
-</script>
 """)
 
   def Layout(self, request, response, client_id=None, aff4_path=None, age=None):
@@ -1465,7 +1207,10 @@ $('.attribute_opener').click(function () {
       self.path = "Unable to open %s" % self.urn
       self.classes = []
 
-    return super(AFF4Stats, self).Layout(request, response)
+    response = super(AFF4Stats, self).Layout(request, response)
+    return self.CallJavascript(response, "AFF4Stats.Layout",
+                               historical_renderer=self.historical_renderer,
+                               historical_renderer_state=self.state)
 
   def RenderAFF4Attributes(self, fd, request=None):
     """Returns attributes rendered by class."""
@@ -1514,13 +1259,10 @@ class HostInformation(AFF4Stats):
   behaviours = frozenset(["Host"])
   order = 0
   css_class = "TableBody"
-  attributes_to_show = ["USERNAMES", "HOSTNAME", "MAC_ADDRESS", "INSTALL_DATE",
-                        "SYSTEM", "CLOCK", "CLIENT_INFO", "UNAME", "ARCH",
-                        "FIRST_SEEN", "LABEL", "LAST_BOOT_TIME"]
 
   def Layout(self, request, response, client_id=None):
     client_id = client_id or request.REQ.get("client_id")
-    urn = rdfvalue.RDFURN(client_id)
+    urn = rdf_client.ClientURN(client_id)
 
     # This verifies we have auth for deep client paths. If this raises, we
     # force the auth screen.
@@ -1544,12 +1286,6 @@ class AFF4ObjectRenderer(renderers.TemplateRenderer):
 
   layout_template = renderers.Template("""
 <div id="{{unique|escape}}"></div>
-<script>
-grr.subscribe("{{ this.event_queue|escapejs }}", function(aff4_path, age) {
-  grr.layout("{{renderer|escapejs}}", "{{id|escapejs}}",
-    {aff4_path: aff4_path, age: age})
-}, '{{unique|escape}}');
-</script>
 """)
 
   # When a message appears on this queue we choose a new renderer.
@@ -1573,7 +1309,10 @@ grr.subscribe("{{ this.event_queue|escapejs }}", function(aff4_path, age) {
           subrenderer = cls
 
     subrenderer(fd).Layout(request, response)
-    return super(AFF4ObjectRenderer, self).Layout(request, response)
+    response = super(AFF4ObjectRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "AFF4ObjectRenderer.Layout",
+                               event_queue=self.event_queue,
+                               renderer=self.__class__.__name__)
 
 
 class FileViewTabs(renderers.TabLayout):
@@ -1583,14 +1322,24 @@ class FileViewTabs(renderers.TabLayout):
     - aff4_path - The AFF4 object we are currently showing.
     - age: The version of the AFF4 object to display.
   """
-  names = ["Stats", "Download", "TextView", "HexView"]
-  delegated_renderers = ["AFF4Stats", "DownloadView", "FileTextViewer",
-                         "FileHexViewer"]
+
+  FILE_TAB_NAMES = ["Stats", "Download", "TextView", "HexView"]
+  FILE_DELEGATED_RENDERERS = ["AFF4Stats", "DownloadView", "FileTextViewer",
+                              "FileHexViewer"]
+
+  COLLECTION_TAB_NAMES = ["Stats", "Results", "Export"]
+  COLLECTION_DELEGATED_RENDERERS = ["AFF4Stats", "RDFValueCollectionRenderer",
+                                    "CollectionExportView"]
+
+  fd = None
 
   def __init__(self, fd=None, **kwargs):
-    if fd:
-      self.fd = fd
+    self.fd = fd
     super(FileViewTabs, self).__init__(**kwargs)
+
+  def DisableTabs(self):
+    self.disabled = [tab_renderer for tab_renderer in self.delegated_renderers
+                     if tab_renderer != "AFF4Stats"]
 
   def Layout(self, request, response):
     """Check if the file is a readable and disable the tabs."""
@@ -1599,30 +1348,103 @@ class FileViewTabs(renderers.TabLayout):
     self.age = request.REQ.get("age", rdfvalue.RDFDatetime().Now())
     self.state = dict(aff4_path=self.aff4_path, age=int(self.age))
 
+    # By default we assume that we're dealing with a regular file,
+    # so we show tabs for files.
+    self.names = self.FILE_TAB_NAMES
+    self.delegated_renderers = self.FILE_DELEGATED_RENDERERS
     try:
-      if not self.fd:
+      if self.fd is not None:
         self.fd = aff4.FACTORY.Open(self.aff4_path, token=request.token)
-      # We just check if the object has a read method.
-      _ = self.fd.Read
-    except (IOError, AttributeError):
-      self.disabled = ["DownloadView", "FileHexViewer", "FileTextViewer"]
+
+      # If file is actually a collection, then show collections-related tabs.
+      if isinstance(self.fd, aff4.RDFValueCollection):
+        self.names = self.COLLECTION_TAB_NAMES
+        self.delegated_renderers = self.COLLECTION_DELEGATED_RENDERERS
+
+        # If collection doesn't have StatEntries or FileFinderResults, disable
+        # the Export tab.
+        if not CollectionExportView.IsCollectionExportable(self.fd,
+                                                           token=request.token):
+          self.disabled = ["CollectionExportView"]
+
+        if isinstance(self.fd, aff4.RekallResponseCollection):
+          # Make a copy so this change is not permanent.
+          self.delegated_renderers = self.delegated_renderers[:]
+          self.delegated_renderers[1] = "RekallResponseCollectionRenderer"
+
+      else:
+        if not hasattr(self.fd, "Read"):
+          self.DisableTabs()
+
+    except IOError:
+      self.DisableTabs()
 
     return super(FileViewTabs, self).Layout(request, response)
+
+
+class CollectionExportView(renderers.TemplateRenderer):
+  """Displays export command to be used to export collection."""
+
+  layout_template = renderers.Template("""
+<p>To download all the files referenced in the collection, you can use
+this command:</p>
+<pre>
+{{ this.export_command_str|escape }}
+</pre>
+<p><em>NOTE: You can optionally add <tt>--dump_client_info</tt> flag to
+dump client info in YAML format.</em></p>
+""")
+
+  @staticmethod
+  def IsCollectionExportable(collection_urn_or_obj,
+                             token=None):
+    if isinstance(collection_urn_or_obj, aff4.RDFValueCollection):
+      collection = collection_urn_or_obj
+    else:
+      collection = aff4.FACTORY.Create(
+          collection_urn_or_obj, "RDFValueCollection", mode="r", token=token)
+
+    if not collection:
+      return False
+
+    try:
+      export.CollectionItemToAff4Path(collection[0])
+    except export.ItemNotExportableError:
+      return False
+
+    return True
+
+  def Layout(self, request, response, aff4_path=None):
+    aff4_path = aff4_path or request.REQ.get("aff4_path")
+
+    self.export_command_str = " ".join([
+        config_lib.CONFIG["AdminUI.export_command"],
+        "--username", utils.ShellQuote(request.token.username),
+        "--reason", utils.ShellQuote(request.token.reason),
+        "collection_files",
+        "--path", utils.ShellQuote(aff4_path),
+        "--output", "."])
+
+    return super(CollectionExportView, self).Layout(request, response)
 
 
 class RWeOwned(renderers.TemplateRenderer):
   """A magic 8 ball reply to the question - Are we Owned?"""
 
   layout_template = renderers.Template("""
-  <div class="modal-header">
-<button type="button" class="close" data-dismiss="modal" aria-hidden="true">
-   x
-</button>
-<h3>Are we owned?</h3>
-</div>
-  <div class="modal-body">
-    <p class="text-info">
-{{this.choice|escape}}
+<div class="modal-dialog">
+  <div class="modal-content">
+    <div class="modal-header">
+    <button type="button" class="close" data-dismiss="modal" aria-hidden="true">
+       x
+    </button>
+    <h3>Are we owned?</h3>
+    </div>
+      <div class="modal-body">
+        <p class="text-info">
+    {{this.choice|escape}}
+    </div>
+  </div>
 </div>
 """)
 
@@ -1691,50 +1513,46 @@ class HistoricalView(renderers.TableRenderer):
     """Build the table for the attribute."""
     attribute = getattr(fd.Schema, attribute_name)
 
+    additional_rows = False
     i = 0
     for i, value in enumerate(fd.GetValuesForAttribute(attribute)):
-      if i > end_row: break
-      if i < start_row: continue
+      if i > end_row:
+        additional_rows = True
+        break
+
+      if i < start_row:
+        continue
 
       self.AddCell(i, "Age", rdfvalue.RDFDatetime(value.age))
       self.AddCell(i, attribute_name, value)
 
     self.size = i + 1
+    return additional_rows
 
 
 class VersionSelectorDialog(renderers.TableRenderer):
   """Renders the version available for this object."""
 
-  table_selection_template = renderers.Template("""
-<script>
-  // Receive the selection event and update the age of this aff4 object
-  grr.subscribe("select_table_{{ id|escapejs }}", function(node) {
-    if (node) {
-      var aff4_path = "{{this.state.aff4_path|escapejs}}";
-      var age = node.find("span[age]").attr('age');
-      var age_string = node.find("span[age]").text();
-      grr.publish("update_age", aff4_path, age, age_string);
-      $(".version-selector-dialog").modal("hide");
-    };
-  }, '{{ unique|escapejs }}');
-</script>
-""")
-
   layout_template = renderers.Template("""
-<div class="modal-header">
-  <button type="button" class="close" data-dismiss="modal" aria-hidden="true">
-    x</button>
-  <h4>Versions of {{this.state.aff4_path}}</h4>
-</div>
-<div class="modal-body">
-  <div class="padded">
-""") + table_selection_template + """
-""" + renderers.TableRenderer.layout_template + """
+<div class="modal-dialog">
+  <div class="modal-content">
+    <div class="modal-header">
+      <button type="button" class="close" data-dismiss="modal"
+        aria-hidden="true">
+        x
+      </button>
+      <h4>Versions of {{this.state.aff4_path}}</h4>
+    </div>
+    <div class="modal-body">
+      <div class="padded">
+  """) + renderers.TableRenderer.layout_template + """
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-default" data-dismiss="modal" name="Ok"
+        aria-hidden="true">Ok</button>
+    </div>
   </div>
-</div>
-<div class="modal-footer">
-  <button class="btn" data-dismiss="modal" name="Ok"
-    aria-hidden="true">Ok</button>
 </div>
 """
 
@@ -1747,7 +1565,10 @@ class VersionSelectorDialog(renderers.TableRenderer):
   def Layout(self, request, response):
     """Populates the table state with the request."""
     self.state["aff4_path"] = request.REQ.get("aff4_path")
-    return super(VersionSelectorDialog, self).Layout(request, response)
+
+    response = super(VersionSelectorDialog, self).Layout(request, response)
+    return self.CallJavascript(response, "VersionSelectorDialog.Layout",
+                               aff4_path=self.state["aff4_path"])
 
   def BuildTable(self, start_row, end_row, request):
     """Populates the table with attribute values."""
@@ -1763,5 +1584,3 @@ class VersionSelectorDialog(renderers.TableRenderer):
 
       self.AddCell(i, "Age", rdfvalue.RDFDatetime(type_attribute.age))
       self.AddCell(i, "Type", type_attribute)
-
-    return i + 1

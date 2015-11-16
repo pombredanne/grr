@@ -243,16 +243,18 @@ class StatsTests(test_lib.GRRBaseTest):
     metrics = stats.STATS.GetAllMetricsMetadata()
     self.assertEqual(metrics["test_counter"].metric_type,
                      stats.MetricType.COUNTER)
-    self.assertEqual(metrics["test_counter"].fields_defs, None)
+    self.assertFalse(metrics["test_counter"].fields_defs)
 
     self.assertEqual(metrics["test_int_gauge"].metric_type,
                      stats.MetricType.GAUGE)
     self.assertEqual(metrics["test_int_gauge"].fields_defs,
-                     [("dimension", str)])
+                     [stats.MetricFieldDefinition(
+                         field_name="dimension",
+                         field_type=stats.MetricFieldDefinition.FieldType.STR)])
 
     self.assertEqual(metrics["test_event_metric"].metric_type,
                      stats.MetricType.EVENT)
-    self.assertEqual(metrics["test_event_metric"].fields_defs, None)
+    self.assertFalse(metrics["test_event_metric"].fields_defs)
 
   def testGetMetricFieldsWorksCorrectly(self):
     stats.STATS.RegisterCounterMetric(

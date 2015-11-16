@@ -4,6 +4,7 @@
 
 
 from grr.gui import runtests_test
+from grr.lib import artifact_test
 from grr.lib import flags
 from grr.lib import test_lib
 
@@ -11,13 +12,17 @@ from grr.lib import test_lib
 class TestArtifactRender(test_lib.GRRSeleniumTest):
   """Test the Cron view GUI."""
 
+  def setUp(self):
+    super(TestArtifactRender, self).setUp()
+    artifact_test.ArtifactTest.LoadTestArtifacts()
+
   def testArtifactRendering(self):
     self.Open("/")
     with self.ACLChecksDisabled():
       self.GrantClientApproval("C.0000000000000001")
     self.Open("/")
 
-    self.Type("client_query", "0001")
+    self.Type("client_query", "C.0000000000000001")
     self.Click("client_query_submit")
 
     self.WaitUntilEqual(u"C.0000000000000001",
@@ -35,25 +40,29 @@ class TestArtifactRender(test_lib.GRRSeleniumTest):
     self.Click("link=ArtifactCollectorFlow")
     self.WaitUntil(self.IsTextPresent, "Artifact list")
 
-    self.Select("css=select[id$=_os_filter]", "Linux")
+    self.Click("css=grr-artifacts-list-form button:contains('All Platforms')")
+    self.Click("css=grr-artifacts-list-form li:contains('Linux')")
 
-    # Check search works.
-    self.Type("css=input[id$=_search]", u"Lin")
-    self.WaitUntil(self.IsTextPresent, "LinuxPasswd")
+    # Check search works. Note that test artifacts names are used (see
+    # test_data/artifacts/test_artifacts.json for details.
+    self.WaitUntil(self.IsTextPresent, "TestCmdArtifact")
+    self.WaitUntil(self.IsTextPresent, "TestFilesArtifact")
+
+    self.Type("css=grr-artifacts-list-form input[type=text]", u"Cmd")
+    self.WaitUntil(self.IsTextPresent, "TestCmdArtifact")
+    self.WaitUntilNot(self.IsTextPresent, "TestFilesArtifact")
 
     # Check we can add to the list.
-    self.Click("css=option[value=LinuxPasswd]")
-    self.Click("css=a[id$=_artifact_add]")
-
-    self.Select("css=#args-artifact_list", "LinuxPasswd")
-    self.Click("css=option[value=LinuxPasswd]")
-
-    # Force selection due to selenium not propagating change correctly.
-    self.driver.execute_script("return $('#args-artifact_list').change()")
+    self.Click("css=grr-artifacts-list-form tr:contains('TestCmdArtifact')")
+    self.Click("css=grr-artifacts-list-form button:contains('Add')")
+    # Selected artifacts should be highlighted in bold.
+    self.WaitUntil(self.IsElementPresent,
+                   "css=grr-artifacts-list-form "
+                   "strong:contains('TestCmdArtifact')")
 
     # Check the artifact description loaded.
-    self.WaitUntil(self.IsTextPresent, "Linux passwd file.")
-    self.WaitUntil(self.IsTextPresent, "PasswdParser")
+    self.WaitUntil(self.IsTextPresent, "Test command artifact for dpkg.")
+    self.WaitUntil(self.IsTextPresent, "TestCmdProcessor")
 
 
 def main(argv):

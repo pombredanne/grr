@@ -4,17 +4,25 @@
 
 import os
 
+from grr.lib import action_mocks
 from grr.lib import aff4
-from grr.lib import rdfvalue
+from grr.lib import flags
 from grr.lib import test_lib
+# pylint: disable=unused-import
+from grr.lib.flows.general import filetypes
+# pylint: enable=unused-import
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import plist as rdf_plist
 
 
 class TestPlistFlows(test_lib.FlowTestsBaseclass):
+  """Tests the PlistValueFilter flow."""
+
   def _RunFlow(self, flow, context=None, query=None, output=None):
-    client_mock = test_lib.ActionMock("PlistQuery")
-    request = rdfvalue.PlistRequest(context=context, query=query)
+    client_mock = action_mocks.ActionMock("PlistQuery")
+    request = rdf_plist.PlistRequest(context=context, query=query)
     request.pathspec.path = os.path.join(self.base_path, "test.plist")
-    request.pathspec.pathtype = rdfvalue.PathSpec.PathType.OS
+    request.pathspec.pathtype = rdf_paths.PathSpec.PathType.OS
 
     for _ in test_lib.TestFlowHelper(
         flow, client_mock, client_id=self.client_id, token=self.token,
@@ -32,3 +40,11 @@ class TestPlistFlows(test_lib.FlowTestsBaseclass):
     self._RunFlow("PlistValueFilter", context="", query="",
                   output=output)
     self._CheckOutputAFF4Type(output)
+
+
+def main(argv):
+  # Run the full test suite
+  test_lib.GrrTestProgram(argv=argv)
+
+if __name__ == "__main__":
+  flags.StartMain(main)

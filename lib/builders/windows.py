@@ -18,7 +18,8 @@ from grr.lib import config_lib
 MODULE_PATTERNS = [re.compile("distorm.*.dll", re.I),
 
                    # Visual Studio runtime libs.
-                   re.compile("msvcr.+.dll", re.I)]
+                   re.compile("msvcr.+.dll", re.I),
+                   re.compile("msvcp.+.dll", re.I)]
 
 PROCESS_QUERY_INFORMATION = 0x400
 PROCESS_VM_READ = 0x10
@@ -28,7 +29,7 @@ def EnumMissingModules():
   """Enumerate all modules which match the patterns MODULE_PATTERNS.
 
   PyInstaller often fails to locate all dlls which are required at
-  runtime. We import all the client modules here, we simply introdpect
+  runtime. We import all the client modules here, we simply introspect
   all the modules we have loaded in our current running process, and
   all the ones matching the patterns are copied into the client
   package.
@@ -46,7 +47,7 @@ def EnumMissingModules():
 
   # The size of a handle is pointer size (i.e. 64 bit of amd64 and 32 bit on
   # i386).
-  if sys.maxsize > 2**32:
+  if sys.maxsize > 2 ** 32:
     handle_type = ctypes.c_ulonglong
   else:
     handle_type = ctypes.c_ulong
@@ -77,8 +78,11 @@ class WindowsClientBuilder(build.ClientBuilder):
     # (since they contain invalid chars). Visual Studio requires these or it
     # will fail.
     os.environ["ProgramFiles(x86)"] = r"C:\Program Files (x86)"
-    logging.info("Copying Nanny build files.")
-    self.nanny_dir = os.path.join(self.build_dir, "grr/client/nanny")
+    self.nanny_dir = os.path.join(self.build_dir, "grr", "client", "nanny")
+    nanny_src_dir = config_lib.CONFIG.Get("ClientBuilder.nanny_source_dir",
+                                          context=self.context)
+    logging.info("Copying Nanny build files from %s to %s", nanny_src_dir,
+                 self.nanny_dir)
 
     shutil.copytree(config_lib.CONFIG.Get("ClientBuilder.nanny_source_dir",
                                           context=self.context), self.nanny_dir)
@@ -98,8 +102,8 @@ class WindowsClientBuilder(build.ClientBuilder):
       raise RuntimeError("no such Visual Studio script: %s" % env_script)
 
     subprocess.check_call(
-        "cmd /c \"\"%s\" && cd \"%s\" && msbuild /p:Configuration=%s\"" % (
-            env_script, self.nanny_dir, build_type))
+        "cmd /c \"\"%s\" && msbuild /p:Configuration=%s;Platform=%s\"" % (
+            env_script, build_type, vs_arch), cwd=self.nanny_dir)
 
     # The templates always contain the same filenames - the deploy step might
     # rename them later.
@@ -107,8 +111,23 @@ class WindowsClientBuilder(build.ClientBuilder):
         os.path.join(self.nanny_dir, vs_arch, build_type, "GRRNanny.exe"),
         os.path.join(self.output_dir, "GRRservice.exe"))
 
-  def MakeExecutableTemplate(self):
+  def BuildWithPyInstaller(self):
+    """Use pyinstaller to build a client package."""
+    # Pyinstaller caches libraries here, clear them out to avoid problems when
+    # building both 32 and 64bit.
+    directory = os.path.expandvars("%APPDATA%\\pyinstaller\\bincache00_py27")
+    logging.info("Clearing directory %s", directory)
+    try:
+      shutil.rmtree(directory)
+    except OSError:
+      pass
+    super(WindowsClientBuilder, self).BuildWithPyInstaller()
+
+  def MakeExecutableTemplate(self, output_file=None):
     """Windows templates also include the nanny."""
+    super(WindowsClientBuilder, self).MakeExecutableTemplate(
+        output_file=output_file)
+
     self.MakeBuildDirectory()
     self.BuildWithPyInstaller()
 
@@ -118,15 +137,7 @@ class WindowsClientBuilder(build.ClientBuilder):
       shutil.copy(module, self.output_dir)
 
     self.BuildNanny()
-
-    self.EnsureDirExists(os.path.dirname(
-        config_lib.CONFIG.Get("ClientBuilder.template_path",
-                              context=self.context)))
-
-    output_file = config_lib.CONFIG.Get("ClientBuilder.template_path",
-                                        context=self.context)
-    logging.info("Generating zip template file at %s", output_file)
-    self.MakeZip(self.output_dir, output_file)
+    self.MakeZip(self.output_dir, self.template_file)
 
 
 def CopyFileInZip(from_zip, from_name, to_zip, to_name=None):

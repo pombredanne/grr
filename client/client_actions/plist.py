@@ -9,11 +9,12 @@ import cStringIO
 import types
 
 
+from binplist import binplist
 from grr.client import actions
 from grr.client import vfs
 from grr.lib import plist as plist_lib
-from grr.lib import rdfvalue
-from grr.parsers import binplist
+from grr.lib.rdfvalues import plist as rdfplist
+from grr.lib.rdfvalues import protodict
 
 
 class PlistQuery(actions.ActionPlugin):
@@ -34,15 +35,15 @@ class PlistQuery(actions.ActionPlugin):
   filter based on the
   """
 
-  in_rdfvalue = rdfvalue.PlistRequest
-  out_rdfvalue = rdfvalue.RDFValueArray
-  MAX_PLIST_SIZE = 1024*1024*100  # 100 MB
+  in_rdfvalue = rdfplist.PlistRequest
+  out_rdfvalue = protodict.RDFValueArray
+  MAX_PLIST_SIZE = 1024 * 1024 * 100  # 100 MB
 
   def Run(self, args):
     self.context = args.context
     self.filter_query = args.query
 
-    with vfs.VFSOpen(args.pathspec) as fd:
+    with vfs.VFSOpen(args.pathspec, progress_callback=self.Progress) as fd:
       data = fd.Read(self.MAX_PLIST_SIZE)
       plist = binplist.readPlist(cStringIO.StringIO(data))
 
@@ -59,7 +60,7 @@ class PlistQuery(actions.ActionPlugin):
         # If we didn't get a context, the context is the whole plist
         iterator = [plist]
 
-      reply = rdfvalue.RDFValueArray()
+      reply = protodict.RDFValueArray()
       for item in iterator:
         # As we're setting the context manually, we need to account for types
         if isinstance(item, types.ListType):

@@ -1,0 +1,22 @@
+<table class="proto-table no-cell-border full-width">
+  <thead>
+    <tr>
+      <th>Age</th>
+      <th>Client</th>
+      <th>Flow URN</th>
+      <th>Flow Name</th>
+      <th>Message</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr grr-paged-filtered-table page-size="100"
+        grr-aff4-items-provider aff4-path="::controller.logsUrn"
+        transform-items="controller.transformItems(items)">
+      <td ng-class="::{proto_key: item.highlighted}"><nobr>{$ ::item.age / 1000 | date:'medium' $}</nobr></td>
+      <td ng-class="::{proto_key: item.highlighted}"><grr-client-urn value="::item.value.client_id.value" /></td>
+      <td ng-class="::{proto_key: item.highlighted}">{$ ::item.shortUrn.value $}</td>
+      <td ng-class="::{proto_key: item.highlighted}">{$ ::item.value.flow_name.value $}</td>
+      <td ng-class="::{proto_key: item.highlighted}">{$ ::item.value.log_message.value $}</td>
+    </tr>
+  </tbody>
+</table>

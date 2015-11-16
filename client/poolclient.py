@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
-
 """This is the GRR client for thread pools."""
 
 
@@ -18,12 +16,12 @@ from grr.client import client
 from grr.client import client_plugins
 # pylint: enable=unused-import
 
-from grr.client import comms
 from grr.client import vfs
 from grr.lib import config_lib
 from grr.lib import flags
-from grr.lib import rdfvalue
 from grr.lib import startup
+from grr.lib.rdfvalues import crypto as rdf_crypto
+from grr.lib.rdfvalues import paths as rdf_paths
 
 flags.DEFINE_integer("nrclients", 1,
                      "Number of clients to start")
@@ -81,12 +79,18 @@ def CreateClientPool(n):
     for certificate in certificates:
       clients.append(PoolGRRClient(private_key=certificate))
 
+    clients_loaded = True
   except (IOError, EOFError):
-    pass
+    clients_loaded = False
+
+  if clients_loaded and len(clients) < n:
+    raise RuntimeError("Loaded %d clients, but expected %d." %
+                       (len(clients), n))
 
   while len(clients) < n:
     # Generate a new RSA key pair for each client.
-    key = rdfvalue.PEMPrivateKey.GenKey(bits=comms.ClientCommunicator.BITS)
+    bits = config_lib.CONFIG["Client.rsa_key_length"]
+    key = rdf_crypto.PEMPrivateKey.GenKey(bits=bits)
     clients.append(PoolGRRClient(private_key=key))
 
   # Start all the clients now.
@@ -119,14 +123,21 @@ def CreateClientPool(n):
     for cl in clients:
       cl.Stop()
 
-  logging.info("Pool done in %s seconds, saving certs.",
+  # Note: code below is going to be executed after SIGTERM is sent to this
+  # process.
+  logging.info("Pool done in %s seconds.",
                time.time() - start_time)
-  try:
-    fd = open(flags.FLAGS.cert_file, "wb")
-    pickle.dump([x.private_key for x in clients], fd)
-    fd.close()
-  except IOError:
-    pass
+
+  # The way benchmarking is supposed to work is that we execute poolclient with
+  # --enroll_only flag, it dumps the certificates to the flags.FLAGS.cert_file.
+  # Then, all further poolclient invocations just read private keys back
+  # from that file. Therefore if private keys were loaded from
+  # flags.FLAGS.cert_file, then there's no need to rewrite it again with the
+  # same data.
+  if not clients_loaded:
+    logging.info("Saving certificates.")
+    with open(flags.FLAGS.cert_file, "wb") as fd:
+      pickle.dump([x.private_key for x in clients], fd)
 
 
 def CheckLocation():
@@ -152,8 +163,8 @@ def main(unused_argv):
 
   # Let the OS handler also handle sleuthkit requests since sleuthkit is not
   # thread safe.
-  tsk = rdfvalue.PathSpec.PathType.TSK
-  os = rdfvalue.PathSpec.PathType.OS
+  tsk = rdf_paths.PathSpec.PathType.TSK
+  os = rdf_paths.PathSpec.PathType.OS
   vfs.VFS_HANDLERS[tsk] = vfs.VFS_HANDLERS[os]
 
   CreateClientPool(flags.FLAGS.nrclients)

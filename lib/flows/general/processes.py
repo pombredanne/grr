@@ -3,11 +3,12 @@
 
 
 from grr.lib import flow
-from grr.lib import rdfvalue
+from grr.lib.flows.general import file_finder
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
-class ListProcessesArgs(rdfvalue.RDFProtoStruct):
+class ListProcessesArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ListProcessesArgs
 
 
@@ -43,21 +44,37 @@ class ListProcesses(flow.GRRFlow):
       self.Log("Got %d processes, fetching binaries for %d...", len(responses),
                len(paths_to_fetch))
 
-      self.CallFlow("FetchFiles",
-                    next_state="HandleDownloadedFiles",
-                    paths=paths_to_fetch)
+      self.CallFlow(
+          "FileFinder",
+          paths=paths_to_fetch,
+          action=file_finder.FileFinderAction(
+              action_type=file_finder.FileFinderAction.Action.DOWNLOAD),
+          next_state="HandleDownloadedFiles")
+
     else:
       # Only send the list of processes if we don't fetch the binaries
-      for response in responses:
-        self.SendReply(response)
+      skipped = 0
+      for p in responses:
+        # If we have a regex filter, apply it to the .exe attribute (set for OS
+        # X and linux too)
+        if self.args.filename_regex:
+          if p.exe:
+            if self.args.filename_regex.Match(p.exe):
+              self.SendReply(p)
+          else:
+            skipped += 1
+        else:
+          self.SendReply(p)
+      if skipped:
+        self.Log("Skipped %s entries, missing path for regex" % skipped)
 
   @flow.StateHandler()
   def HandleDownloadedFiles(self, responses):
-    """Handle success/failure of the FetchFiles flow."""
+    """Handle success/failure of the FileFinder flow."""
     if responses.success:
-      for response_stat in responses:
-        self.Log("Downloaded %s", response_stat.pathspec)
-        self.SendReply(response_stat)
+      for response in responses:
+        self.Log("Downloaded %s", response.stat_entry.pathspec)
+        self.SendReply(response.stat_entry)
 
     else:
       self.Log("Download of file %s failed %s",
@@ -66,7 +83,7 @@ class ListProcesses(flow.GRRFlow):
   @flow.StateHandler()
   def End(self):
     """Save the results collection and update the notification line."""
-    if self.runner.output:
+    if self.runner.output is not None:
       num_items = len(self.runner.output)
       if self.args.fetch_binaries:
         self.Notify("ViewObject", self.runner.output.urn,

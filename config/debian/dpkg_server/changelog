@@ -1,9 +1,39 @@
+grr-server (0.3.0-7) unstable; urgency=low
+
+  * Update
+
+ -- GRR development team <grr-dev@googlegroups.com>  Mon, 20 Jul 2015 13:40:26 -0700
+
+grr-server (0.3.0-6) unstable; urgency=low
+
+  * Update
+
+ -- GRR development team <grr-dev@googlegroups.com>  Wed, 17 Mar 2015 00:00:00 +0100
+
+grr-server (0.3.0-2) unstable; urgency=low
+
+  * Fixed some small client bugs.
+  * Updated GRR to use Rekall v1.0.2, removed Volatility completely.
+
+ -- GRR development team <grr-dev@googlegroups.com>  Wed, 30 Jun 2014 00:00:00 +0100
+
+grr-server (0.3.0-1) unstable; urgency=low
+
+  * Version change to make client versioning easier.
+
+ -- GRR development team <grr-dev@googlegroups.com>  Tue, 26 Jun 2014 11:35:00 +0100
+
+grr-server (0.2.10-1) unstable; urgency=low
+
+  * Update
+
+ -- GRR development team <grr-dev@googlegroups.com>  Tue, 15 Apr 2014 12:08:00 +0100
+
 grr-server (0.2.9-1) unstable; urgency=low
 
   * Version correction
 
  -- GRR development team <grr-dev@googlegroups.com>  Fri, 06 Dec 2013 11:13:18 +0100
-
 
 grr-server (0.2-9) unstable; urgency=low
 

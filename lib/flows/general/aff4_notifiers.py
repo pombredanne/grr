@@ -8,6 +8,7 @@ from grr.lib import email_alerts
 from grr.lib import flow
 from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import flows as rdf_flows
 
 
 class AFF4NotificationEmailListener(flow.EventListener):
@@ -15,7 +16,7 @@ class AFF4NotificationEmailListener(flow.EventListener):
   EVENTS = ["AFF4ChangeNotifyByEmail"]
 
   well_known_session_id = rdfvalue.SessionID(
-      "aff4:/flows/W:AFF4ChangeNotifyByEmailHandler")
+      flow_name="AFF4ChangeNotifyByEmailHandler")
 
   mail_template = """<html><body><h1>AFF4 change notification</h1>
 Following path got modified: %(path)s"
@@ -26,7 +27,7 @@ Following path got modified: %(path)s"
     """Process an event message."""
 
     # Only accept authenticated messages
-    auth_state = rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED
+    auth_state = rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED
     if message.auth_state != auth_state:
       return
 
@@ -37,8 +38,7 @@ Following path got modified: %(path)s"
     urn = aff4.RDFURN(message.args)
 
     subject = "AFF4 change: %s" % utils.SmartStr(urn)
-    email_alerts.SendEmail(change_email, "GRR server",
-                           subject,
-                           self.mail_template % dict(
-                               path=utils.SmartStr(urn)),
-                           is_html=True)
+    email_alerts.EMAIL_ALERTER.SendEmail(
+        change_email, "GRR server", subject, self.mail_template % dict(
+            path=utils.SmartStr(urn)),
+        is_html=True)

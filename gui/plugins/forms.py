@@ -20,6 +20,7 @@ from grr.gui import renderers
 from grr.lib import rdfvalue
 from grr.lib import type_info
 from grr.lib import utils
+from grr.lib.rdfvalues import structs as rdf_structs
 
 
 # Caches for GetTypeDescriptorRenderer(), We can have a renderer for a repeated
@@ -43,13 +44,13 @@ def GetTypeDescriptorRenderer(type_descriptor):
       if delegate is None:
         delegate = getattr(renderer_cls, "type_descriptor", None)
 
-      # Repeated form renderers go in their own cache.
-      if utils.issubclass(renderer_cls, RepeatedFieldFormRenderer):
-        repeated_renderer_cache[delegate] = renderer_cls
-        continue
-
       if delegate:
-        semantic_renderer_cache[delegate] = renderer_cls
+        # Repeated form renderers go in their own cache.
+        if utils.issubclass(renderer_cls, RepeatedFieldFormRenderer):
+          repeated_renderer_cache[delegate] = renderer_cls
+
+        else:
+          semantic_renderer_cache[delegate] = renderer_cls
 
   # Try to find a renderer for this type descriptor's type:
   if isinstance(type_descriptor, type_info.ProtoList):
@@ -90,16 +91,20 @@ class SemanticProtoFormRenderer(renderers.TemplateRenderer):
       {{form_element|safe}}
     {% endfor %}
   {% if this.advanced_elements %}
-  <div class="control-group">
-    <a id="advanced_label_{{unique|escape}}"
-      class="control-label advanced-label">Advanced</a>
-    <div class="controls"><i class="advanced-icon icon-chevron-right"></i></div>
-  </div>
-  <div class="hide advanced-controls" id="advanced_controls_{{unique|escape}}">
-    {% for form_element in this.advanced_elements %}
-      {{form_element|safe}}
-    {% endfor %}
-  </div>
+    <div class="form-group col-sm-12">
+      <label class="control-label">
+        <a id="advanced_label_{{unique|escape}}"
+          class="advanced-label">Advanced</a>
+        <i class="advanced-icon glyphicon glyphicon-chevron-right"></i>
+      </label>
+    </div>
+    <div class="clearfix"></div>
+    <div class="hide advanced-controls"
+      id="advanced_controls_{{unique|escape}}">
+      {% for form_element in this.advanced_elements %}
+        {{form_element|safe}}
+      {% endfor %}
+    </div>
   {% endif %}
 </div>
 """)
@@ -155,9 +160,10 @@ class SemanticProtoFormRenderer(renderers.TemplateRenderer):
         continue
 
       # Ignore hidden labeled members.
-      if (rdfvalue.SemanticDescriptor.Labels.HIDDEN not in descriptor.labels and
-          "HIDDEN" not in descriptor.labels):
-        kwargs = dict(descriptor=descriptor, opened=self.opened,
+      if (rdf_structs.SemanticDescriptor.Labels.HIDDEN not in descriptor.labels
+          and "HIDDEN" not in descriptor.labels):
+        kwargs = dict(descriptor=descriptor,
+                      opened=self.opened,
                       container=self.proto_obj,
                       prefix=self.prefix + "-" + descriptor.name)
 
@@ -168,8 +174,8 @@ class SemanticProtoFormRenderer(renderers.TemplateRenderer):
 
         # Put the members which are labeled as advanced behind an advanced
         # button.
-        if (rdfvalue.SemanticDescriptor.Labels.ADVANCED in descriptor.labels or
-            "ADVANCED" in descriptor.labels):
+        if (rdf_structs.SemanticDescriptor.Labels.ADVANCED in descriptor.labels
+            or "ADVANCED" in descriptor.labels):
           # Allow the type renderer to draw the form.
           self.advanced_elements.append(type_renderer.RawHTML(request))
         else:
@@ -216,6 +222,8 @@ class TypeDescriptorFormRenderer(renderers.TemplateRenderer):
   # This should be set to the type descriptor class we are responsible for.
   type_descriptor = None
 
+  context_help_url = None
+
   # This is the default view of the description.
   default_description_view = renderers.Template("""
   {% if this.render_label %}
@@ -223,6 +231,10 @@ class TypeDescriptorFormRenderer(renderers.TemplateRenderer):
     <abbr title='{{this.descriptor.description|escape}}'>
       {{this.friendly_name}}
     </abbr>
+  {% if this.context_help_url %}
+    <a href="/help/{{this.context_help_url|escape}}" target="_blank">
+    <i class="glyphicon glyphicon-question-sign"></i></a>
+  {% endif %}
   </label>
   {% endif %}
 """)
@@ -283,7 +295,7 @@ class StringTypeFormRenderer(TypeDescriptorFormRenderer):
   """String form element renderer."""
   type_descriptor = type_info.ProtoString
 
-  layout_template = ("""<div class="control-group">
+  layout_template = ("""<div class="form-group">
 """ + TypeDescriptorFormRenderer.default_description_view + """
   <div class="controls">
     <input id='{{this.prefix}}'
@@ -292,7 +304,7 @@ class StringTypeFormRenderer(TypeDescriptorFormRenderer):
   value='{{ this.default|escape }}'
 {% endif %}
       onchange="grr.forms.inputOnChange(this)"
-      class="unset"/>
+      class="form-control unset"/>
   </div>
 </div>
 """)
@@ -380,14 +392,14 @@ class EmbeddedProtoFormRenderer(TypeDescriptorFormRenderer):
   """A form renderer for an embedded semantic protobuf."""
   type_descriptor = type_info.ProtoEmbedded
 
-  layout_template = ("""<div class="control-group">
+  layout_template = ("""<div class="form-group">
 """ + TypeDescriptorFormRenderer.default_description_view + """
   <div class="controls">
    <div class='nested_opener'>
 {% if this.opened %}
      {{this.prefetched|safe}}
 {% else %}
-     <i class='nested-icon icon-plus' id='{{unique|escape}}'
+     <i class='nested-icon glyphicon glyphicon-plus' id='{{unique|escape}}'
        data-rdfvalue='{{this.type_name}}' data-prefix='{{this.prefix}}'
       />
      <div id='content_{{unique|escape}}'></div>
@@ -485,13 +497,17 @@ class RepeatedFieldFormRenderer(TypeDescriptorFormRenderer):
 
   type_descriptor = type_info.ProtoList
 
+  # If True, will add one element on the first show.
+  add_element_on_first_show = True
+
   layout_template = renderers.Template("""
-  <div class="control-group">
+  <div class="form-group">
 """ + TypeDescriptorFormRenderer.default_description_view + """
     <div class="controls">
-      <button class="btn form-add" id="add_{{unique|escape}}"
-        data-count=0 data-prefix="{{this.prefix|escape}}">
-        <i class="icon-plus"></i>
+      <button class="btn btn-default form-add" id="add_{{unique|escape}}"
+        data-count="{{this.default_data_count|escape}}"
+        data-prefix="{{this.prefix|escape}}">
+        <i class="glyphicon glyphicon-plus"></i>
       </button>
     </div>
   </div>
@@ -501,13 +517,21 @@ class RepeatedFieldFormRenderer(TypeDescriptorFormRenderer):
 """)
 
   ajax_template = renderers.Template("""
-<button type=button class="control-label close" data-dismiss="alert">x</button>
-<div class="control-group" id="{{unique|escape}}"
+<button type=button class="control-label close"
+  id="remove_{{unique|escapejs}}">x</button>
+<div class="form-group" id="{{unique|escapejs}}"
   data-index="{{this.index}}" data-prefix="{{this.prefix}}">
 
   {{this.delegated|safe}}
 </div>
 """)
+
+  @property
+  def default_data_count(self):
+    if self.add_element_on_first_show:
+      return 1
+    else:
+      return 0
 
   def Layout(self, request, response):
     """Build form elements for repeated fields."""
@@ -518,10 +542,15 @@ class RepeatedFieldFormRenderer(TypeDescriptorFormRenderer):
                       field=self.descriptor.name,
                       prefix=self.prefix, index=0)
     request.REQ.update(parameters)
-    self.content = self.RawHTML(request, method=self.RenderAjax)
+
+    if self.add_element_on_first_show:
+      self.content = self.RawHTML(request, method=self.RenderAjax)
+    else:
+      self.content = ""
 
     response = super(RepeatedFieldFormRenderer, self).Layout(request, response)
-    return self.CallJavascript(response, "Layout", **parameters)
+    return self.CallJavascript(response, "RepeatedFieldFormRenderer.Layout",
+                               **parameters)
 
   def ParseArgs(self, request):
     """Parse repeated fields from post parameters."""
@@ -529,12 +558,13 @@ class RepeatedFieldFormRenderer(TypeDescriptorFormRenderer):
 
     # The form tells us how many items there should be. Note that they can be
     # sparse since when an item is removed, the count is not decremented.
-    count = int(request.REQ.get("%s_count" % self.prefix, 0))
+    count = int(request.REQ.get("%s_count" % self.prefix,
+                                self.default_data_count))
 
     # Parse out the items and fill them into the result. Note that we do not
     # support appending empty repeated fields. Such fields may happen by adding
     # and removing the form for the repeated member.
-    for index in range(0, count+1):
+    for index in range(count):
       delegate_prefix = "%s-%s" % (self.prefix, index)
       delegate = self.descriptor.delegate
       delegate_renderer = GetTypeDescriptorRenderer(delegate)(
@@ -573,7 +603,7 @@ class RepeatedFieldFormRenderer(TypeDescriptorFormRenderer):
 
     response = super(RepeatedFieldFormRenderer, self).RenderAjax(
         request, response)
-    return self.CallJavascript(response, "RenderAjax")
+    return self.CallJavascript(response, "RepeatedFieldFormRenderer.RenderAjax")
 
 
 class EnumFormRenderer(TypeDescriptorFormRenderer):
@@ -581,17 +611,17 @@ class EnumFormRenderer(TypeDescriptorFormRenderer):
 
   type_descriptor = type_info.ProtoEnum
 
-  layout_template = """<div class="control-group">
+  layout_template = """<div class="form-group">
 """ + TypeDescriptorFormRenderer.default_description_view + """
 <div class="controls">
 
-<select id="{{this.prefix}}" class="unset"
+<select id="{{this.prefix}}" class="form-control unset"
   onchange="grr.forms.inputOnChange(this)"
   >
-{% for enum_name, enum_value in this.items %}
- <option {% ifequal enum_value this.default %}selected{% endifequal %}
-   value="{{enum_value|escape}}">
-   {{enum_name|escape}}{% ifequal enum_value this.default %} (default)
+{% for enum_name in this.items %}
+ <option {% ifequal enum_name this.default %}selected{% endifequal %}
+   value="{{enum_name|escape}}">
+   {{enum_name|escape}}{% ifequal enum_name this.default %} (default)
                        {% endifequal %}
  </option>
 {% endfor %}
@@ -601,26 +631,20 @@ class EnumFormRenderer(TypeDescriptorFormRenderer):
 """
 
   def Layout(self, request, response):
-    self.items = sorted(self.descriptor.enum.items(), key=lambda x: x[1])
+    enum_dict = dict(self.descriptor.enum.items())
+    self.items = sorted(enum_dict.keys(), key=lambda k: enum_dict[k])
     super(EnumFormRenderer, self).Layout(request, response)
-
-    if self.value is not None:
-      self.value = int(self.value)
-
-    if self.default is not None:
-      self.default = int(self.default)
-
     return self.CallJavascript(response, "Layout",
                                default=self.default, value=self.value,
                                prefix=self.prefix)
 
 
-class ProtoBoolFormRenderer(EnumFormRenderer):
+class ProtoBoolFormRenderer(TypeDescriptorFormRenderer):
   """Render a checkbox for boolean values."""
   type_descriptor = type_info.ProtoBoolean
 
   layout_template = renderers.Template("""
-<div class="control-group">
+<div class="form-group">
 <div class="controls">
 
 <label class="checkbox">
@@ -638,6 +662,18 @@ class ProtoBoolFormRenderer(EnumFormRenderer):
 </div>
 """)
 
+  def Layout(self, request, response):
+    super(ProtoBoolFormRenderer, self).Layout(request, response)
+    if self.default is not None:
+      self.default = bool(self.default)
+    if self.value is not None:
+      self.value = bool(self.default)
+
+    return self.CallJavascript(response, "Layout",
+                               default=self.default,
+                               value=self.value,
+                               prefix=self.prefix)
+
   def ParseArgs(self, request):
     value = request.REQ.get(self.prefix)
     if value is None:
@@ -653,16 +689,15 @@ class RDFDatetimeFormRenderer(StringTypeFormRenderer):
   """Allow the user to enter a timestamp using the date and time pickers."""
   type = rdfvalue.RDFDatetime
 
-  layout_template = ("""<div class="control-group">
+  layout_template = ("""<div class="form-group">
 """ + TypeDescriptorFormRenderer.default_description_view + """
   <div class="controls">
-    <input id='{{this.prefix}}_picker' class="pickerIcon"/>
-
     <input id='{{this.prefix}}'
       type=text value='Click to set'
       onchange="grr.forms.inputOnChange(this)"
-      class="unset hasDatepicker"/>
-
+      class="pull-left form-control unset hasDatepicker"
+    />
+    <input id='{{this.prefix}}_picker' class="pickerIcon"/>
   </div>
 </div>
 """)
@@ -678,7 +713,8 @@ class RDFDatetimeFormRenderer(StringTypeFormRenderer):
     self.default = str(self.default)
 
     response = super(RDFDatetimeFormRenderer, self).Layout(request, response)
-    return self.CallJavascript(response, "Layout", prefix=self.prefix)
+    return self.CallJavascript(response, "RDFDatetimeFormRenderer.Layout",
+                               prefix=self.prefix)
 
   def ParseArgs(self, request):
     date = request.REQ.get(self.prefix)
@@ -689,7 +725,7 @@ class RDFDatetimeFormRenderer(StringTypeFormRenderer):
     return rdfvalue.RDFDatetime().ParseFromHumanReadable(date)
 
 
-class OptionFormRenderer(renderers.TemplateRenderer):
+class OptionFormRenderer(TypeDescriptorFormRenderer):
   """Renders the form for protobuf enums."""
   default = None
   friendly_name = "Select and option"
@@ -698,42 +734,66 @@ class OptionFormRenderer(renderers.TemplateRenderer):
   options = []
 
   layout_template = renderers.Template("""
-<div class="control-group">
-  <label class="control-label">
-    <abbr title='{{this.help|escape}}'>
-      {{this.friendly_name|escape}}
-    </abbr>
-  </label>
-
+<div class="form-group">
+""" + TypeDescriptorFormRenderer.default_description_view + """
   <div class="controls">
+    <div class="OptionList well well-large">
 
-  <select id="{{this.prefix}}-option" class="unset"
-    onchange="grr.forms.inputOnChange(this)"
-    >
-    {% for name, description in this.options %}
-     <option
-       {% ifequal name this.default %}selected{% endifequal %}
-       value="{{name|escape}}"
-       >
-         {{description|escape}}
-         {% ifequal name this.default %} (default){% endifequal %}
-     </option>
-    {% endfor %}
-  </select>
+      <label class="control-label">
+        <abbr title='{{this.help|escape}}'>
+          {{this.friendly_name|escape}}
+        </abbr>
+      </label>
+
+      <div class="controls" style="margin-bottom: 1em">
+        <select id="{{this.prefix|escape}}-option" class="form-control unset"
+          onchange="grr.forms.inputOnChange(this)"
+          >
+          {% for name, description in this.options %}
+           <option
+             {% ifequal name this.default %}selected{% endifequal %}
+             value="{{name|escape}}"
+             >
+               {{description|escape}}
+               {% ifequal name this.default %} (default){% endifequal %}
+           </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div id='{{unique|escape}}-option-form'></div>
+
+    </div>
   </div>
+
 </div>
 """)
 
-  def __init__(self, prefix="option", **kwargs):
-    super(OptionFormRenderer, self).__init__(**kwargs)
+  def __init__(self, prefix="option", default_item_type=None,
+               render_label=False, **kwargs):
+    """Constructor.
+
+    Args:
+      prefix: Id of the select control will be [prefix]-option. Having
+              different prefixes allows one to have multiple
+              OptionFormRenderers on the same page.
+      default_item_type: Item type of the option item that will be selected
+                         by default.
+      render_label: If True, will render the label for this field.
+      **kwargs: passthrough to baseclass.
+    """
+    super(OptionFormRenderer, self).__init__(render_label=render_label,
+                                             **kwargs)
     self.prefix = prefix
+    self.default_item_type = default_item_type
 
   def ParseOption(self, option, request):
     """Override this to parse the specific option selected."""
 
   def ParseArgs(self, request):
     option = request.REQ.get("%s-option" % self.prefix)
-    return self.ParseOption(option, request)
+    if option:
+      return self.ParseOption(option, request)
 
   def RenderOption(self, option, request, response):
     """Extend this to render a different form for each option."""
@@ -741,11 +801,12 @@ class OptionFormRenderer(renderers.TemplateRenderer):
   def Layout(self, request, response):
     super(OptionFormRenderer, self).Layout(request, response)
     return self.CallJavascript(response, "OptionFormRenderer.Layout",
-                               prefix=self.prefix)
+                               prefix=self.prefix,
+                               default_item_type=self.default_item_type)
 
   def RenderAjax(self, request, response):
     self.prefix = request.REQ.get("prefix", self.option_name)
-    option = request.REQ.get(self.prefix + "-option", 1)
+    option = request.REQ.get(self.prefix + "-option", None)
 
     self.RenderOption(option, request, response)
 
@@ -767,18 +828,11 @@ class MultiFormRenderer(renderers.TemplateRenderer):
   layout_template = renderers.Template("""
 {% if this.item %}
 
-<button type=button class=close data-dismiss="alert">x</button>
-
-<form id='{{unique}}' class='OptionList well well-large form-horizontal'
-  data-item='{{this.item|escape}}'
-  >
-
-  {{this.item_type_selector|safe}}
-  <div id='{{unique}}-{{this.item|escape}}' />
-</form>
-
+<button id="RemoveButton{{unique}}" type=button class=close
+  data-dismiss="alert">x</button>
+{{this.child|safe}}
 {% else %}
-<button class="btn" id="AddButton{{unique}}" data-item_count=0 >
+<button class="btn btn-default" id="AddButton{{unique}}" data-item_count=0 >
  {{this.button_text|escape}}
 </button>
 {% endif %}
@@ -790,7 +844,8 @@ class MultiFormRenderer(renderers.TemplateRenderer):
     count = int(request.REQ.get("%s_count" % self.option_name, 0))
     for item in range(count):
       parsed_item = self.child_renderer(
-          prefix="%s_%s" % (self.option_name, item)).ParseArgs(request)
+          prefix="%s_%s" % (self.option_name, item),
+          item=item).ParseArgs(request)
       if parsed_item is not None:
         result.append(parsed_item)
 
@@ -799,9 +854,16 @@ class MultiFormRenderer(renderers.TemplateRenderer):
   def Layout(self, request, response):
     """Renders given item's form. Calls Layout() js code if no item is given."""
     self.item = request.REQ.get("item")
+    default_item_type = request.REQ.get("default_item_type", None)
+
     if self.item is not None:
-      self.item_type_selector = self.child_renderer(
-          prefix="%s_%s" % (self.option_name, self.item)).RawHTML(request)
+      self.child = self.child_renderer(
+          prefix="%s_%s" % (self.option_name, self.item),
+          item=self.item,
+          default_item_type=default_item_type).RawHTML(request)
+
+      self.CallJavascript(response, "MultiFormRenderer.LayoutItem",
+                          option=self.option_name)
     else:
       self.CallJavascript(response, "MultiFormRenderer.Layout",
                           option=self.option_name,
@@ -819,7 +881,7 @@ class MultiSelectListRenderer(RepeatedFieldFormRenderer):
   type = None
   values = []
 
-  layout_template = ("""<div class="control-group">
+  layout_template = ("""<div class="form-group">
 """ + TypeDescriptorFormRenderer.default_description_view + """
   <div class="controls">
     <select id='{{this.prefix}}' multiple
@@ -831,12 +893,12 @@ class MultiSelectListRenderer(RepeatedFieldFormRenderer):
     </select>
   </div>
 </div>
-<script>
-  // Height hack as CSS isn't handled properly for multiselect.
-  var multiselect_height = parseInt($("#{{this.prefix}} option").length) * 15;
-  $("#{{this.prefix}}").css("height", multiselect_height);
-</script>
 """)
+
+  def Layout(self, request, response):
+    response = super(MultiSelectListRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "MultiSelectListRenderer.Layout",
+                               prefix=self.prefix)
 
   def ParseArgs(self, request):
     """Parse all the post parameters and build a list."""
@@ -846,3 +908,70 @@ class MultiSelectListRenderer(RepeatedFieldFormRenderer):
         result.append(v)
 
     return result
+
+
+class UnionMultiFormRenderer(OptionFormRenderer):
+  """Renderer that renders union-style RDFValues.
+
+  Certain RDFValues have union-like semantics. I.e. they are essentially
+  selectors of a number of predefined other protobufs. There's a single
+  field that identifies the type of the selected "subvalue" and then
+  nested rdfvalues corresponding to different selections. For examples:
+
+  message FileFinderFilter {
+    enum Type {
+      MODIFICATION_TIME = 0 [(description) = "Modification time"];
+      ACCESS_TIME = 1 [(description) = "Access time"];
+    }
+
+    optional Type filter_type = 1;
+    optional FileFinderModificationTimeFilter modification_time = 2;
+    optional FileFinderAccessTimeFilter access_time = 3;
+  }
+
+  UnionMultiFormRenderer renders this kind of rdfvalues. Field specified in
+  union_by_field is used to determine available values. union_by_field
+  field has to be Enum. Corresponding nested values have to have names
+  equal to enum values' names, but in lower case.
+
+  Renderer renders a dropdown with a type selector and renders a form
+  corresponding to a currently selected type.
+  """
+  union_by_field = None
+
+  def __init__(self, render_label=True, **kwargs):
+    super(UnionMultiFormRenderer, self).__init__(render_label=render_label,
+                                                 **kwargs)
+    union_field_enum = self.type.type_infos.get(self.union_by_field)
+
+    self.friendly_name = union_field_enum.friendly_name
+    self.option_name = union_field_enum.name
+    self.help = union_field_enum.description
+
+    self.options = []
+    for name, value in sorted(union_field_enum.enum.iteritems(),
+                              key=lambda x: int(x[1])):
+      self.options.append((int(value), value.description or name))
+
+  def ParseOption(self, option, request):
+    union_field_enum = self.type.type_infos.get(self.union_by_field)
+    union_field_value = union_field_enum.reverse_enum[int(option)]
+
+    result = self.type()
+    setattr(result, self.union_by_field, union_field_value)
+
+    union_field_name = union_field_enum.reverse_enum[int(option)].lower()
+    if hasattr(result, union_field_name):
+      setattr(result, union_field_name, SemanticProtoFormRenderer(
+          getattr(result, union_field_name), id=self.id,
+          prefix=self.prefix).ParseArgs(request))
+    return result
+
+  def RenderOption(self, option, request, response):
+    result = self.type()
+    union_field_enum = self.type.type_infos.get(self.union_by_field)
+    union_field_name = union_field_enum.reverse_enum[int(option)].lower()
+    if hasattr(result, union_field_name):
+      SemanticProtoFormRenderer(
+          getattr(result, union_field_name), id=self.id,
+          prefix=self.prefix).Layout(request, response)

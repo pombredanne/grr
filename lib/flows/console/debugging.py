@@ -16,10 +16,12 @@ from grr.lib import flow
 from grr.lib import queue_manager
 from grr.lib import rdfvalue
 from grr.lib import worker
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
-class ClientActionArgs(rdfvalue.RDFProtoStruct):
+class ClientActionArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ClientActionArgs
 
   def GetActionArgsClass(self):
@@ -68,10 +70,11 @@ class ClientAction(flow.GRRFlow):
         pickle.dump(responses, fd)
         self.Log("Wrote %d responses to %s", len(responses), fname)
       finally:
-        if fd: fd.close()
+        if fd:
+          fd.close()
 
 
-class ConsoleDebugFlowArgs(rdfvalue.RDFProtoStruct):
+class ConsoleDebugFlowArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.ConsoleDebugFlowArgs
 
   def GetFlowArgsClass(self):
@@ -122,30 +125,8 @@ class ConsoleDebugFlow(flow.GRRFlow):
         pickle.dump(responses, fd)
         self.Log("Wrote %d responses to %s", len(responses), fname)
       finally:
-        if fd: fd.close()
-
-
-def StartFlowAndWait(client_id, flow_name, **kwargs):
-  """Launches the flow and waits for it to complete.
-
-  Args:
-     client_id: The client common name we issue the request.
-     flow_name: The name of the flow to launch.
-     **kwargs: passthrough to flow.
-
-  Returns:
-     A GRRFlow object.
-  """
-  session_id = flow.GRRFlow.StartFlow(client_id=client_id,
-                                      flow_name=flow_name, **kwargs)
-  while 1:
-    time.sleep(1)
-    with aff4.FACTORY.Open(session_id) as flow_obj:
-      with flow_obj.GetRunner() as runner:
-        if not runner.IsRunning():
-          break
-
-  return flow_obj
+        if fd:
+          fd.close()
 
 
 def StartFlowAndWorker(client_id, flow_name, **kwargs):
@@ -157,17 +138,18 @@ def StartFlowAndWorker(client_id, flow_name, **kwargs):
      **kwargs: passthrough to flow.
 
   Returns:
-     A GRRFlow object.
+     A flow session id.
 
   Note: you need raw access to run this flow as it requires running a worker.
   """
+  # Empty token, only works with raw access.
+  token = access_control.ACLToken(username="GRRConsole")
   queue = rdfvalue.RDFURN("DEBUG-%s-" % getpass.getuser())
   session_id = flow.GRRFlow.StartFlow(client_id=client_id,
                                       flow_name=flow_name, queue=queue,
-                                      **kwargs)
-  # Empty token, only works with raw access.
+                                      token=token, **kwargs)
   worker_thrd = worker.GRRWorker(
-      queue=queue, token=access_control.ACLToken(username="test"),
+      queues=[queue], token=token,
       threadpool_size=1)
   while True:
     try:
@@ -178,15 +160,14 @@ def StartFlowAndWorker(client_id, flow_name, **kwargs):
       break
 
     time.sleep(2)
-    with aff4.FACTORY.Open(session_id) as flow_obj:
-      with flow_obj.GetRunner() as runner:
-        if not runner.IsRunning():
-          break
+    with aff4.FACTORY.Open(session_id, token=token) as flow_obj:
+      if not flow_obj.GetRunner().IsRunning():
+        break
 
   # Terminate the worker threads
   worker_thrd.thread_pool.Join()
 
-  return flow_obj
+  return session_id
 
 
 def TestClientActionWithWorker(client_id, client_action, print_request=False,
@@ -231,11 +212,12 @@ def WakeStuckFlow(session_id):
 
         checked_pending = True
 
-      if not responses or responses[-1].type != rdfvalue.GrrMessage.Type.STATUS:
+      if (not responses or responses[-1].type !=
+          rdf_flows.GrrMessage.Type.STATUS):
         manager.QueueClientMessage(request.request)
         woken += 1
 
-      if responses and responses[-1].type == rdfvalue.GrrMessage.Type.STATUS:
+      if responses and responses[-1].type == rdf_flows.GrrMessage.Type.STATUS:
         manager.QueueNotification(session_id)
 
   return woken

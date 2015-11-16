@@ -5,14 +5,10 @@
 import argparse
 import os
 
-# pylint: disable=unused-import, g-bad-import-order
-from grr.lib import server_plugins
-# pylint: enable=unused-import, g-bad-import-order
-
+from grr.lib import access_control
 from grr.lib import aff4
 from grr.lib import data_store
 from grr.lib import flags
-from grr.lib import rdfvalue
 from grr.lib import test_lib
 from grr.lib import utils
 from grr.tools.export_plugins import file_plugin
@@ -27,8 +23,9 @@ class FileExportPluginTest(test_lib.GRRBaseTest):
     self.client_id = client_ids[0]
     self.out = self.client_id.Add("fs/os")
 
-    data_store.default_token = rdfvalue.ACLToken(username="user",
-                                                 reason="reason")
+    data_store.default_token = access_control.ACLToken(username="user",
+                                                       reason="reason")
+    self.GrantClientApproval(self.client_id, token=data_store.default_token)
 
   def CreateDir(self, dirpath):
     path = self.out.Add(dirpath)
@@ -80,7 +77,8 @@ class FileExportPluginTest(test_lib.GRRBaseTest):
           "--output",
           tmpdir]))
 
-      expected_outdir = os.path.join(tmpdir, self.out.Add("testdir").Path()[1:])
+      expected_outdir = os.path.join(tmpdir,
+                                     self.out.Add("testdir").Path()[1:])
       self.assertTrue("testfile1" in os.listdir(expected_outdir))
       full_outdir = os.path.join(expected_outdir, "testdir1", "testdir2")
       self.assertTrue("testfile4" in os.listdir(full_outdir))

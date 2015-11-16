@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """In this file we define constants that can be used by client and server."""
 
 
@@ -18,7 +17,6 @@ profile_folders = [("AppData", "Application Data", "app_data"),
                     "AppData\\Local\\Microsoft\\Windows\\History",
                     "history"),
                    ("Local AppData", "AppData\\Roaming", "local_app_data"),
-                   ("Local Settings", "Local Settings", "local_settings"),
                    ("My Music", "Music", "my_music"),
                    ("My Pictures", "Pictures", "my_pictures"),
                    ("My Video", "Videos", "my_video"),

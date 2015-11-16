@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """This is the WSGI based version of the GRR HTTP Server.
 
 If you want to set up apache as an http server for GRR, here is a site config
@@ -38,6 +37,10 @@ grrpath = grrpath.replace("/grr/tools", "")
 if grrpath not in sys.path:
   sys.path.append(grrpath)
 
+# pylint: disable=g-import-not-at-top
+# pylint: enable=g-import-not-at-top
+
+import logging
 
 # pylint: disable=unused-import,g-bad-import-order
 from grr.lib import server_plugins
@@ -49,8 +52,10 @@ from grr.lib import communicator
 from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import flow
-from grr.lib import rdfvalue
+from grr.lib import master
 from grr.lib import startup
+from grr.lib import stats
+from grr.lib.rdfvalues import flows as rdf_flows
 
 
 flags.DEFINE_integer("max_queue_size", 500,
@@ -64,6 +69,7 @@ flags.DEFINE_integer("message_expiry_time", 600,
                      "Maximum time messages remain valid within the system.")
 
 
+# pylint: disable=g-bad-name
 
 
 class GrrWSGIServer(object):
@@ -84,6 +90,12 @@ class GrrWSGIServer(object):
 
   def handle(self, environ, start_response):
     """The request handler."""
+    if not master.MASTER_WATCHER.IsMaster():
+      # We shouldn't be getting requests from the client unless we
+      # are the active instance.
+      stats.STATS.IncrementCounter("frontend_inactive_request_count",
+                                   fields=["http"])
+      logging.info("Request sent to inactive frontend")
 
     if environ["REQUEST_METHOD"] == "GET":
       if environ["PATH_INFO"] == "/server.pem":
@@ -96,9 +108,9 @@ class GrrWSGIServer(object):
         length = int(environ["CONTENT_LENGTH"])
         input_data = environ["wsgi.input"].read(length)
 
-        request_comms = rdfvalue.ClientCommunication(input_data)
+        request_comms = rdf_flows.ClientCommunication(input_data)
 
-        responses_comms = rdfvalue.ClientCommunication()
+        responses_comms = rdf_flows.ClientCommunication()
 
         self.front_end.HandleMessageBundles(
             request_comms, responses_comms)

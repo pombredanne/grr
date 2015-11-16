@@ -17,8 +17,9 @@ from grr.client import client_utils_common
 from grr.client.client_actions import standard
 from grr.client.client_actions.linux import ko_patcher
 from grr.lib import config_lib
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import protodict as rdf_protodict
 
 
 # struct sockaddr_ll
@@ -43,7 +44,7 @@ class Sockaddrll(ctypes.Structure):
       ("sll_pkttype", ctypes.c_ubyte),
       ("sll_halen", ctypes.c_ubyte),
       ("sll_addr", ctypes.c_ubyte * 8),
-      ]
+  ]
 
 # struct sockaddr_in {
 #   sa_family_t           sin_family;     /* Address family               */
@@ -62,7 +63,7 @@ class Sockaddrin(ctypes.Structure):
       ("sin_port", ctypes.c_ushort),
       ("sin_addr", ctypes.c_ubyte * 4),
       ("sin_zero", ctypes.c_char * 8)
-      ]
+  ]
 
 # struct sockaddr_in6 {
 #         unsigned short int      sin6_family;    /* AF_INET6 */
@@ -81,7 +82,7 @@ class Sockaddrin6(ctypes.Structure):
       ("sin6_flowinfo", ctypes.c_ubyte * 4),
       ("sin6_addr", ctypes.c_ubyte * 16),
       ("sin6_scope_id", ctypes.c_ubyte * 4)
-      ]
+  ]
 
 
 # struct ifaddrs   *ifa_next;         /* Pointer to next struct */
@@ -106,12 +107,12 @@ Ifaddrs._fields_ = [  # pylint: disable=protected-access
     ("ifa_broadaddr", ctypes.POINTER(ctypes.c_char)),
     ("ifa_destaddr", ctypes.POINTER(ctypes.c_char)),
     ("ifa_data", ctypes.POINTER(ctypes.c_char))
-    ]
+]
 
 
 class EnumerateInterfaces(actions.ActionPlugin):
   """Enumerates all MAC addresses on this system."""
-  out_rdfvalue = rdfvalue.Interface
+  out_rdfvalue = rdf_client.Interface
 
   def Run(self, unused_args):
     """Enumerate all interfaces and collect their MAC addresses."""
@@ -133,9 +134,9 @@ class EnumerateInterfaces(actions.ActionPlugin):
         if iffamily == 0x2:     # AF_INET
           data = ctypes.cast(m.contents.ifa_addr, ctypes.POINTER(Sockaddrin))
           ip4 = "".join(map(chr, data.contents.sin_addr))
-          address_type = rdfvalue.NetworkAddress.Family.INET
-          address = rdfvalue.NetworkAddress(address_type=address_type,
-                                            packed_bytes=ip4)
+          address_type = rdf_client.NetworkAddress.Family.INET
+          address = rdf_client.NetworkAddress(address_type=address_type,
+                                              packed_bytes=ip4)
           addresses.setdefault(ifname, []).append(address)
 
         if iffamily == 0x11:    # AF_PACKET
@@ -146,9 +147,9 @@ class EnumerateInterfaces(actions.ActionPlugin):
         if iffamily == 0xA:     # AF_INET6
           data = ctypes.cast(m.contents.ifa_addr, ctypes.POINTER(Sockaddrin6))
           ip6 = "".join(map(chr, data.contents.sin6_addr))
-          address_type = rdfvalue.NetworkAddress.Family.INET6
-          address = rdfvalue.NetworkAddress(address_type=address_type,
-                                            packed_bytes=ip6)
+          address_type = rdf_client.NetworkAddress.Family.INET6
+          address = rdf_client.NetworkAddress(address_type=address_type,
+                                              packed_bytes=ip6)
           addresses.setdefault(ifname, []).append(address)
       except ValueError:
         # Some interfaces don't have a iffamily and will raise a null pointer
@@ -167,12 +168,12 @@ class EnumerateInterfaces(actions.ActionPlugin):
         args["mac_address"] = mac
       if addresses:
         args["addresses"] = address_list
-      self.SendReply(rdfvalue.Interface(**args))
+      self.SendReply(rdf_client.Interface(**args))
 
 
 class GetInstallDate(actions.ActionPlugin):
   """Estimate the install date of this system."""
-  out_rdfvalue = rdfvalue.DataBlob
+  out_rdfvalue = rdf_protodict.DataBlob
 
   def Run(self, unused_args):
     self.SendReply(integer=int(os.stat("/lost+found").st_ctime))
@@ -193,17 +194,28 @@ class UtmpStruct(utils.Struct):
       ("i", "tv_usec"),
       ("4i", "ut_addr_v6"),
       ("20s", "unused"),
-      ]
+  ]
 
 
 class EnumerateUsers(actions.ActionPlugin):
-  """Enumerates all the users on this system."""
-  out_rdfvalue = rdfvalue.User
+  """Enumerates all the users on this system.
+
+  While wtmp can be collected and parsed server-side using artifacts, we keep
+  this client action to avoid collecting every wtmp on every interrogate, and to
+  allow for the metadata (homedir) expansion to occur on the client, where we
+  have access to LDAP.
+
+  This client action used to return rdf_client.User.  To allow for backwards
+  compatibility we expect it to be called via the LinuxUserProfiles artifact and
+  we convert User to KnowledgeBaseUser in the artifact parser on the server.
+  """
+  out_rdfvalue = rdf_client.KnowledgeBaseUser
 
   def ParseWtmp(self):
     """Parse wtmp and extract the last logon time."""
     users = {}
 
+    wtmp_struct_size = UtmpStruct.GetSize()
     for filename in sorted(os.listdir("/var/log")):
       if filename.startswith("wtmp"):
         try:
@@ -211,13 +223,12 @@ class EnumerateUsers(actions.ActionPlugin):
         except IOError:
           continue
 
-        while wtmp:
+        for offset in xrange(0, len(wtmp), wtmp_struct_size):
           try:
-            record = UtmpStruct(wtmp)
+            record = UtmpStruct(wtmp[offset:offset + wtmp_struct_size])
           except RuntimeError:
             break
 
-          wtmp = wtmp[record.size:]
           # Users only appear for USER_PROCESS events, others are system.
           if record.ut_type != 7:
             continue
@@ -255,13 +266,18 @@ class EnumerateUsers(actions.ActionPlugin):
         self.SendReply(username=utils.SmartUnicode(username),
                        homedir=utils.SmartUnicode(homedir),
                        full_name=utils.SmartUnicode(full_name),
-                       last_logon=last_login*1000000)
+                       last_logon=last_login * 1000000)
 
 
 class EnumerateFilesystems(actions.ActionPlugin):
-  """Enumerate all unique filesystems local to the system."""
-  acceptable_filesystems = set(["ext2", "ext3", "ext4", "vfat", "ntfs"])
-  out_rdfvalue = rdfvalue.Filesystem
+  """Enumerate all unique filesystems local to the system.
+
+  Filesystems picked from:
+    https://www.kernel.org/doc/Documentation/filesystems/
+  """
+  acceptable_filesystems = set(["ext2", "ext3", "ext4", "vfat", "ntfs",
+                                "btrfs", "Reiserfs", "XFS", "JFS", "squashfs"])
+  out_rdfvalue = rdf_client.Filesystem
 
   def CheckMounts(self, filename):
     """Parses the currently mounted devices."""
@@ -310,7 +326,7 @@ class Uninstall(actions.ActionPlugin):
   Note this needs to handle the different distributions separately, e.g. Redhat
   vs Debian.
   """
-  out_rdfvalue = rdfvalue.DataBlob
+  out_rdfvalue = rdf_protodict.DataBlob
 
   def Run(self, unused_arg):
     raise RuntimeError("Not implemented")
@@ -323,7 +339,7 @@ class UninstallDriver(actions.ActionPlugin):
   client_config.DRIVER_SIGNING_CERT can be uninstalled.
   """
 
-  in_rdfvalue = rdfvalue.DriverInstallTemplate
+  in_rdfvalue = rdf_client.DriverInstallTemplate
 
   @staticmethod
   def UninstallDriver(driver_name):
@@ -393,8 +409,8 @@ class InstallDriver(UninstallDriver):
     try:
       fd = tempfile.NamedTemporaryFile()
       data = args.driver.data
-      if args.mode >= rdfvalue.DriverInstallTemplate.RewriteMode.ENABLE:
-        force = args.mode == rdfvalue.DriverInstallTemplate.RewriteMode.FORCE
+      if args.mode >= rdf_client.DriverInstallTemplate.RewriteMode.ENABLE:
+        force = args.mode == rdf_client.DriverInstallTemplate.RewriteMode.FORCE
         data = ko_patcher.KernelObjectPatcher().Patch(data, force_patch=force)
       fd.write(data)
       fd.flush()
@@ -418,41 +434,18 @@ class InstallDriver(UninstallDriver):
       fd.close()
 
 
-class GetMemoryInformation(actions.ActionPlugin):
-  """Loads the driver for memory access and returns a Stat for the device."""
-
-  in_rdfvalue = rdfvalue.PathSpec
-  out_rdfvalue = rdfvalue.MemoryInformation
-
-  def Run(self, args):
-    """Run."""
-    result = rdfvalue.MemoryInformation()
-
-    # Try if we can actually open the device.
-    with open(args.path, "rb") as fd:
-      fd.read(5)
-
-    result.device = rdfvalue.PathSpec(
-        path=args.path,
-        pathtype=rdfvalue.PathSpec.PathType.MEMORY)
-
-    self.SendReply(result)
-
-
 class UpdateAgent(standard.ExecuteBinaryCommand):
   """Updates the GRR agent to a new version."""
 
-  in_rdfvalue = rdfvalue.ExecuteBinaryRequest
-  out_rdfvalue = rdfvalue.ExecuteBinaryResponse
+  def ProcessFile(self, path, args):
+    if path.endswith(".deb"):
+      self._InstallDeb(path, args)
+    elif path.endswith(".rpm"):
+      self._InstallRpm(path)
+    else:
+      raise ValueError("Unknown suffix for file %s." % path)
 
-  def Run(self, args):
-    """Run."""
-    pub_key = config_lib.CONFIG["Client.executable_signing_public_key"]
-    if not args.executable.Verify(pub_key):
-      raise OSError("Executable signing failure.")
-
-    path = self.WriteBlobToFile(args.executable, args.write_path, ".deb")
-
+  def _InstallDeb(self, path, args):
     cmd = "/usr/bin/dpkg"
     cmd_args = ["-i", path]
     time_limit = args.time_limit
@@ -464,3 +457,37 @@ class UpdateAgent(standard.ExecuteBinaryCommand):
     # so we just wait. If something goes wrong, the nanny will restart the
     # service after a short while and the client will come back to life.
     time.sleep(1000)
+
+  def _InstallRpm(self, path):
+    """Client update for rpm based distros.
+
+    Upgrading rpms is a bit more tricky than upgrading deb packages since there
+    is a preinstall script that kills the running GRR daemon and, thus, also
+    the installer process. We need to make sure we detach the child process
+    properly and therefore cannot use client_utils_common.Execute().
+
+    Args:
+      path: Path to the .rpm.
+    """
+
+    pid = os.fork()
+    if pid == 0:
+      # This is the child that will become the installer process.
+
+      cmd = "/bin/rpm"
+      cmd_args = [cmd, "-U", "--replacepkgs", "--replacefiles", path]
+
+      # We need to clean the environment or rpm will fail - similar to the
+      # use_client_context=False parameter.
+      env = os.environ.copy()
+      env.pop("LD_LIBRARY_PATH", None)
+      env.pop("PYTHON_PATH", None)
+
+      # This call doesn't return.
+      os.execve(cmd, cmd_args, env)
+
+    else:
+      # The installer will run in the background and kill the main process
+      # so we just wait. If something goes wrong, the nanny will restart the
+      # service after a short while and the client will come back to life.
+      time.sleep(1000)

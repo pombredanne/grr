@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
-
 """Tests for grr.parsers.ie_history."""
 
 
@@ -14,9 +12,6 @@ from grr.lib import test_lib
 from grr.parsers import ie_history
 
 
-# pylint: disable=g-bad-name
-
-
 class IEHistoryTest(test_lib.GRRBaseTest):
   """Test parsing of chrome history files."""
 
@@ -25,22 +20,28 @@ class IEHistoryTest(test_lib.GRRBaseTest):
     hist_file = os.path.join(self.base_path, "index.dat")
     c = ie_history.IEParser(open(hist_file))
     entries = [x for x in c.Parse()]
-    self.assertEquals(entries[1]["url"],
-                      "Visited: testing@http://www.trafficfusionx.com/"
-                      "download/tfscrn2/funnycats.exe")
+
+    # Check that our results are properly time ordered
+    time_results = [x["mtime"] for x in entries]
+    self.assertEqual(time_results, sorted(time_results))
+
+    self.assertEqual(entries[1]["url"],
+                     "Visited: testing@http://www.google.com/chrome/chrome"
+                     "/eula.html")
     dt1 = datetime.datetime.utcfromtimestamp(entries[1]["ctime"] / 1e6)
-    self.assertEquals(str(dt1), "2011-06-23 18:01:45.238000")
+    self.assertEqual(str(dt1), "2009-12-11 17:55:46.968000")
     dt2 = datetime.datetime.utcfromtimestamp(entries[-1]["ctime"] / 1e6)
-    self.assertEquals(str(dt2), "2010-05-14 18:29:41.531000")
-    self.assertEquals(entries[-1]["url"],
-                      "Visited: testing@http://get.adobe.com/flashplayer/thankyou/activex/?installer=Flash_Player_10_for_Windows_Internet_Explorer&i=McAfee_Security_Scan_Plus&d=Google_Toolbar_6.3")
-    self.assertEquals(len(entries), 18)
+    self.assertEqual(str(dt2), "2011-06-23 18:57:24.250000")
+    self.assertEqual(entries[-1]["url"],
+                     "Visited: testing@mshelp://windows/?id=d063548a-3fc9-"
+                     "4723-99f3-b12a0c4354a8")
+    self.assertEqual(len(entries), 18)
 
   def testErrors(self):
     """Test empty files don't raise errors."""
     c = ie_history.IEParser(StringIO.StringIO())
     entries = [x for x in c.Parse()]
-    self.assertEquals(len(entries), 0)
+    self.assertEqual(len(entries), 0)
 
 
 def main(argv):

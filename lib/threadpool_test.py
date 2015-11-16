@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
 """Tests for the ThreadPool class."""
 
 
@@ -13,6 +12,7 @@ from grr.lib import flags
 from grr.lib import stats
 from grr.lib import test_lib
 from grr.lib import threadpool
+from grr.lib import utils
 
 
 class ThreadPoolTest(test_lib.GRRBaseTest):
@@ -91,7 +91,7 @@ class ThreadPoolTest(test_lib.GRRBaseTest):
 
     test_list = []
     for i in range(self.NUMBER_OF_TASKS):
-      self.test_pool.AddTask(Insert, (test_list, i,))
+      self.test_pool.AddTask(Insert, (test_list, i))
 
     self.test_pool.Join()
     test_list.sort()
@@ -109,10 +109,11 @@ class ThreadPoolTest(test_lib.GRRBaseTest):
         some_obj.process()
 
     self.exception_args = []
+
     def MockException(*args):
       self.exception_args = args
 
-    with test_lib.Stubber(logging, "exception", MockException):
+    with utils.Stubber(logging, "exception", MockException):
       self.test_pool.AddTask(IRaise, (None,), "Raising")
       self.test_pool.AddTask(IRaise, (None,), "Raising")
       self.test_pool.Join()
@@ -141,7 +142,7 @@ class ThreadPoolTest(test_lib.GRRBaseTest):
       raise threading.ThreadError()
 
     # Now simulate failure of creating threads.
-    with test_lib.Stubber(threadpool._WorkerThread, "start", RaisingStart):
+    with utils.Stubber(threadpool._WorkerThread, "start", RaisingStart):
       # Fill all the existing threads and wait for them to become busy.
       self.test_pool.AddTask(Block, (done_event,))
       self.WaitUntil(
@@ -180,7 +181,7 @@ class ThreadPoolTest(test_lib.GRRBaseTest):
 
     # Ensure that the thread pool is able to add the correct number of threads
     # deterministically.
-    with test_lib.Stubber(self.test_pool, "CPUUsage", lambda: 0):
+    with utils.Stubber(self.test_pool, "CPUUsage", lambda: 0):
       # Schedule the maximum number of threads of blocking tasks and the same of
       # insert tasks. The threads are now all blocked, and the inserts are
       # waiting in the queue.
@@ -234,7 +235,7 @@ class ThreadPoolTest(test_lib.GRRBaseTest):
   def testThreadsReaped(self):
     """Check that threads are reaped when too old."""
     self.now = 0
-    with test_lib.MultiStubber(
+    with utils.MultiStubber(
         (time, "time", lambda: self.now),
         (threading, "_time", lambda: self.now),
         (Queue, "_time", lambda: self.now),
@@ -308,6 +309,7 @@ class ThreadPoolTest(test_lib.GRRBaseTest):
 
 
 class DummyConverter(threadpool.BatchConverter):
+
   def __init__(self, **kwargs):
     self.sleep_time = kwargs.pop("sleep_time")
 

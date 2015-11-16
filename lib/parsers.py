@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Registry for parsers and abstract classes for basic parser functionality."""
 
-from grr.lib import artifact_lib
-from grr.lib import rdfvalue
 from grr.lib import registry
+# For CronTabFile, an artifact output type. pylint: disable=unused-import
+from grr.lib.rdfvalues import cronjobs as _
+# pylint: enable=unused-import
 
 
 class Error(Exception):
@@ -33,6 +34,10 @@ class Parser(object):
   # A list of string identifiers for artifacts that this parser can process.
   supported_artifacts = []
 
+  # Any knowledgebase dependencies required by the parser. Dependencies required
+  # by the artifact itself will be inferred from the artifact definition.
+  knowledgebase_dependencies = []
+
   # The semantic types that can be produced by this parser.
   output_types = []
 
@@ -50,27 +55,16 @@ class Parser(object):
 
   @classmethod
   def GetDescription(cls):
-    return cls.__doc__.split("\n")[0]
+    if cls.__doc__:
+      return cls.__doc__.split("\n")[0]
+    else:
+      return ""
 
+  # Additional validation code can be put in this function. This will only be
+  # run in tests.
   @classmethod
   def Validate(cls):
-    """Validate a parser is well defined."""
-    for artifact_to_parse in cls.supported_artifacts:
-      if artifact_to_parse not in artifact_lib.Artifact.classes:
-        raise ParserDefinitionError("Artifact parser %s has an invalid artifact"
-                                    " %s. Artifact is undefined" %
-                                    (cls.__name__, artifact_to_parse))
-
-    for out_type in cls.output_types:
-      if out_type not in rdfvalue.RDFValue.classes:
-        raise ParserDefinitionError("Artifact parser %s has an invalid output "
-                                    "type %s." % (cls.__name__, out_type))
-
-    if cls.process_together:
-      if not hasattr(cls, "ParseMultiple"):
-        raise ParserDefinitionError("Parser %s has set process_together, but "
-                                    "has not defined a ParseMultiple method." %
-                                    cls.__name__)
+    pass
 
 
 class CommandParser(Parser):
@@ -92,6 +86,22 @@ class CommandParser(Parser):
     if return_val != 0:
       raise CommandFailedError("Parsing output of Command %s failed, as "
                                "command had %s return code" % (cmd, return_val))
+
+
+class FileParser(Parser):
+  """Abstract parser for processing files output.
+
+  Must implement the Parse function.
+  """
+
+  # Prevents this from automatically registering.
+  __abstract = True  # pylint: disable=g-bad-name
+
+  def Parse(self, stat, file_object, knowledge_base):
+    """Take the file data, and yield RDFValues."""
+
+  def ParseMultiple(self, stats, file_objects, knowledge_base):
+    """Take the file data, and yield RDFValues."""
 
 
 class WMIQueryParser(Parser):
@@ -118,6 +128,20 @@ class RegistryParser(Parser):
     """Take the stat, and yield RDFValues."""
 
 
+class GenericResponseParser(Parser):
+  """Abstract response parser."""
+
+  def Parse(self, response, knowledge_base):
+    """Parse the response object."""
+
+
+class GrepParser(Parser):
+  """Parser for the results of grep artifacts."""
+
+  def Parse(self, response, knowledge_base):
+    """Parse the FileFinderResult.matches."""
+
+
 class ArtifactFilesParser(Parser):
   """Abstract parser for processing artifact files."""
 
@@ -125,26 +149,5 @@ class ArtifactFilesParser(Parser):
     """Parse artifact files."""
 
 
-class VolatilityPluginParser(Parser):
-  """Abstract parser for processing Volatility results."""
-
-  def ParseMultiple(self, results, knowledge_base):
-    """Parse multiple results in a single call."""
-
-  def Parse(self, results, knowledge_base):
-    """Take the stat, and yield RDFValues."""
-
-  def CheckError(self, result):
-    if result.error:
-      raise ParseError("Volatility returned an error for plugin %s. Error: %s"
-                       % (result.plugin, result.error))
-
-  def IterateSections(self, result, plugin=None):
-    """Iterate through all sections if a plugin matches."""
-    self.CheckError(result)
-    if plugin and result.plugin == plugin:
-      for section in result.sections:
-        headers = [h.name for h in section.table.headers]
-        for row in section.table.rows:
-          yield dict(zip(headers, row.values))
-
+class RekallPluginParser(Parser):
+  """Parses Rekall responses."""

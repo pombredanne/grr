@@ -5,8 +5,12 @@
 
 
 
-
 import re
+
+from grr.lib import parsers
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import standard as rdf_standard
 
 
 class OSXLaunchdJobDict(object):
@@ -34,9 +38,9 @@ class OSXLaunchdJobDict(object):
     self.launchdjobs = launchdjobs
 
     self.blacklist_regex = [
-        re.compile(r'^0x[a-z0-9]+\.anonymous\..+$'),
-        re.compile(r'^0x[a-z0-9]+\.mach_init\.(crash_inspector|Inspector)$'),
-        ]
+        re.compile(r"^0x[a-z0-9]+\.anonymous\..+$"),
+        re.compile(r"^0x[a-z0-9]+\.mach_init\.(crash_inspector|Inspector)$"),
+    ]
 
   def Parse(self):
     """Parse the list of jobs and yield the good ones."""
@@ -53,6 +57,27 @@ class OSXLaunchdJobDict(object):
       True if the item should be filtered (dropped)
     """
     for regex in self.blacklist_regex:
-      if regex.match(launchditem.get('Label', '')):
+      if regex.match(launchditem.get("Label", "")):
         return True
     return False
+
+
+class DarwinPersistenceMechanismsParser(parsers.ArtifactFilesParser):
+  """Turn various persistence objects into PersistenceFiles."""
+  output_types = ["PersistenceFile"]
+  supported_artifacts = ["DarwinPersistenceMechanisms"]
+
+  def Parse(self, persistence, knowledge_base, download_pathtype):
+    """Convert persistence collector output to downloadable rdfvalues."""
+    pathspecs = []
+
+    if isinstance(persistence, rdf_client.OSXServiceInformation):
+      if persistence.program:
+        pathspecs = rdf_paths.PathSpec(path=persistence.program,
+                                       pathtype=download_pathtype)
+      elif persistence.args:
+        pathspecs = rdf_paths.PathSpec(path=persistence.args[0],
+                                       pathtype=download_pathtype)
+
+    for pathspec in pathspecs:
+      yield rdf_standard.PersistenceFile(pathspec=pathspec)

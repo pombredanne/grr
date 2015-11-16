@@ -2,7 +2,7 @@
 """An implementation of an in-memory data store for testing."""
 
 
-import re
+import sys
 import threading
 import time
 
@@ -11,22 +11,19 @@ from grr.lib import data_store
 from grr.lib import utils
 
 
-class FakeTransaction(data_store.Transaction):
+class FakeTransaction(data_store.CommonTransaction):
   """A fake transaction object for testing."""
 
   def __init__(self, store, subject, lease_time=None, token=None):
-    self.data_store = store
-    self.subject = subject
-    self.token = token
+    super(FakeTransaction, self).__init__(store, subject, lease_time=lease_time,
+                                          token=token)
     self.locked = False
-    self.to_set = {}
-    self.to_delete = set()
     if lease_time is None:
       lease_time = config_lib.CONFIG["Datastore.transaction_timeout"]
 
     self.expires = time.time() + lease_time
 
-    with self.data_store.lock:
+    with self.store.lock:
       expires = store.transactions.get(subject)
       if expires and time.time() < expires:
         raise data_store.TransactionError("Subject is locked")
@@ -41,56 +38,20 @@ class FakeTransaction(data_store.Transaction):
 
   def UpdateLease(self, duration):
     self.expires = time.time() + duration
-    self.data_store.transactions[self.subject] = self.expires
-
-  def DeleteAttribute(self, predicate):
-    self.to_delete.add(predicate)
-
-  def ResolveRegex(self, predicate_regex, timestamp=None):
-    # TODO(user): Retrieve values from to_set as well.
-    return self.data_store.ResolveRegex(self.subject, predicate_regex,
-                                        timestamp=timestamp,
-                                        token=self.token)
-
-  def Set(self, predicate, value, timestamp=None, replace=True):
-    if replace:
-      self.to_delete.add(predicate)
-
-    if timestamp is None:
-      timestamp = int(time.time() * 1e6)
-
-    self.to_set.setdefault(predicate, []).append((value, int(timestamp)))
-
-  def Resolve(self, predicate):
-    if predicate in self.to_set:
-      return sorted(self.to_set[predicate], key=lambda vt: vt[1])[-1]
-    if predicate in self.to_delete:
-      return None
-
-    return self.data_store.Resolve(self.subject, predicate, token=self.token)
+    self.store.transactions[self.subject] = self.expires
 
   def Abort(self):
     self.Unlock()
 
   def Commit(self):
-    self.data_store.DeleteAttributes(self.subject, self.to_delete, sync=True,
-                                     token=self.token)
-
-    self.data_store.MultiSet(self.subject, self.to_set, token=self.token)
-
+    super(FakeTransaction, self).Commit()
     self.Unlock()
 
   def Unlock(self):
-    with self.data_store.lock:
+    with self.store.lock:
       if self.locked:
-        self.data_store.transactions.pop(self.subject, None)
+        self.store.transactions.pop(self.subject, None)
         self.locked = False
-
-  def __del__(self):
-    try:
-      self.Abort()
-    except Exception:  # This can raise on cleanup pylint: disable=broad-except
-      pass
 
 
 class FakeDataStore(data_store.DataStore):
@@ -199,69 +160,46 @@ class FakeDataStore(data_store.DataStore):
     subject = utils.SmartUnicode(subject)
     try:
       record = self.subjects[subject]
+      keys_to_delete = []
       for name, values in record.iteritems():
         if name not in attributes:
           continue
 
         start = start or 0
-        end = end or (2 ** 63) - 1  # sys.maxint
+        if end is None:
+          end = (2 ** 63) - 1  # sys.maxint
         new_values = []
         for value, timestamp in values:
           if not start <= timestamp <= end:
             new_values.append((value, int(timestamp)))
 
-        record[name] = new_values
+        if new_values:
+          record[name] = new_values
+        else:
+          keys_to_delete.append(name)
+
+      for key in keys_to_delete:
+        record.pop(key)
     except KeyError:
       pass
 
   @utils.Synchronized
-  def DeleteAttributesRegex(self, subject, regexes, token=None):
-    self.security_manager.CheckDataStoreAccess(token, [subject], "w")
-    for regex in regexes:
-      regex_compiled = re.compile(regex)
-      subject = utils.SmartUnicode(subject)
-      try:
-        record = self.subjects[subject]
+  def ResolveMulti(self, subject, attributes, timestamp=None, limit=None,
+                   token=None):
+    self.security_manager.CheckDataStoreAccess(
+        token, [subject], self.GetRequiredResolveAccess(attributes))
 
-        for attribute in list(record):
-          if regex_compiled.match(utils.SmartStr(attribute)):
-            record.pop(attribute)
-
-      except KeyError:
-        pass
-
-  @utils.Synchronized
-  def MultiResolveRegex(self, subjects, predicate_regex, token=None,
-                        timestamp=None, limit=None):
-    result = {}
-    for subject in subjects:
-      # If any of the subjects is forbidden we fail the entire request.
-      self.security_manager.CheckDataStoreAccess(token, [subject], "r")
-
-      values = self.ResolveRegex(subject, predicate_regex, token=token,
-                                 timestamp=timestamp, limit=limit)
-
-      if values:
-        result[subject] = values
-        if limit:
-          limit -= len(values)
-
-    return result.iteritems()
-
-  @utils.Synchronized
-  def ResolveMulti(self, subject, predicates, token=None, timestamp=None):
-    self.security_manager.CheckDataStoreAccess(token, [subject], "r")
     # Does timestamp represent a range?
     if isinstance(timestamp, (list, tuple)):
-      start, end = timestamp
+      start, end = timestamp  # pylint: disable=unpacking-non-sequence
     else:
       start, end = -1, 1 << 65
 
     start = int(start)
     end = int(end)
 
-    if isinstance(predicates, str):
-      predicates = [predicates]
+    if isinstance(attributes, str):
+      attributes = [attributes]
 
     subject = utils.SmartUnicode(subject)
     try:
@@ -272,9 +210,9 @@ class FakeDataStore(data_store.DataStore):
     # Holds all the attributes which matched. Keys are attribute names, values
     # are lists of timestamped data.
     results = {}
-    for predicate in predicates:
-      for attribute, values in record.iteritems():
-        if predicate == attribute:
+    for attribute in attributes:
+      for attr, values in record.iteritems():
+        if attr == attribute:
           for value, ts in values:
             results_list = results.setdefault(attribute, [])
             # If we are always after the latest ts we clear older ones.
@@ -290,26 +228,69 @@ class FakeDataStore(data_store.DataStore):
             results_list.append((attribute, ts, value))
 
     # Return the results in the same order they requested.
-    for predicate in predicates:
-      for v in sorted(results.get(predicate, [])):
-        yield (predicate, v[2], v[1])
+    remaining_limit = limit
+    for attribute in attributes:
+      # This returns triples of (attribute_name, timestamp, data). We want to
+      # sort by timestamp.
+      for _, ts, data in sorted(results.get(attribute, []), key=lambda x: x[1],
+                                reverse=True):
+        if remaining_limit:
+          remaining_limit -= 1
+          if remaining_limit == 0:
+            yield (attribute, data, ts)
+            return
+
+        yield (attribute, data, ts)
 
   @utils.Synchronized
-  def ResolveRegex(self, subject, predicate_regex, token=None,
-                   timestamp=None, limit=None):
-    """Resolve all predicates for a subject matching a regex."""
-    self.security_manager.CheckDataStoreAccess(token, [subject], "r")
+  def MultiResolvePrefix(self, subjects, attribute_prefix, token=None,
+                         timestamp=None, limit=None):
+    required_access = self.GetRequiredResolveAccess(attribute_prefix)
+
+    result = {}
+    for subject in subjects:
+      # If any of the subjects is forbidden we fail the entire request.
+      self.security_manager.CheckDataStoreAccess(token, [subject],
+                                                 required_access)
+
+      values = self.ResolvePrefix(subject, attribute_prefix, token=token,
+                                  timestamp=timestamp, limit=limit)
+
+      if not values:
+        continue
+
+      if limit:
+        if limit < len(values):
+          values = values[:limit]
+        result[subject] = values
+        limit -= len(values)
+        if limit <= 0:
+          return result.iteritems()
+      else:
+        result[subject] = values
+
+    return result.iteritems()
+
+  @utils.Synchronized
+  def ResolvePrefix(self, subject, attribute_prefix, token=None,
+                    timestamp=None, limit=None):
+    """Resolve all attributes for a subject starting with a prefix."""
+    self.security_manager.CheckDataStoreAccess(
+        token, [subject], self.GetRequiredResolveAccess(attribute_prefix))
+
+    if timestamp in [None, self.NEWEST_TIMESTAMP, self.ALL_TIMESTAMPS]:
+      start, end = 0, (2 ** 63) - 1
     # Does timestamp represent a range?
-    if isinstance(timestamp, (list, tuple)):
-      start, end = timestamp
+    elif isinstance(timestamp, (list, tuple)):
+      start, end = timestamp  # pylint: disable=unpacking-non-sequence
     else:
-      start, end = -1, 1 << 65
+      raise ValueError("Invalid timestamp: %s" % timestamp)
 
     start = int(start)
     end = int(end)
 
-    if isinstance(predicate_regex, str):
-      predicate_regex = [predicate_regex]
+    if isinstance(attribute_prefix, str):
+      attribute_prefix = [attribute_prefix]
 
     subject = utils.SmartUnicode(subject)
     try:
@@ -321,13 +302,11 @@ class FakeDataStore(data_store.DataStore):
     # are lists of timestamped data.
     results = {}
     nr_results = 0
-    for regex in predicate_regex:
-      regex = re.compile(regex)
-
+    for prefix in attribute_prefix:
       for attribute, values in record.iteritems():
         if limit and nr_results >= limit:
           break
-        if regex.match(utils.SmartStr(attribute)):
+        if utils.SmartStr(attribute).startswith(prefix):
           for value, ts in values:
             results_list = results.setdefault(attribute, [])
             # If we are always after the latest ts we clear older ones.
@@ -346,7 +325,29 @@ class FakeDataStore(data_store.DataStore):
               break
 
     result = []
-    for k, values in sorted(results.items()):
-      for v in sorted(values):
-        result.append((k, v[2], v[1]))
+    for attribute_name, values in sorted(results.items()):
+      # Values are triples of (attribute_name, timestamp, data). We want to
+      # sort by timestamp.
+      for _, ts, data in sorted(values, key=lambda x: x[1], reverse=True):
+        # Return triples (attribute_name, data, timestamp).
+        result.append((attribute_name, data, ts))
     return result
+
+  def Size(self):
+    total_size = sys.getsizeof(self.subjects)
+    for subject, record in self.subjects.iteritems():
+      total_size += sys.getsizeof(subject)
+      total_size += sys.getsizeof(record)
+      for attribute, values in record.iteritems():
+        total_size += sys.getsizeof(attribute)
+        total_size += sys.getsizeof(values)
+        for value, timestamp in values:
+          total_size += sys.getsizeof(value)
+          total_size += sys.getsizeof(timestamp)
+    return total_size
+
+  def PrintSubjects(self, literal=None):
+    for s in sorted(self.subjects):
+      if literal and literal not in s:
+        continue
+      print s

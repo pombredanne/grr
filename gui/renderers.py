@@ -17,7 +17,6 @@ from django import template
 
 import logging
 
-from grr.lib import access_control
 from grr.lib import data_store
 from grr.lib import registry
 from grr.lib import utils
@@ -37,11 +36,64 @@ def GetNextId():
   return COUNTER
 
 
+def StringifyJSON(item):
+  """Recursively convert item to a string.
+
+  Since JSON can only encode strings we need to convert complex types to string.
+
+  Args:
+    item: A python data object.
+
+  Returns:
+    A data object suitable for JSON encoding.
+  """
+  if isinstance(item, (tuple, list)):
+    return [StringifyJSON(x) for x in item]
+
+  elif isinstance(item, dict):
+    result = {}
+    for k, v in item.items():
+      result[k] = StringifyJSON(v)
+
+    return result
+
+  elif type(item) in (int, long, float):
+    return item
+
+  elif item is None:
+    return None
+
+  elif type(item) is bool:
+    return item
+
+  else:
+    return utils.SmartUnicode(item)
+
+
 class Template(template.Template):
   """A specialized template which supports concatenation."""
 
-  def __init__(self, template_string):
+  def __init__(self, template_string, allow_script=False):
+    """Template constructor.
+
+    Args:
+      template_string: Template contents.
+      allow_script: If False, ValueError will be raised when <script>
+                    tag is found inside template_string. NOTE: this is
+                    not a security check, but rather a convenience check
+                    for developers so that they put javascript code into
+                    the right place: not into templates, but into separate
+                    javascript files.
+    Raises:
+      ValueError: if allow_script is False and <script> tag is found
+                  inside the template.
+    """
     self.template_string = template_string
+    if not allow_script and "<script" in template_string:
+      raise ValueError("<script> tags inside templates are not allowed. Please "
+                       " use separate javascript files and "
+                       "Renderer.CallJavascript() calls.")
+
     super(Template, self).__init__(template_string)
 
   def Copy(self):
@@ -57,6 +109,10 @@ class Template(template.Template):
   def __radd__(self, other):
     """Support concatenation."""
     return Template(utils.SmartStr(other) + self.template_string)
+
+  def RawHTML(self, **kwargs):
+    kwargs["unique"] = GetNextId()
+    return self.render(template.Context(kwargs))
 
 
 class Renderer(object):
@@ -90,13 +146,13 @@ class Renderer(object):
 <script>
   grr.ExecuteRenderer("{{method|escapejs}}", {{js_state_json|safe}});
 </script>
-""")
+""", allow_script=True)
 
   help_template = Template("""
 {% if this.context_help_url %}
 <div style="width: 15px; height: 0px; position: absolute; right: 10px; top:0">
   <a href="/help/{{this.context_help_url|escape}}" target="_blank">
-  <i class="icon-question-sign"></i></a>
+  <i class="glyphicon glyphicon-question-sign"></i></a>
 </div>
 {% endif %}
 """)
@@ -127,9 +183,13 @@ class Renderer(object):
       Response object.
     """
     js_state = self.state.copy()
-    js_state.update(dict(unique=self.unique,
-                         id=self.id, renderer=self.__class__.__name__))
-    js_state.update(kwargs)
+    js_state.update(dict(
+        unique=self.unique,
+        id=self.id, renderer=self.__class__.__name__))
+
+    # Since JSON can only represent strings, we must force inputs to a string
+    # here.
+    js_state.update(StringifyJSON(kwargs))
 
     if "." not in method:
       method = "%s.%s" % (self.__class__.__name__, method)
@@ -168,8 +228,7 @@ class Renderer(object):
       self.id = request.REQ.get("id", hash(self))
 
     # Make the encoded state available for our template.
-    encoder = json.JSONEncoder()
-    self.state_json = encoder.encode(self.state)
+    self.state_json = JsonDumpForScriptContext(self.state)
 
     return response
 
@@ -239,29 +298,17 @@ class UserLabelCheckMixin(object):
   @classmethod
   def CheckAccess(cls, request):
     """If the user is not in the AUTHORIZED_LABELS, reject this renderer."""
-    if data_store.DB.security_manager.CheckUserLabels(
+    data_store.DB.security_manager.CheckUserLabels(
         request.token.username, cls.AUTHORIZED_LABELS,
-        token=request.token):
-      return
-    raise access_control.UnauthorizedAccess("User %s not allowed." %
-                                            request.token.username)
+        token=request.token)
 
 
 class ErrorHandler(Renderer):
   """An error handler decorator which can be applied on individual methods."""
 
-  message_template = Template("""
-<script>
-  grr.publish("grr_messages", "Error: {{error|escapejs}}");
-  grr.publish("grr_traceback", "Error: {{backtrace|escapejs}}");
-</script>
-""")
-
-  def __init__(self, message_template=None, status_code=503, **kwargs):
+  def __init__(self, status_code=503, **kwargs):
     super(ErrorHandler, self).__init__(**kwargs)
     self.status_code = status_code
-    if message_template is not None:
-      self.message_template = message_template
 
   def __call__(self, func):
 
@@ -271,12 +318,11 @@ class ErrorHandler(Renderer):
         return func(*args, **kwargs)
       except Exception as e:  # pylint: disable=broad-except
         logging.exception(utils.SmartUnicode(e))
-        response = http.HttpResponse(content_type="text/json")
-
-        response.write(")]}\n" + JsonDumpForScriptContext(
-            dict(message=utils.SmartUnicode(e),
-                 traceback=traceback.format_exc())))
-
+        response = http.HttpResponse()
+        response = self.CallJavascript(response,
+                                       "ErrorHandler.Layout",
+                                       error=utils.SmartUnicode(e),
+                                       backtrace=traceback.format_exc())
         response.status_code = 500
 
         return response
@@ -308,9 +354,12 @@ class TemplateRenderer(Renderer):
     if apply_template is None:
       apply_template = self.layout_template
 
+    canary_mode = getattr(request, "canary_mode", False)
+
     return self.RenderFromTemplate(apply_template, response,
                                    this=self, id=self.id, unique=self.unique,
-                                   renderer=self.__class__.__name__)
+                                   renderer=self.__class__.__name__,
+                                   canary_mode=canary_mode)
 
   def RenderAjax(self, request, response):
     return TemplateRenderer.Layout(self, request, response,
@@ -323,6 +372,32 @@ class TemplateRenderer(Renderer):
     result = http.HttpResponse(content_type="text/html")
     method(request, result, **kwargs)
     return result.content
+
+  def __str__(self):
+    return self.RawHTML()
+
+
+class AngularDirectiveRenderer(TemplateRenderer):
+  """Renderers specified Angular directive with given parameters."""
+
+  directive = None
+  directive_args = None
+
+  layout_template = Template("""
+<div class="full-width-height" id="{{unique|escape}}"></div>
+""")
+
+  def Layout(self, request, response, **kwargs):
+    if self.directive is None:
+      raise ValueError("'directive' attribute has to be specified.")
+
+    self.directive_args = self.directive_args or {}
+
+    response = super(AngularDirectiveRenderer, self).Layout(
+        request, response, **kwargs)
+    return self.CallJavascript(response, "AngularDirectiveRenderer.Layout",
+                               directive=self.directive,
+                               directive_args=self.directive_args)
 
 
 class EscapingRenderer(TemplateRenderer):
@@ -408,6 +483,7 @@ class TableRenderer(TemplateRenderer):
   """
 
   fixed_columns = False
+  show_total_count = False
   custom_class = ""
 
   # We receive change path events from this queue
@@ -456,8 +532,7 @@ class TableRenderer(TemplateRenderer):
       except KeyError:
         pass
 
-    row_index += 1
-    self.size = max(self.size, row_index)
+    self.size = max(self.size, row_index + 1)
 
   def AddRowFromFd(self, index, fd):
     """Adds the row from an AFF4 object."""
@@ -467,6 +542,7 @@ class TableRenderer(TemplateRenderer):
         column.AddRowFromFd(index, fd)
       except AttributeError:
         pass
+    self.size = max(self.size, index + 1)
 
   def GetCell(self, row_index, column_name):
     """Gets the value of a Cell."""
@@ -519,13 +595,6 @@ class TableRenderer(TemplateRenderer):
     </tbody>
 </table>
 </div>
-<script>
-  grr.table.newTable("{{renderer|escapejs}}", "table_{{id|escapejs}}",
-    "{{unique|escapejs}}", {{this.state_json|safe}});
-
-  grr.publish("grr_messages", "{{this.message|escapejs}}");
-  $("#table_{{id|escapejs}}").attr({{this.state_json|safe}});
-</script>
 """) + TemplateRenderer.help_template
 
   # Renders the inside of the tbody.
@@ -547,11 +616,6 @@ class TableRenderer(TemplateRenderer):
   </td>
 </tr>
 {% endif %}
-<script>
-  var table = $('#{{id}}');
-
-  grr.publish("grr_messages", "{{this.message|escapejs}}");
-</script>
 """)
 
   def Layout(self, request, response):
@@ -591,7 +655,11 @@ class TableRenderer(TemplateRenderer):
     delegate_renderer = self.__class__(id=self.id, state=self.state.copy())
     self.table_contents = delegate_renderer.RenderAjax(request, tmp).content
 
-    return super(TableRenderer, self).Layout(request, response)
+    response = super(TableRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "TableRenderer.Layout",
+                               renderer=self.__class__.__name__,
+                               table_state=self.state,
+                               message=self.message)
 
   def BuildTable(self, start_row, end_row, request):
     """Populate the table between the start and end rows.
@@ -619,8 +687,10 @@ class TableRenderer(TemplateRenderer):
 
     # The limit_row is merely a suggestion for the BuildTable method, but if
     # the BuildTable method wants to render more we can render more here.
-    end_row = self.BuildTable(start_row, limit_row + start_row, request)
-    if not end_row: end_row = min(start_row + limit_row, self.size)
+    self.additional_rows = self.BuildTable(start_row,
+                                           limit_row + start_row, request)
+
+    end_row = min(start_row + limit_row, self.size)
 
     self.rows = []
     for index in xrange(start_row, end_row):
@@ -636,7 +706,8 @@ class TableRenderer(TemplateRenderer):
 
       self.rows.append((row, row_options.items()))
 
-    self.additional_rows = self.size > end_row
+    if self.additional_rows is None:
+      self.additional_rows = self.size > end_row
 
     # If we did not write any additional rows in this round trip we ensure the
     # table does not try to fetch more rows. This is a safety check in case
@@ -645,8 +716,10 @@ class TableRenderer(TemplateRenderer):
     if not self.rows:
       self.additional_rows = False
 
-    return super(TableRenderer, self).Layout(request, response,
-                                             apply_template=self.ajax_template)
+    response = super(TableRenderer, self).Layout(
+        request, response, apply_template=self.ajax_template)
+    return self.CallJavascript(response, "TableRenderer.RenderAjax",
+                               message=self.message)
 
   def Download(self, request, _):
     """Export the table in CSV.
@@ -701,13 +774,16 @@ class TreeRenderer(TemplateRenderer):
   publish_select_queue = "tree_select"
 
   layout_template = Template("""
-<script>
-grr.grrTree("{{ renderer|escapejs }}", "{{ id|escapejs }}",
-            "{{ this.publish_select_queue|escapejs }}",
-            {{ this.state_json|safe }});
-</script>""")
+<div id="{{unique|escape}}"></div>""")
 
   hidden_branches = []     # Branches to hide in the tree.
+
+  def Layout(self, request, response):
+    response = super(TreeRenderer, self).Layout(request, response)
+    return self.CallJavascript(response, "TreeRenderer.Layout",
+                               renderer=self.__class__.__name__,
+                               publish_select_queue=self.publish_select_queue,
+                               tree_state=self.state)
 
   def RenderAjax(self, request, response):
     """Render the tree leafs for the tree path."""
@@ -741,10 +817,8 @@ grr.grrTree("{{ renderer|escapejs }}", "{{ id|escapejs }}",
                          attr=dict(id=DeriveIDFromPath(path),
                                    path=path)))
 
-    encoder = json.JSONEncoder()
-    return http.HttpResponse(encoder.encode(dict(
-        data=result, message=self.message, id=self.id)),
-                             content_type="text/json")
+    return JsonResponse(dict(
+        data=result, message=self.message, id=self.id))
 
   def AddElement(self, name, behaviour="branch", icon=None, friendly_name=None):
     """This should be called by the RenderBranch method to prepare the tree."""
@@ -800,75 +874,6 @@ class TabLayout(TemplateRenderer):
   </ul>
   <div id="tab_contents_{{unique|escape}}" class="tab-content"></div>
 </div>
-
-<!-- TODO: rewrite. it's bad to generate JS code in a loop -->
-<script>
-// Disable the tabs which need to be disabled.
-$("li").removeClass("disabled");
-$("li a").removeClass("disabled");
-
-{% for disabled in this.disabled %}
-$("li[renderer={{disabled|escapejs}}]").addClass("disabled");
-$("li a[renderer={{disabled|escapejs}}]").addClass("disabled");
-{% endfor %}
-</script>
-<script>
-  // Store the state of this widget.
-  $("#{{unique|escapejs}}").data().state = {{this.state_json|safe}};
-
-  // Add click handlers to switch tabs.
-  $("#{{unique|escapejs}} li a").click(function (e) {
-    e.preventDefault();
-    if ($(this).hasClass("disabled")) return false;
-
-    var renderer = this.attributes["renderer"].value;
-
-    {% if this.tab_hash %}
-      grr.publish("hash_state", "{{this.tab_hash|escapejs}}", renderer);
-    {% endif %}
-
-    // Make a new div to accept the content of the tab rather than drawing
-    // directly on the content area. This prevents spurious drawings due to
-    // latent ajax calls.
-    content_area = $("#tab_contents_{{unique|escapejs}}");
-    content_area.html('<div id="' + renderer + '_{{unique|escapejs}}">')
-    update_area = $("#" + renderer + "_{{unique|escapejs}}");
-
-    // We append the state of this widget which is stored on the unique element.
-    grr.layout(renderer, renderer + "_{{unique|escapejs}}",
-       $("#{{unique|escapejs}}").data().state);
-
-    // Clear previously selected tab.
-    $("#{{unique|escapejs}}").find("li").removeClass("active");
-
-    // Select the new one.
-    $(this).parent().addClass("active");
-  });
-
-  // Find first enabled tab (the default selection).
-  var enabledTabs = $.map(
-    $("#{{unique|escapejs}} > li:not(.disabled)"),
-    function(val) {
-      return $(val).attr("renderer");
-    }
-  );
-
-  // Select the first tab at first.
-  {% if this.tab_hash %}
-    var selected = grr.hash.{{this.tab_hash|safe}} ||
-      "{{this.selected|escapejs}}";
-  {% else %}
-    var selected = "{{this.selected|escapejs}}";
-  {% endif %}
-
-  if (enabledTabs.indexOf(selected) == -1) {
-    selected = enabledTabs.length > 0 ? enabledTabs[0] : null;
-  }
-  if (selected) {
-    $($("#{{unique|escapejs}} li a[renderer='" + selected + "']")).click();
-  }
-</script>
-
 """) + TemplateRenderer.help_template
 
   def __init__(self, *args, **kwargs):
@@ -884,7 +889,12 @@ $("li a[renderer={{disabled|escapejs}}]").addClass("disabled");
     self.indexes = [(self.delegated_renderers[i], self.names[i])
                     for i in range(len(self.names))]
 
-    return super(TabLayout, self).Layout(request, response, apply_template)
+    response = super(TabLayout, self).Layout(request, response, apply_template)
+    return self.CallJavascript(response, "TabLayout.Layout",
+                               disabled=self.disabled,
+                               tab_layout_state=self.state,
+                               tab_hash=self.tab_hash,
+                               selected_tab=self.selected)
 
 
 class Splitter(TemplateRenderer):
@@ -931,32 +941,6 @@ class Splitter(TemplateRenderer):
     </div>
   </div>
 </div>
-<script>
-      $("#{{ id|escapejs }}")
-          .splitter({
-              minAsize: {{ this.min_left_pane_width }},
-              maxAsize: {{ this.max_left_pane_width }},
-              splitVertical: true,
-              A: $('#{{id|escapejs}}_leftPane'),
-              B: $('#{{id|escapejs}}_rightPane'),
-              animSpeed: 50,
-              closeableto: 0});
-
-      $("#{{id|escapejs}}_rightSplitterContainer")
-          .splitter({
-              splitHorizontal: true,
-              A: $('#{{id|escapejs}}_rightTopPane'),
-              B: $('#{{id|escapejs}}_rightBottomPane'),
-              animSpeed: 50,
-              closeableto: 100});
-
-      // Triggering resize event here to ensure that splitters will position
-      // themselves correctly.
-      $("#{{ id|escapejs }}").resize();
-
-// Pass our state to our children.
-var state = $.extend({}, grr.state, {{this.state_json|safe}});
-</script>
 """)
 
   def Layout(self, request, response):
@@ -973,7 +957,10 @@ var state = $.extend({}, grr.state, {{this.state_json|safe}});
     self.bottom_right_pane = self.classes[self.bottom_right_renderer](
         id="%s_rightBottomPane" % self.id).RawHTML(request)
 
-    return super(Splitter, self).Layout(request, response)
+    response = super(Splitter, self).Layout(request, response)
+    return self.CallJavascript(response, "Splitter.Layout",
+                               min_left_pane_width=self.min_left_pane_width,
+                               max_left_pane_width=self.max_left_pane_width)
 
 
 class Splitter2Way(TemplateRenderer):
@@ -989,17 +976,6 @@ class Splitter2Way(TemplateRenderer):
   {{this.bottom_pane|safe}}
 </div>
 <div id="{{unique}}"/>
-<script>
-      $("#{{id|escapejs}}")
-          .splitter({
-              splitHorizontal: true,
-              A: $('#{{id|escapejs}}_topPane'),
-              B: $('#{{id|escapejs}}_bottomPane'),
-              animSpeed: 50,
-              closeableto: 100});
-
-var state = $.extend({}, grr.state, {{this.state_json|safe}});
-</script>
 """) + TemplateRenderer.help_template
 
   def Layout(self, request, response):
@@ -1015,7 +991,8 @@ var state = $.extend({}, grr.state, {{this.state_json|safe}});
         id="%s_bottomPane" % self.id,
         state=self.state.copy()).RawHTML(request)
 
-    return super(Splitter2Way, self).Layout(request, response)
+    response = super(Splitter2Way, self).Layout(request, response)
+    return self.CallJavascript(response, "Splitter2Way.Layout")
 
 
 class Splitter2WayVertical(TemplateRenderer):
@@ -1035,23 +1012,11 @@ class Splitter2WayVertical(TemplateRenderer):
   {{this.right_pane|safe}}
 </div>
 <div id="{{unique}}"/>
-<script>
-      $("#{{id|escapejs}}")
-          .splitter({
-              minAsize: {{ this.min_left_pane_width }},
-              maxAsize: {{ this.max_left_pane_width }},
-              splitVertical: true,
-              A: $('#{{id|escapejs}}_leftPane'),
-              B: $('#{{id|escapejs}}_rightPane'),
-              animSpeed: 50,
-              closeableto: 0});
-
-</script>
 """) + TemplateRenderer.help_template
 
   def Layout(self, request, response):
     """Layout."""
-    self.id = request.REQ.get("id", hash(self))
+    self.id = self.id or request.REQ.get("id", hash(self))
 
     # Pre-render the top and bottom layout contents to avoid extra round trips.
     self.left_pane = self.classes[self.left_renderer](
@@ -1062,7 +1027,10 @@ class Splitter2WayVertical(TemplateRenderer):
         id="%s_rightPane" % self.id,
         state=self.state.copy()).RawHTML(request)
 
-    return super(Splitter2WayVertical, self).Layout(request, response)
+    response = super(Splitter2WayVertical, self).Layout(request, response)
+    return self.CallJavascript(response, "Splitter2WayVertical.Layout",
+                               min_left_pane_width=self.min_left_pane_width,
+                               max_left_pane_width=self.max_left_pane_width)
 
 
 def DeriveIDFromPath(path):
@@ -1091,15 +1059,10 @@ def DeriveIDFromPath(path):
 
 class ErrorRenderer(TemplateRenderer):
   """Render Exceptions."""
-  layout_template = Template("""
-<script>
-  grr.publish("messages", "{{this.value|escapejs}}");
-</script>
-""")
 
   def Layout(self, request, response):
-    self.value = request.REQ.get("value", "")
-    return super(ErrorRenderer, self).Layout(request, response)
+    response = self.CallJavascript(response, "ErrorRenderer.Layout",
+                                   value=request.REQ.get("value", ""))
 
 
 class EmptyRenderer(TemplateRenderer):
@@ -1110,6 +1073,12 @@ class EmptyRenderer(TemplateRenderer):
 
 class ConfirmationDialogRenderer(TemplateRenderer):
   """Renderer used to render confirmation dialogs."""
+
+  # If this is True, the container div won't have "modal-dialog" class. This is
+  # useful when we want to render the dialog inside existing modal dialog,
+  # because having 2 nested divs both having "modal-dialog" class confuses
+  # Bootstrap.
+  inner_dialog_only = False
 
   header = None
   cancel_button_title = "Close"
@@ -1127,33 +1096,37 @@ class ConfirmationDialogRenderer(TemplateRenderer):
   content_template = Template("")
 
   layout_template = Template("""
-<div class="FormData">
-  {% if this.header %}
-  <div class="modal-header">
-    <button type="button" class="close" data-dismiss="modal" aria-hidden="true">
-      x</button>
-    <h3>{{this.header|escape}}</h3>
-  </div>
-  {% endif %}
+<div class="FormData {% if not this.inner_dialog_only %}modal-dialog{% endif %}">
+  <div class="modal-content">
+    {% if this.header %}
+    <div class="modal-header">
+      <button type="button" class="close" data-dismiss="modal"
+        aria-hidden="true" ng-click="$dismiss()">
+        x
+      </button>
+      <h3>{{this.header|escape}}</h3>
+    </div>
+    {% endif %}
 
-  <div class="modal-body">
-    <form id="form_{{unique|escape}}" class="form-horizontal">
-      {{this.rendered_content|safe}}
-    </form>
-    <div id="results_{{unique|escape}}"></div>
-    <div id="check_access_results_{{unique|escape}}" class="hide"></div>
-  </div>
-  <div class="modal-footer">
-    <ul class="nav pull-left">
-      <div class="navbar-text" id="footer_message_{{unique}}"></div>
-    </ul>
+    <div class="modal-body">
+      <form id="form_{{unique|escape}}" class="form-horizontal">
+        {{this.rendered_content|safe}}
+      </form>
+      <div id="results_{{unique|escape}}"></div>
+      <div id="check_access_results_{{unique|escape}}" class="hide"></div>
+    </div>
+    <div class="modal-footer">
+      <ul class="nav pull-left">
+        <div class="navbar-text" id="footer_message_{{unique}}"></div>
+      </ul>
 
-    <button class="btn" data-dismiss="modal" name="Cancel"
-      aria-hidden="true">
-      {{this.cancel_button_title|escape}}</button>
-    <button id="proceed_{{unique|escape}}" name="Proceed"
-      class="btn btn-primary">
-      {{this.proceed_button_title|escape}}</button>
+      <button class="btn btn-default" data-dismiss="modal" name="Cancel"
+        aria-hidden="true" ng-click="$dismiss()">
+        {{this.cancel_button_title|escape}}</button>
+      <button id="proceed_{{unique|escape}}" name="Proceed"
+        class="btn btn-primary">
+        {{this.proceed_button_title|escape}}</button>
+    </div>
   </div>
 </div>
 """)
@@ -1194,3 +1167,18 @@ def JsonDumpForScriptContext(dump_object):
   # and then by the json parser, so we must escape < & > to prevent someone
   # including <script> tags and creating XSS security bugs.
   return js_state_json.replace("<", r"\\x3c").replace(">", r"\\x3e")
+
+
+def JsonResponse(dump_object, xssi_protection=True):
+  """Return a django JSON response object with correct headers."""
+  result = JsonDumpForScriptContext(dump_object)
+  if xssi_protection:
+    result = ")]}\n" + result
+
+  response = http.HttpResponse(
+      result, content_type="application/json; charset=utf-8")
+
+  response["Content-Disposition"] = "attachment; filename=response.json"
+  response["X-Content-Type-Options"] = "nosniff"
+
+  return response

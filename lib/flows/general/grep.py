@@ -6,29 +6,46 @@ import stat
 
 from grr.lib import aff4
 from grr.lib import flow
-from grr.lib import rdfvalue
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
-class SearchFileContentArgs(rdfvalue.RDFProtoStruct):
+class SearchFileContentArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.SearchFileContentArgs
 
 
 class SearchFileContent(flow.GRRFlow):
   """A flow that runs a glob first and then issues a grep on the results.
 
-  This flow can be used to search for files by filename. Simply specify a glob
-  expression for the filename:
+  DEPRECATED.
+  This flow is now deprecated in favor of FileFinder. To use FileFinder instead
+  of SearchFileContent:
+  Specify list of glob expressions corresponding to the files you want to
+  search in. Add conditions that will be applied to found files. You can
+  use "literal match" and "regex match" conditions. Set "action" to
+  "Stat" if you're just interested in matches, or "Download" if you want to
+  also download the matching files.
+  ------------------------------------------------------------------------------
 
-  %%KnowledgeBase.environ_windir%%/notepad.exe
+  This flow can be used to search for files by specifying a filename glob.
+  e.g. this glob will search recursively under the environment directory for
+  files called notepad with any extension:
 
-  By also specifying a grep specification, the file contents can also be
-  searched.
+  %%KnowledgeBase.environ_windir%%/**notepad.*
+
+  The default ** recursion depth is 3 levels, and can be modified using a number
+  after the ** like this:
+
+  %%KnowledgeBase.environ_windir%%/**10notepad.*
+
+  Optionally you can also specify File Content Search parameters to search file
+  contents.
   """
   category = "/Filesystem/"
   friendly_name = "Search In Files"
-  args_type = rdfvalue.SearchFileContentArgs
-  behaviours = flow.GRRFlow.behaviours + "BASIC"
+  args_type = SearchFileContentArgs
+  behaviours = flow.GRRFlow.behaviours + "ADVANCED"
 
   @classmethod
   def GetDefaultArgs(cls, token=None):
@@ -38,7 +55,7 @@ class SearchFileContent(flow.GRRFlow):
   @flow.StateHandler(next_state=["Grep"])
   def Start(self):
     """Run the glob first."""
-    if self.runner.output:
+    if self.runner.output is not None:
       self.runner.output = aff4.FACTORY.Create(
           self.runner.output.urn, "GrepResultsCollection", mode="rw",
           token=self.token)
@@ -46,15 +63,15 @@ class SearchFileContent(flow.GRRFlow):
       self.runner.output.Set(self.runner.output.Schema.DESCRIPTION(
           "SearchFiles {0}".format(self.__class__.__name__)))
 
-    self.CallFlow("Glob", next_state="Grep",
+    self.CallFlow("Glob", next_state="Grep", root_path=self.args.root_path,
                   paths=self.args.paths, pathtype=self.args.pathtype)
 
-  @flow.StateHandler(next_state=["WriteHits", "End"])
+  @flow.StateHandler(next_state=["WriteHits"])
   def Grep(self, responses):
     if responses.success:
       # Grep not specified - just list all hits.
       if not self.args.grep:
-        msgs = [rdfvalue.BufferReference(pathspec=r.pathspec)
+        msgs = [rdf_client.BufferReference(pathspec=r.pathspec)
                 for r in responses]
         self.CallStateInline(messages=msgs, next_state="WriteHits")
       else:
@@ -64,8 +81,8 @@ class SearchFileContent(flow.GRRFlow):
           if not stat.S_ISDIR(response.st_mode):
 
             # Cast the BareGrepSpec to a GrepSpec type.
-            request = rdfvalue.GrepSpec(target=response.pathspec,
-                                        **self.args.grep.AsDict())
+            request = rdf_client.GrepSpec(target=response.pathspec,
+                                          **self.args.grep.AsDict())
             self.CallClient("Grep", request=request, next_state="WriteHits",
                             request_data=dict(pathspec=response.pathspec))
 

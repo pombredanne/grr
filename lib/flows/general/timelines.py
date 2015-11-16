@@ -4,12 +4,14 @@
 from grr.lib import aff4
 from grr.lib import data_store
 from grr.lib import flow
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.aff4_objects import timeline
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
-class MACTimesArgs(rdfvalue.RDFProtoStruct):
+class MACTimesArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.MACTimesArgs
 
 
@@ -24,7 +26,7 @@ class MACTimes(flow.GRRFlow):
   def Start(self):
     """This could take a while so we just schedule for the worker."""
     self.state.Register("urn", self.client_id.Add(self.args.path))
-    if self.runner.output:
+    if self.runner.output is not None:
       self.runner.output = aff4.FACTORY.Create(
           self.runner.output.urn, "GRRTimeSeries", token=self.token)
 
@@ -61,11 +63,11 @@ class MACTimes(flow.GRRFlow):
     child_urns = self._ListVFSChildren([self.state.urn])
     attribute = aff4.Attribute.GetAttributeByName("stat")
 
-    for subject, values in data_store.DB.MultiResolveRegex(
+    for subject, values in data_store.DB.MultiResolvePrefix(
         child_urns, attribute.predicate, token=self.token, limit=10000000):
       for _, serialized, _ in values:
-        stat = rdfvalue.StatEntry(serialized)
-        event = rdfvalue.Event(source=utils.SmartUnicode(subject),
+        stat = rdf_client.StatEntry(serialized)
+        event = timeline.Event(source=utils.SmartUnicode(subject),
                                stat=stat)
 
         # Add a new event for each MAC time if it exists.
@@ -78,5 +80,5 @@ class MACTimes(flow.GRRFlow):
             # We are taking about the file which is a direct child of the
             # source.
             event.subject = utils.SmartUnicode(subject)
-            if self.runner.output:
+            if self.runner.output is not None:
               self.runner.output.AddEvent(event)

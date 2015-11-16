@@ -18,25 +18,16 @@ python grr/tools/grr_server.py \
 
 
 
-import threading
-import time
-
-
 # pylint: disable=unused-import,g-bad-import-order
 from grr.lib import server_plugins
 # pylint: enable=unused-import,g-bad-import-order
 
 from grr.gui import admin_ui
-from grr.lib import config_lib
 from grr.lib import flags
-from grr.lib import startup
+from grr.server.data_server import data_server
 from grr.tools import http_server
-from grr.worker import enroller
 from grr.worker import worker
 
-
-flags.DEFINE_bool("start_enroller", False,
-                  "Start the server as enroller.")
 
 flags.DEFINE_bool("start_worker", False,
                   "Start the server as worker.")
@@ -47,62 +38,32 @@ flags.DEFINE_bool("start_http_server", False,
 flags.DEFINE_bool("start_ui", False,
                   "Start the server as user interface.")
 
+flags.DEFINE_bool("start_dataserver", False,
+                  "Start the dataserver.")
+
 
 def main(argv):
   """Sets up all the component in their own threads."""
-  flag_list = [flags.FLAGS.start_worker, flags.FLAGS.start_ui,
-               flags.FLAGS.start_http_server, flags.FLAGS.start_enroller]
-  enabled_flags = [f for f in flag_list if f]
 
-  # If no start preferences were provided start everything.
-  if not enabled_flags:
-    flags.FLAGS.start_worker = True
-    flags.FLAGS.start_enroller = True
-    flags.FLAGS.start_http_server = True
-    flags.FLAGS.start_ui = True
-
-  if len(enabled_flags) != 1:
-    # If we only have one flag, we are running in single component mode and we
-    # want the component to do the initialization. Otherwise we initialize as
-    # a SingleServer.
-    config_lib.CONFIG.AddContext(
-        "SingleServer Context",
-        "Context applied when running all functions in a single server.")
-    startup.Init()
-
-  # Start the worker thread if necessary.
+  # Start as a worker.
   if flags.FLAGS.start_worker:
-    worker_thread = threading.Thread(target=worker.main, args=[argv],
-                                     name="Worker")
-    worker_thread.daemon = True
-    worker_thread.start()
+    worker.main([argv])
 
-  # Start the enroller thread if necessary.
-  if flags.FLAGS.start_enroller:
-    enroller_thread = threading.Thread(target=enroller.main, args=[argv],
-                                       name="Enroller")
-    enroller_thread.daemon = True
-    enroller_thread.start()
+  # Start as a HTTP server that clients communicate with.
+  elif flags.FLAGS.start_http_server:
+    http_server.main([argv])
 
-  # Start the HTTP server thread, that clients communicate with, if necessary.
-  if flags.FLAGS.start_http_server:
-    http_thread = threading.Thread(target=http_server.main, args=[argv],
-                                   name="HTTP Server")
-    http_thread.daemon = True
-    http_thread.start()
+  # Start as an AdminUI.
+  elif flags.FLAGS.start_ui:
+    admin_ui.main([argv])
 
-  # Start the UI thread if necessary.
-  if flags.FLAGS.start_ui:
-    ui_thread = threading.Thread(target=admin_ui.main, args=[argv],
-                                 name="GUI")
-    ui_thread.daemon = True
-    ui_thread.start()
+  # Start as the data server.
+  elif flags.FLAGS.start_dataserver:
+    data_server.main([argv])
 
-  try:
-    while True:
-      time.sleep(100)
-  except KeyboardInterrupt:
-    pass
+  # If no flags were set then raise.
+  else:
+    raise RuntimeError("No component specified to start")
 
 
 if __name__ == "__main__":

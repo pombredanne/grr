@@ -7,19 +7,21 @@ from grr.gui import runtests_test
 from grr.lib import aff4
 from grr.lib import flags
 from grr.lib import hunts
-from grr.lib import rdfvalue
 from grr.lib import test_lib
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import foreman as rdf_foreman
 
 
 class TestCrashView(test_lib.GRRSeleniumTest):
-  client_id = rdfvalue.ClientURN("C.0000000000000001")
+  """Tests the crash view."""
+
+  client_id = rdf_client.ClientURN("C.0000000000000001")
 
   def SetUpCrashedFlow(self):
     client = test_lib.CrashClientMock(self.client_id, self.token)
     for _ in test_lib.TestFlowHelper(
-        "ListDirectory", client, client_id=self.client_id,
-        pathspec=rdfvalue.PathSpec(path="/", pathtype=1), token=self.token,
-        check_flow_errors=False):
+        "FlowWithOneClientRequest", client, client_id=self.client_id,
+        token=self.token, check_flow_errors=False):
       pass
 
   def testClientCrashedFlow(self):
@@ -29,7 +31,7 @@ class TestCrashView(test_lib.GRRSeleniumTest):
 
     self.Open("/")
 
-    self.Type("client_query", "0001")
+    self.Type("client_query", "C.0000000000000001")
     self.Click("client_query_submit")
 
     self.WaitUntilEqual(u"C.0000000000000001",
@@ -40,18 +42,17 @@ class TestCrashView(test_lib.GRRSeleniumTest):
     self.WaitUntil(self.IsTextPresent, "VFSGRRClient")
 
     self.Click("css=a:contains('Manage launched flows')")
-    self.WaitUntil(self.IsTextPresent, "ListDirectory")
+    self.WaitUntil(self.IsTextPresent, "FlowWithOneClientRequest")
 
     # Check that skull icon is in place.
-    self.WaitUntil(self.IsElementPresent,
-                   "css=img[src='/static/images/skull-icon.png']")
+    self.WaitUntil(self.IsElementPresent, "css=img[src$='skull-icon.png']")
 
     # Click on the crashed flow.
-    self.Click("css=td:contains(ListDirectory)")
+    self.Click("css=td:contains(FlowWithOneClientRequest)")
 
     # Check that "Flow Information" tab displays crash data.
     self.WaitUntil(self.AllTextsPresent, [
-        "CLIENT_CRASH", "aff4:/flows/W:CrashHandler",
+        "CLIENT_CRASH", "aff4:/flows/", ":CrashHandler",
         "Client killed during transaction"])
 
     # Check that client crash is present in global crashes list.
@@ -64,7 +65,7 @@ class TestCrashView(test_lib.GRRSeleniumTest):
     # Check that needed data are displayed.
     self.Click("css=a:contains('All Clients Crashes')")
     self.WaitUntil(self.AllTextsPresent, [
-        "Crash Details", "aff4:/flows/W:CrashHandler",
+        "Crash Details", "aff4:/flows/", ":CrashHandler",
         "Client killed during transaction"])
 
     # Click on a session id link and check that we're redirected to a flow.
@@ -73,13 +74,13 @@ class TestCrashView(test_lib.GRRSeleniumTest):
         "Manage launched flows", "Flow Name", "Flow Information"])
 
   def SetUpCrashedFlowInHunt(self):
-    client_ids = [rdfvalue.ClientURN("C.%016X" % i) for i in range(0, 10)]
+    client_ids = [rdf_client.ClientURN("C.%016X" % i) for i in range(0, 10)]
     client_mocks = dict([(client_id, test_lib.CrashClientMock(
         client_id, self.token)) for client_id in client_ids])
 
     with hunts.GRRHunt.StartHunt(
         hunt_name="SampleHunt",
-        regex_rules=[rdfvalue.ForemanAttributeRegex(
+        regex_rules=[rdf_foreman.ForemanAttributeRegex(
             attribute_name="GRR client",
             attribute_regex="GRR")],
         client_rate=0,
@@ -114,14 +115,14 @@ class TestCrashView(test_lib.GRRSeleniumTest):
     self.Click("css=td:contains('SampleHunt')")
 
     # Click on "Crashes" tab.
-    self.Click("css=a[renderer=HuntCrashesRenderer]")
+    self.Click("css=li[heading=Crashes]")
 
     # Check that all crashes were registered for this hunt.
     self.WaitUntil(self.AllTextsPresent,
                    [client_id for client_id in client_ids])
 
     # Search for the C.0000000000000001 and select it.
-    self.Type("client_query", "0001")
+    self.Type("client_query", "C.0000000000000001")
     self.Click("client_query_submit")
 
     with self.ACLChecksDisabled():
@@ -134,14 +135,14 @@ class TestCrashView(test_lib.GRRSeleniumTest):
 
     # Open the "Advanced" dropdown.
     self.Click("css=a[href='#HostAdvanced']")
-    self.WaitUntil(self.IsVisible, "css=a[grrtarget=ClientCrashesRenderer]'")
+    self.WaitUntil(self.IsVisible, "css=a[grrtarget=ClientCrashesRenderer]")
     # Select list of crashes.
-    self.Click("css=a[grrtarget=ClientCrashesRenderer]'")
+    self.Click("css=a[grrtarget=ClientCrashesRenderer]")
 
     self.WaitUntil(self.AllTextsPresent, [
         "C.0000000000000001",
         "Crash Type",
-        "aff4:/flows/W:CrashHandler",
+        "aff4:/flows/", "CrashHandler",
         "Crash Message",
         "Client killed during transaction"])
 

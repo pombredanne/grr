@@ -33,6 +33,67 @@ import "grr/proto/semantic.proto";
 
 
 
+message PwEntry {
+  enum PwStore {
+    UNKNOWN = 0;
+    PASSWD = 1;
+    SHADOW = 2;
+    GROUP = 3;
+    GSHADOW = 4;
+  }
+
+  optional PwStore store = 1 [(sem_type) = {
+      description: "Where the user password is stored.",
+    }, default = UNKNOWN];
+
+  // The hash functions used for password hashes. See man crypt(3)
+  enum PwHash {
+    DES = 0;
+    MD5 = 1;
+    BLOWFISH = 2;
+    NTHASH = 3;
+    UNUSED = 4;
+    SHA256 = 5;
+    SHA512 = 6;
+    UNSET = 13;
+    DISABLED = 14;
+    EMPTY = 15;
+  }
+
+  optional PwHash hash_type = 2 [(sem_type) = {
+      description: "How the password is hashed.",
+    }];
+
+  optional uint32 age = 3 [(sem_type) = {
+      description: "The password age in days.",
+    }];
+
+  optional uint32 max_age = 4 [(sem_type) = {
+      description: "The maximum password age in days.",
+    }];
+}
+
+
+message Group {
+  optional string name = 1 [(sem_type) = {
+      description: "The name of the group. ",
+    }];
+
+  repeated string members = 2 [(sem_type) = {
+      description: "The members of the group, as usernames. ",
+    }];
+
+  // Posix specific values.
+  optional uint32 gid = 3 [(sem_type) = {
+      description: "The gid of the the group, e.g.: 1001.",
+    }];
+
+  optional PwEntry pw_entry = 4 [(sem_type) = {
+      description: "The password state of the group, e.g.: shadow+sha512.",
+    }];
+
+}
+
 
 message KnowledgeBaseUser {
   optional string username = 1 [(sem_type) = {
@@ -46,6 +107,15 @@ message KnowledgeBaseUser {
   optional string desktop = 4 [(sem_type) = {
       description: "The desktop directory of the user. E.g. "
         "c:\\Documents and Settings\\foo\\Desktop",
+    }];
+
+  optional uint64 last_logon = 5 [(sem_type) = {
+      type: "RDFDatetime",
+      description: "The last logon time for this user."
+    }];
+
+  optional string full_name = 6 [(sem_type) = {
+      description: "Full name of the user."
     }];
 
   // Windows specific values.
@@ -70,7 +140,7 @@ message KnowledgeBaseUser {
 
   optional string localappdata = 15 [(sem_type) = {
       description: "The %LOCALAPPDATA% directory of the user as reported by the"
-        " system. E.g. AppData\\Local\\Microsoft\\Windows",
+        " system. E.g. c:\\Documents and Settings\\foo\\AppData\\Local",
     }];
 
   optional string internet_cache = 16 [(sem_type) = {
@@ -94,14 +164,11 @@ message KnowledgeBaseUser {
         "c:\\Documents and Settings\\foo\\Documents.",
     }];
 
-  optional string local_settings = 20 [(sem_type) = {
-      description: "The Local Settings directory of the user. E.g. "
-        "c:\\Documents and Settings\\foo\\Local Settings.",
-    }];
+  // ID 20 previously used by local_settings.
 
-    optional string startup = 21 [(sem_type) = {
-      description: "The Startup directory of the user. E.g. "
-        "c:\\Documents and Settings\\foo\\Startup.",
+  optional string startup = 21 [(sem_type) = {
+    description: "The Startup directory of the user. E.g. "
+      "c:\\Documents and Settings\\foo\\Startup.",
     }];
 
   optional string localappdata_low = 22 [(sem_type) = {
@@ -129,6 +196,13 @@ message KnowledgeBaseUser {
       description: "The shell of the the user. E.g. /bin/sh.",
     }];
 
+  optional PwEntry pw_entry = 34 [(sem_type) = {
+      description: "The password state of the user, e.g.: shadow+sha512.",
+    }];
+
+  repeated uint32 gids = 35 [(sem_type) = {
+      description: "Additional group ids the user is a member of.",
+    }];
 };
 
 
@@ -168,6 +242,15 @@ message KnowledgeBase {
     }];
 
   //
+  // Linux specific distribution information.
+  // See: lsb_release(1) man page, or the LSB Specification under the 'Command
+  // Behaviour' section.
+  //
+  optional string os_release = 9 [(sem_type) = {
+      description: "Linux distribution name.",
+    }];
+
+  //
   // Windows specific system level parameters.
   //
   optional string environ_systemroot = 20 [(sem_type) = {
@@ -194,11 +277,6 @@ message KnowledgeBase {
         "the system, e.g. C:",
     }];
 
-  optional string environ_system = 25 [(sem_type) = {
-      description: "The value of the %System% parameter. As returned by "
-        "the system, e.g. C:\\windows\\system32",
-    }];
-
   optional string environ_allusersprofile = 26 [(sem_type) = {
       description: "The value of the %AllUsersProfile% parameter. As returned "
         "by the system, e.g. c:\\Documents and Settings\\All Users",
@@ -212,12 +290,7 @@ message KnowledgeBase {
 
   optional string current_control_set = 28 [(sem_type) = {
       description: "The current value of the system CurrentControlSet "
-        "e.g. ControlSet001",
-    }];
-
-  optional string sys_registry = 29 [(sem_type) = {
-      description: "The directory containing the system registry files. "
-        "E.g. c:\\windows\\system32\\config.",
+        "e.g. HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001",
     }];
 
   optional string code_page = 30 [(sem_type) = {

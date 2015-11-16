@@ -1,45 +1,72 @@
 #!/bin/bash
 #
-# Script to install GRR from scratch on an Ubuntu 12.04, 12.10 or 13.04 system.
+# Script to install GRR from scratch on an Ubuntu system. Tested on trusty
+# (14.04)
 #
 # By default this will install into /usr and set the config in
 # /etc/grr/
 #
 PREFIX=/usr
 
+# If true, do an apt-get upgrade
+: ${UPGRADE:=true}
+
 # Variables to control the install versions etc. Made for changing this to
 # support other platforms more easily.
 PLAT=amd64
 INSTALL_DIR=${PREFIX}/share/grr
 
-# We now host files on google drive since code.google.com downloads are
-# deprecated: https://code.google.com/p/support/wiki/DownloadsFAQ
-DEB_DEPENDENCIES_URL=https://googledrive.com/host/0B1wsLqFoT7i2aW5mWXNDX1NtTnc/ubuntu-12.04-${PLAT}-debs.tar.gz;
-DEB_DEPENDENCIES_DIR=ubuntu-12.04-${PLAT}-debs;
-SLEUTHKIT_DEB=sleuthkit-lib_3.2.3-1_${PLAT}.deb
-PYTSK_DEB=pytsk3_3.2.3-1_${PLAT}.deb
-M2CRYPTO_DEB=m2crypto_0.21.1-1_${PLAT}.deb
-
-GRR_STABLE_VERSION=0.2.9-1
-GRR_TEST_VERSION=0.2.10-1
+GRR_STABLE_VERSION=0.3.0-7
+GRR_TEST_VERSION=
 SERVER_DEB_STABLE_BASE_URL=https://googledrive.com/host/0B1wsLqFoT7i2c3F0ZmI1RDJlUEU/grr-server_
 SERVER_DEB_TEST_BASE_URL=https://googledrive.com/host/0B1wsLqFoT7i2c3F0ZmI1RDJlUEU/test-grr-server_
 
-
-# Take command line parameters as these are easier for users than shell
-# variables.
-if [ "$1" == "--localtest" ]
-then
-  GRR_LOCAL_TEST=1;
-  GRR_TESTING=1;
-elif [ "$1" == "--test" ]
-then
-  GRR_LOCAL_TEST=0;
-  GRR_TESTING=1;
+if [ "$EUID" -ne 0 ]
+  then echo "Please run as root"
+  exit
 fi
 
+# Variable to store if the user has answered "Yes to All"
+ALL_YES=0;
 
-if [ -z "${GRR_TESTING}" ];
+# If true only install build dependencies. GRR itself and the database won't be
+# installed.
+BUILD_DEPS_ONLY=0;
+
+# Use local deb, for testing
+GRR_LOCAL_TEST=0
+
+# Use the GRR test version
+GRR_TESTING=0;
+
+OPTIND=1
+while getopts "h?ltdy" opt; do
+    case "$opt" in
+    h|\?)
+        echo "Usage: ./install_script_ubuntu.sh [OPTIONS]"
+        echo " -l Test locally (no download), get deb from current path"
+        echo " -t Install the GRR beta testing version"
+        echo " -d Only install build dependencies"
+        echo " -y Don't prompt, i.e. answer yes to everything"
+        exit 0
+        ;;
+    l)  GRR_LOCAL_TEST=1
+        ;;
+    t)  GRR_TESTING=1;
+        ;;
+    d)  BUILD_DEPS_ONLY=1;
+        ;;
+    y)  ALL_YES=1;
+        ;;
+    esac
+done
+
+shift $((OPTIND-1))
+[ "$1" = "--" ] && shift
+
+echo "Running with GRR_LOCAL_TEST=${GRR_LOCAL_TEST}, GRR_TESTING=${GRR_TESTING}, BUILD_DEPS_ONLY=${BUILD_DEPS_ONLY}, ALL_YES=${ALL_YES}"
+
+if [ ${GRR_TESTING} = 0 ];
 then
   SERVER_DEB_URL=${SERVER_DEB_STABLE_BASE_URL}${GRR_STABLE_VERSION}_${PLAT}.deb
 else
@@ -48,18 +75,6 @@ else
   echo "#########################################"
   SERVER_DEB_URL=${SERVER_DEB_TEST_BASE_URL}${GRR_TEST_VERSION}_${PLAT}.deb
 fi
-
-# Used for local testing, if set it will assume the deb is in the current path
-# instead of attempting wget for it.
-if [ -z "${GRR_LOCAL_TEST}" ];
-then
-  GRR_LOCAL_TEST=0;
-fi
-
-
-# Variable to store if the user has answered "Yes to All"
-ALL_YES=0;
-
 
 function header()
 {
@@ -104,79 +119,95 @@ function run_cmd_confirm()
   fi
 };
 
+header "Adding launchpad.net/~gift PPA for m2crypto pytsk dependencies."
+run_cmd_confirm apt-get install -y software-properties-common
+run_cmd_confirm add-apt-repository ppa:gift/dev -y
+run_cmd_confirm apt-get update -q
 
 header "Updating APT and Installing dependencies"
-run_cmd_confirm sudo apt-get --yes update;
-run_cmd_confirm sudo apt-get --yes upgrade;
-run_cmd_confirm sudo apt-get --force-yes --yes install python-setuptools python-dateutil python-django ipython apache2-utils zip wget python-ipaddr python-support python-psutil python-matplotlib python-mox python-yaml python-pip dpkg-dev debhelper;
-
-header "Getting the right version of M2Crypto installed"
-run_cmd_confirm sudo apt-get --yes remove python-m2crypto;
-
-DEB_DEPENDENCIES_TARBALL=$(basename ${DEB_DEPENDENCIES_URL});
-run_cmd_confirm wget --no-verbose ${DEB_DEPENDENCIES_URL} -O ${DEB_DEPENDENCIES_TARBALL};
-run_cmd_confirm tar zxfv ${DEB_DEPENDENCIES_TARBALL};
-run_cmd_confirm sudo dpkg -i ${DEB_DEPENDENCIES_DIR}/${M2CRYPTO_DEB};
-
-header "Installing Protobuf"
-run_cmd_confirm sudo apt-get --yes --force-yes install libprotobuf-dev python-protobuf;
-
-header "Installing Sleuthkit and Pytsk"
-run_cmd_confirm sudo apt-get --yes remove libtsk3* sleuthkit
-run_cmd_confirm sudo dpkg -i ${DEB_DEPENDENCIES_DIR}/${SLEUTHKIT_DEB} ${DEB_DEPENDENCIES_DIR}/${PYTSK_DEB};
-
-header "Installing Mongodb"
-run_cmd_confirm sudo apt-get --yes --force-yes install mongodb python-pymongo;
-
-header "Getting correct psutil version (we require 0.6 or newer)"
-PSUTIL_VERSION=`dpkg-query -W python-psutil | cut -f 2`
-if [[ "$PSUTIL_VERSION" == 0.5* ]]; then
-  echo "Unsupported psutil version ${PSUTIL_VERSION}. Upgrading with pip."
-  run_cmd_confirm sudo apt-get --yes remove python-psutil;
-  run_cmd_confirm sudo apt-get --yes --force-yes install build-essential python-dev;
-  run_cmd_confirm sudo easy_install psutil;
+run_cmd_confirm apt-get --yes update;
+if $UPGRADE; then
+  run_cmd_confirm apt-get --yes upgrade;
 fi
 
-header "Installing Selenium test framework for Tests"
-run_cmd_confirm sudo easy_install selenium
+header "Installing dependencies."
+# Installing pkg-config is a workaround for this matplotlib problem:
+# https://github.com/matplotlib/matplotlib/issues/3029/
+sudo apt-get install -y \
+  apache2-utils \
+  build-essential \
+  debhelper \
+  dpkg-dev \
+  git-core \
+  ipython \
+  libdistorm64-dev \
+  libdistorm64-1 \
+  libfreetype6-dev \
+  libpng-dev \
+  libprotobuf-dev \
+  ncurses-dev \
+  pkg-config \
+  prelink \
+  protobuf-compiler \
+  python-m2crypto \
+  python-protobuf \
+  python-setuptools \
+  python-support \
+  pytsk3 \
+  rpm \
+  sleuthkit \
+  swig \
+  wget \
+  zip
 
+# Fail silently if python-dev or libpython-dev is not available in the apt repo
+# python-dev is for Ubuntu version < 12.10 and libpython-dev is for > 12.04
+apt-get --force-yes --yes install python-dev 2>/dev/null
+apt-get --force-yes --yes install libpython-dev 2>/dev/null
 
-header "Checking Django version is > 1.4 and fixing up"
-# We need 1.4, 12.04 ships with 1.3
-DJANGO_VERSION=`dpkg-query -W python-django | cut -f 2`
-if [[ "$DJANGO_VERSION" == 1.3* ]]; then
-  echo "Unsupported Django version ${DJANGO_VERSION}. Upgrading with pip."
-  run_cmd_confirm sudo apt-get --yes remove python-django
-  run_cmd_confirm sudo easy_install django
+run_cmd_confirm wget --quiet https://bootstrap.pypa.io/get-pip.py
+run_cmd_confirm python get-pip.py
+run_cmd_confirm pip install pip --upgrade
+
+header "Installing python dependencies"
+run_cmd_confirm wget --quiet https://raw.githubusercontent.com/google/grr/99606f24b2f14e03dbba87aa6801b476ac7b9c20/requirements.txt
+run_cmd_confirm pip install -r requirements.txt
+
+# Set filehandle max to a high value if it isn't already set.
+if ! grep -Fq "fs.file-max" /etc/sysctl.conf; then
+  header "Increase our filehandle limit (for SQLite datastore)."
+  echo "fs.file-max = 1048576" >> /etc/sysctl.conf
+  sysctl -p
 fi
+echo "Filehandle limit now: $(cat /proc/sys/fs/file-max)"
 
+if [ $BUILD_DEPS_ONLY = 1 ]; then
+  echo "#######################################"
+  echo "Finished installing build dependencies."
+  echo "#######################################"
+  exit 0
+fi
 
 header "Installing GRR from prebuilt package"
 SERVER_DEB=$(basename ${SERVER_DEB_URL});
 if [ $GRR_LOCAL_TEST = 0 ]; then
   run_cmd_confirm wget --no-verbose ${SERVER_DEB_URL} -O ${SERVER_DEB};
-  run_cmd_confirm sudo dpkg -i ${SERVER_DEB};
+  run_cmd_confirm dpkg -i ${SERVER_DEB};
 else
-  run_cmd_confirm sudo dpkg -i ${SERVER_DEB};
+  run_cmd_confirm dpkg -i ${SERVER_DEB};
 fi
 
 header "Initialize the configuration, building clients and setting options."
-run_cmd_confirm sudo grr_config_updater initialize
+run_cmd_confirm grr_config_updater initialize
 
-header "Enable grr-single-server to start automatically on boot"
-SERVER_DEFAULT=/etc/default/grr-single-server
-run_cmd_confirm sudo sed -i 's/START=\"no\"/START=\"yes\"/' ${SERVER_DEFAULT};
+header "Enable grr services to start automatically on boot"
+run_cmd_confirm . /usr/share/grr/scripts/shell_helpers.sh
 
-header "Starting up the service"
-sudo initctl status grr-single-server | grep "running"
-IS_RUNNING=$?
-if [ $IS_RUNNING = 0 ]; then
-  run_cmd_confirm sudo service grr-single-server stop
-fi
-run_cmd_confirm sudo service grr-single-server start
+# These lines can be replaced with grr_enable_all once we have built a new
+# server package.
+run_cmd_confirm enable_services grr-http-server
+run_cmd_confirm enable_services grr-ui
+run_cmd_confirm enable_services grr-worker
 
 HOSTNAME=`hostname`
-echo "############################################################################################"
-echo "Install complete. Congratulations. Point your browser at http://${HOSTNAME}:8000"
-echo "############################################################################################"
-echo ""
+header "Install complete. Congratulations. Point your browser at http://${HOSTNAME}:8000"

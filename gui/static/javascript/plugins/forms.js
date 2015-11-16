@@ -66,11 +66,10 @@ grr.forms.selectOnChange = function(element) {
  */
 grr.forms.clearPrefix = function(element, prefix) {
   var form_data = $(element).closest('.FormData');
-  var data = form_data.data();
 
   if (form_data) {
-    $.each(data, function(k, v) {
-      if (k.substring(0, prefix.length) == prefix) {
+    $.each(form_data.data(), function(k, v) {
+      if (k == prefix || k.substring(0, prefix.length + 1) == prefix + '-') {
         form_data.removeData(k);
       }
     });
@@ -83,8 +82,8 @@ grr.Renderer('EmbeddedProtoFormRenderer', {
     $('#' + state.unique).click(function() {
       var jthis = $(this);
 
-      if (jthis.hasClass('icon-plus')) {
-        jthis.removeClass('icon-plus').addClass('icon-minus');
+      if (jthis.hasClass('glyphicon-plus')) {
+        jthis.removeClass('glyphicon-plus').addClass('glyphicon-minus');
 
         var jcontent = $('#content_' + state.unique);
 
@@ -96,7 +95,7 @@ grr.Renderer('EmbeddedProtoFormRenderer', {
         jcontent.show();
       } else {
         // Flip the opener and remove the form.
-        jthis.removeClass('icon-minus').addClass('icon-plus');
+        jthis.removeClass('glyphicon-minus').addClass('glyphicon-plus');
         $('#content_' + state.unique).hide();
       }
     });
@@ -114,13 +113,12 @@ grr.Renderer('RepeatedFieldFormRenderer', {
     var unique = state.unique;
 
     $('button#add_' + unique).click(function(event) {
-      var count = $(this).data('count') + 1;
+      var count = $(this).data('count');
       var new_id = 'content_' + unique + '_' + count;
 
-      $(this).data('count', count);
-
       // Store the total count of members in the form.
-      $(this).closest('.FormData').data()[state.prefix + '_count'] = count;
+      $(this).closest('.FormData').data()[state.prefix + '_count'] = count + 1;
+      $(this).data('count', count + 1);
 
       $('#content_' + unique).append('<div id="' + new_id + '"/>');
 
@@ -135,10 +133,16 @@ grr.Renderer('RepeatedFieldFormRenderer', {
   },
 
   RenderAjax: function(state) {
-    $(state.unique).on('close', function() {
-      var data = $(this).data();
+    var unique = state.unique;
 
-      grr.forms.clearPrefix(this, data.prefix + '-' + data.index + '-');
+    $('button#remove_' + unique).click(function(event) {
+      var form_id = '#' + unique;
+
+      var data = $('#' + unique).data();
+      grr.forms.clearPrefix(this, data.prefix + '-' + data.index);
+
+      $(this).remove();
+      $(form_id).remove();
     });
   }
 });
@@ -147,8 +151,12 @@ grr.Renderer('RepeatedFieldFormRenderer', {
 grr.Renderer('StringTypeFormRenderer', {
   Layout: function(state) {
     var value = state.value;
+    var default_value = state.default;
+
     if (value != null) {
       $('input#' + state.prefix).val(value).change();
+    } else if (default_value != null) {
+      $('input#' + state.prefix).val(default_value);
     }
   }
 });
@@ -156,8 +164,12 @@ grr.Renderer('StringTypeFormRenderer', {
 grr.Renderer('EnumFormRenderer', {
   Layout: function(state) {
     var value = state.value;
+    var default_value = state.default;
+
     if (value != null) {
       $('select#' + state.prefix).val(value).change();
+    } else if (default_value != null) {
+      $('select#' + state.prefix).val(default_value);
     }
   }
 });
@@ -165,8 +177,14 @@ grr.Renderer('EnumFormRenderer', {
 grr.Renderer('ProtoBoolFormRenderer', {
   Layout: function(state) {
     var value = state.value;
+    var default_value = state.default;
+
     if (value != null) {
-      $('select#' + state.prefix).val(value).change();
+      $('input#' + state.prefix).prop(
+          'checked', value != null).val(value).change();
+    } else if (default_value) {
+      $('input#' + state.prefix).prop(
+          'checked', default_value).val(default_value);
     }
   }
 });
@@ -174,19 +192,22 @@ grr.Renderer('ProtoBoolFormRenderer', {
 
 grr.Renderer('OptionFormRenderer', {
   Layout: function(state) {
-    $('#' + state.prefix + '-option').on('change', function() {
+    var optionControl = $('#' + state.prefix + '-option');
+    optionControl.on('change', function() {
       grr.forms.inputOnChange(this);
 
       var data = $.extend({}, $(this).closest('.FormData').data());
-      var form = $(this).closest('.OptionList');
-      data.item = form.data('item');
-      data.prefix = state.prefix;
-
-      grr.update(state.renderer, form.attr('id') + '-' + data.item, data);
+      data['prefix'] = state.prefix;
+      grr.update(state.renderer, state.unique + '-option-form', data);
 
       // First time the form appears, trigger the change event on the selector
       // to make the default choice appear.
-    }).trigger('change');
+    });
+
+    if (state.default_item_type) {
+      optionControl.val(state.default_item_type);
+    }
+    optionControl.trigger('change');
   }
 });
 
@@ -197,25 +218,25 @@ grr.Renderer('MultiFormRenderer', {
     var option = state.option || 'option';
 
     // This button is pressed when we want a new form.
-    var addButton = $('#AddButton' + unique).click(function() {
+    var addButton = $('#AddButton' + unique);
+    addButton.bind('addItem', function(event, defaultItemType) {
       var data = $(this).closest('.FormData').data();
       var count = data[option + '_count'] || 1;
       var new_id = unique + '_' + count;
 
       data.item = count;
+      data['default_item_type'] = defaultItemType;
       data[option + '_count'] = count + 1;
 
       var new_div = $('<div class="alert fade in" id="' +
-          new_id + '" data-item="' + data.item + '" >');
-
-      new_div.on('close', function() {
-        var item = $(this).data('item');
-        grr.forms.clearPrefix(this, option + '_' + item);
-      });
+          new_id + '" data-item="' + count + '" >');
 
       new_div.insertBefore(this);
 
       grr.layout(state.renderer, new_id, data);
+    });
+    addButton.click(function() {
+      addButton.trigger('addItem');
     });
 
     if (state.add_one_default) {
@@ -223,6 +244,18 @@ grr.Renderer('MultiFormRenderer', {
       // click it to make at least one option available.
       addButton.click();
     }
+  },
+
+  LayoutItem: function(state) {
+    var unique = state.unique;
+    var option = state.option || 'option';
+
+    // This button is pressed when current form is removed.
+    var removeButton = $('#RemoveButton' + unique);
+    removeButton.click(function() {
+      var item = $(this).parent().data('item');
+      grr.forms.clearPrefix(this, option + '_' + item);
+    });
   }
 });
 
@@ -232,13 +265,20 @@ grr.Renderer('SemanticProtoFormRenderer', {
     var unique = state.unique;
 
     $('#advanced_label_' + unique).click(function() {
-      $('#advanced_controls_' + unique).toggle();
+      var advancedControls = $('#advanced_controls_' + unique);
+      if (advancedControls.hasClass('hide')) {
+        advancedControls.removeClass('hide');
+      } else {
+        advancedControls.addClass('hide');
+      }
 
       var icon = $('#' + unique + ' .advanced-icon:last');
       if ($('#advanced_controls_' + unique).is(':visible')) {
-        icon.removeClass('icon-chevron-right').addClass('icon-chevron-down');
+        icon.removeClass('glyphicon-chevron-right').addClass(
+            'glyphicon-chevron-down');
       } else {
-        icon.removeClass('icon-chevron-down').addClass('icon-chevron-right');
+        icon.removeClass('glyphicon-chevron-down').addClass(
+            'glyphicon-chevron-right');
       }
     });
 
@@ -258,7 +298,21 @@ grr.Renderer('RDFDatetimeFormRenderer', {
       showOn: 'button',
       buttonImage: 'static/images/clock.png',
       buttonImageOnly: true,
-      altField: '#' + state.prefix
+      altField: '#' + state.prefix,
+      onSelect: function(dateText, inst) {
+        $('#' + state.prefix).trigger('change');
+     }
     });
+  }
+});
+
+
+grr.Renderer('MultiSelectListRenderer', {
+  Layout: function(state) {
+    var prefix = state.prefix;
+
+    // Height hack as CSS isn't handled properly for multiselect.
+    var multiselect_height = parseInt($('#' + prefix + ' option').length) * 15;
+    $('#' + prefix).css('height', multiselect_height);
   }
 });

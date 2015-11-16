@@ -2,15 +2,14 @@
 """This is the GRR frontend HTTP Server."""
 
 
+
 import BaseHTTPServer
 import cgi
 import cStringIO
-
-from multiprocessing import freeze_support
-from multiprocessing import Process
 import pdb
 import socket
 import SocketServer
+import threading
 
 
 import ipaddr
@@ -21,14 +20,19 @@ import logging
 from grr.lib import server_plugins
 # pylint: enable=g-bad-import-order
 
+from grr.lib import aff4
 from grr.lib import communicator
 from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import flow
+from grr.lib import master
 from grr.lib import rdfvalue
 from grr.lib import startup
+from grr.lib import stats
 from grr.lib import type_info
 from grr.lib import utils
+from grr.lib.flows.general import file_finder
+from grr.lib.rdfvalues import flows as rdf_flows
 
 
 # pylint: disable=g-bad-name
@@ -38,14 +42,18 @@ class GRRHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
   """GRR HTTP handler for receiving client posts."""
 
   statustext = {200: "200 OK",
+                404: "404 Not Found",
                 406: "406 Not Acceptable",
                 500: "500 Internal Server Error"}
+
+  active_counter_lock = threading.Lock()
+  active_counter = 0
 
   def Send(self, data, status=200, ctype="application/octet-stream",
            last_modified=0):
 
     self.wfile.write(("HTTP/1.0 %s\r\n"
-                      "Server: BaseHTTP/0.3 Python/2.6.5\r\n"
+                      "Server: GRR Server\r\n"
                       "Content-type: %s\r\n"
                       "Content-Length: %d\r\n"
                       "Last-Modified: %s\r\n"
@@ -56,8 +64,29 @@ class GRRHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
   def do_GET(self):
     """Server the server pem with GET requests."""
+    url_prefix = config_lib.CONFIG["Frontend.static_url_path_prefix"]
     if self.path.startswith("/server.pem"):
       self.ServerPem()
+    elif self.path.startswith(url_prefix):
+      path = self.path[len(url_prefix):]
+      self.ServeStatic(path)
+
+  AFF4_READ_BLOCK_SIZE = 10 * 1024 * 1024
+
+  def ServeStatic(self, path):
+    static_aff4_prefix = config_lib.CONFIG["Frontend.static_aff4_prefix"]
+    aff4_path = rdfvalue.RDFURN(static_aff4_prefix).Add(path)
+    try:
+      logging.info("Serving %s", aff4_path)
+      fd = aff4.FACTORY.Open(aff4_path)
+      while True:
+        data = fd.Read(self.AFF4_READ_BLOCK_SIZE)
+        if not data:
+          break
+
+        self.Send(data)
+    except (IOError, AttributeError):
+      self.Send("", status=404)
 
   def ServerPem(self):
     self.Send(self.server.server_cert)
@@ -83,18 +112,34 @@ class GRRHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """Process encrypted message bundles."""
     self.Control()
 
+  @stats.Counted("frontend_request_count", fields=["http"])
+  @stats.Timed("frontend_request_latency", fields=["http"])
   def Control(self):
+    """Handle POSTS."""
+    if not master.MASTER_WATCHER.IsMaster():
+      # We shouldn't be getting requests from the client unless we
+      # are the active instance.
+      stats.STATS.IncrementCounter("frontend_inactive_request_count",
+                                   fields=["http"])
+      logging.info("Request sent to inactive frontend from %s",
+                   self.client_address[0])
+
     # Get the api version
     try:
       api_version = int(cgi.parse_qs(self.path.split("?")[1])["api"][0])
     except (ValueError, KeyError, IndexError):
       # The oldest api version we support if not specified.
-      api_version = 2
+      api_version = 3
+
+    with GRRHTTPServerHandler.active_counter_lock:
+      GRRHTTPServerHandler.active_counter += 1
+      stats.STATS.SetGaugeValue("frontend_active_count", self.active_counter,
+                                fields=["http"])
 
     try:
       length = int(self.headers.getheader("content-length"))
 
-      request_comms = rdfvalue.ClientCommunication(self._GetPOSTData(length))
+      request_comms = rdf_flows.ClientCommunication(self._GetPOSTData(length))
 
       # If the client did not supply the version in the protobuf we use the get
       # parameter.
@@ -102,7 +147,7 @@ class GRRHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         request_comms.api_version = api_version
 
       # Reply using the same version we were requested with.
-      responses_comms = rdfvalue.ClientCommunication(
+      responses_comms = rdf_flows.ClientCommunication(
           api_version=request_comms.api_version)
 
       source_ip = ipaddr.IPAddress(self.client_address[0])
@@ -110,7 +155,7 @@ class GRRHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
       if source_ip.version == 6:
         source_ip = source_ip.ipv4_mapped or source_ip
 
-      request_comms.orig_request = rdfvalue.HttpRequest(
+      request_comms.orig_request = rdf_flows.HttpRequest(
           raw_headers=utils.SmartStr(self.headers),
           source_ip=utils.SmartStr(source_ip))
 
@@ -137,6 +182,12 @@ class GRRHTTPServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
       logging.error("Had to respond with status 500: %s.", e)
       self.Send("Error", status=500)
 
+    finally:
+      with GRRHTTPServerHandler.active_counter_lock:
+        GRRHTTPServerHandler.active_counter -= 1
+        stats.STATS.SetGaugeValue("frontend_active_count", self.active_counter,
+                                  fields=["http"])
+
 
 class GRRHTTPServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):
   """The GRR HTTP frontend server."""
@@ -147,6 +198,9 @@ class GRRHTTPServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):
   address_family = socket.AF_INET6
 
   def __init__(self, server_address, handler, frontend=None, *args, **kwargs):
+    stats.STATS.SetGaugeValue("frontend_max_active_count",
+                              self.request_queue_size)
+
     if frontend:
       self.frontend = frontend
     else:
@@ -195,10 +249,6 @@ def main(unused_argv):
   startup.Init()
 
   httpd = CreateServer()
-  if config_lib.CONFIG["Frontend.processes"] > 1:
-    # Multiprocessing
-    for _ in range(config_lib.CONFIG["Frontend.processes"] - 1):
-      Process(target=Serve, args=(httpd,)).start()
 
   try:
     httpd.serve_forever()
@@ -206,5 +256,4 @@ def main(unused_argv):
     print "Caught keyboard interrupt, stopping"
 
 if __name__ == "__main__":
-  freeze_support()
   flags.StartMain(main)

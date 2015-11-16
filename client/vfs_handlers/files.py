@@ -1,29 +1,31 @@
 #!/usr/bin/env python
-# Copyright 2010 Google Inc. All Rights Reserved.
 """Implements VFSHandlers for files on the client."""
 
 import logging
 import os
+import platform
 import re
 import sys
 import threading
 
 from grr.client import client_utils
 from grr.client import vfs
-from grr.lib import rdfvalue
 from grr.lib import utils
+from grr.lib.rdfvalues import client
+from grr.lib.rdfvalues import paths
 
 
-# File handles are cached here.
-FILE_HANDLE_CACHE = utils.FastStore()
+# File handles are cached here. They expire after a couple minutes so
+# we don't keep files locked on the client.
+FILE_HANDLE_CACHE = utils.TimeBasedCache(max_age=300)
 
 
 class LockedFileHandle(object):
   """An object which encapsulates access to a file."""
 
-  def __init__(self, filename):
+  def __init__(self, filename, mode="rb"):
     self.lock = threading.RLock()
-    self.fd = open(filename, "rb")
+    self.fd = open(filename, mode)
     self.filename = filename
 
   def Seek(self, offset, whence=0):
@@ -50,7 +52,7 @@ class FileHandleManager(object):
     try:
       self.fd = FILE_HANDLE_CACHE.Get(self.filename)
     except KeyError:
-      self.fd = LockedFileHandle(self.filename)
+      self.fd = LockedFileHandle(self.filename, mode="rb")
       FILE_HANDLE_CACHE.Put(self.filename, self.fd)
 
     # Wait for exclusive access to this file handle.
@@ -63,8 +65,8 @@ class FileHandleManager(object):
 
 
 def MakeStatResponse(st, pathspec):
-  """Creates a StatResponse proto."""
-  response = rdfvalue.StatEntry(pathspec=pathspec)
+  """Creates a StatEntry."""
+  response = client.StatEntry(pathspec=pathspec)
 
   if st is None:
     # Special case empty stat if we don't have a real value, e.g. we get Access
@@ -100,11 +102,9 @@ def MakeStatResponse(st, pathspec):
 class File(vfs.VFSHandler):
   """Read a regular file."""
 
-  supported_pathtype = rdfvalue.PathSpec.PathType.OS
+  supported_pathtype = paths.PathSpec.PathType.OS
   auto_register = True
 
-  # The file descriptor of the OS file.
-  fd = None
   files = None
 
   # Directories do not have a size.
@@ -114,8 +114,11 @@ class File(vfs.VFSHandler):
   alignment = 1
   file_offset = 0
 
-  def __init__(self, base_fd, pathspec=None):
-    super(File, self).__init__(base_fd, pathspec=pathspec)
+  def __init__(self, base_fd, pathspec=None, progress_callback=None,
+               full_pathspec=None):
+    super(File, self).__init__(base_fd, pathspec=pathspec,
+                               full_pathspec=full_pathspec,
+                               progress_callback=progress_callback)
     if base_fd is None:
       self.pathspec.Append(pathspec)
 
@@ -134,9 +137,9 @@ class File(vfs.VFSHandler):
     if self.pathspec[0].HasField("offset"):
       self.file_offset = self.pathspec[0].offset
 
-    self.pathspec.last.path_options = rdfvalue.PathSpec.Options.CASE_LITERAL
+    self.pathspec.last.path_options = paths.PathSpec.Options.CASE_LITERAL
 
-    self.WindowsHacks()
+    self.FileHacks()
     self.filename = client_utils.CanonicalPathToLocalPath(self.path)
 
     error = None
@@ -158,10 +161,18 @@ class File(vfs.VFSHandler):
     try:
       with FileHandleManager(self.filename) as fd:
 
-        # Work out how large the file is
-        if self.size is None:
-          fd.Seek(0, 2)
-          self.size = fd.Tell() - self.file_offset
+        if pathspec.last.HasField("file_size_override"):
+          self.size = pathspec.last.file_size_override - self.file_offset
+        else:
+          # Work out how large the file is.
+          if self.size is None:
+            fd.Seek(0, 2)
+            end = fd.Tell()
+            if end == 0:
+              # This file is not seekable, we just use the default.
+              end = pathspec.last.file_size_override
+
+            self.size = end - self.file_offset
 
       error = None
     # Some filesystems do not support unicode properly
@@ -175,8 +186,8 @@ class File(vfs.VFSHandler):
     if error is not None:
       raise error  # pylint: disable=raising-bad-type
 
-  def WindowsHacks(self):
-    """Windows specific hacks to make the filesystem look normal."""
+  def FileHacks(self):
+    """Hacks to make the filesystem look normal."""
     if sys.platform == "win32":
       import win32api  # pylint: disable=g-import-not-at-top
 
@@ -204,12 +215,24 @@ class File(vfs.VFSHandler):
 
         # In windows raw devices must be accessed using sector alignment.
         self.alignment = 512
+    elif sys.platform == "darwin":
+      # On Mac, raw disk devices are also not seekable to the end and have no
+      # size so we use the same approach as on Windows.
+      if re.match("/dev/r?disk.*", self.path):
+        self.size = 0x7fffffffffffffff
+        self.alignment = 512
 
   def ListNames(self):
     return self.files or []
 
   def Read(self, length):
     """Read from the file."""
+    if self.progress_callback:
+      self.progress_callback()
+
+    available_to_read = max(0, (self.size or 0) - self.offset)
+    to_read = min(length, available_to_read)
+
     with FileHandleManager(self.filename) as fd:
       offset = self.file_offset + self.offset
       pre_padding = offset % self.alignment
@@ -219,7 +242,7 @@ class File(vfs.VFSHandler):
 
       fd.Seek(aligned_offset)
 
-      data = fd.Read(length + pre_padding)
+      data = fd.Read(to_read + pre_padding)
       self.offset += len(data) - pre_padding
 
       return data[pre_padding:]
@@ -259,9 +282,7 @@ class File(vfs.VFSHandler):
   def ListFiles(self):
     """List all files in the dir."""
     if not self.IsDirectory():
-      # Try to open as a container if possible.
-      for child in self.OpenAsContainer().ListFiles():
-        yield child
+      raise IOError("%s is not a directory." % self.path)
 
     else:
       for path in self.files:
@@ -277,3 +298,48 @@ class File(vfs.VFSHandler):
 
   def IsDirectory(self):
     return self.size is None
+
+  def StatFS(self, path=None):
+    """Call os.statvfs for a given list of paths. OS X and Linux only.
+
+    Note that a statvfs call for a network filesystem (e.g. NFS) that is
+    unavailable, e.g. due to no network, will result in the call blocking.
+
+    Args:
+      path: a Unicode string containing the path or None.
+            If path is None the value in self.path is used.
+    Returns:
+      posix.statvfs_result object
+    Raises:
+      RuntimeError: if called on windows
+    """
+    if platform.system() == "Windows":
+      raise RuntimeError("os.statvfs not available on Windows")
+
+    local_path = client_utils.CanonicalPathToLocalPath(
+        path or self.path)
+
+    return os.statvfs(local_path)
+
+  def GetMountPoint(self, path=None):
+    """Walk back from the path to find the mount point.
+
+    Args:
+      path: a Unicode string containing the path or None.
+            If path is None the value in self.path is used.
+
+    Returns:
+      path string of the mount point
+    """
+    path = os.path.abspath(client_utils.CanonicalPathToLocalPath(
+        path or self.path))
+
+    while not os.path.ismount(path):
+      path = os.path.dirname(path)
+
+    return path
+
+
+class TempFile(File):
+  """GRR temporary files on the client."""
+  supported_pathtype = paths.PathSpec.PathType.TMPFILE

@@ -92,8 +92,10 @@ filter is easy. Three basic filter implementations are given:
 
 import abc
 import binascii
-import logging
+import collections
 import re
+
+import logging
 
 from grr.lib import lexer
 from grr.lib import utils
@@ -185,6 +187,7 @@ class Operator(Filter):
 
 
 class IdentityFilter(Operator):
+
   def Matches(self, _):
     return True
 
@@ -295,7 +298,12 @@ class Contains(GenericBinaryOperator):
   """Whether the right operand is contained in the value."""
 
   def Operation(self, x, y):
-    return y in x
+    # Assuming x is iterable, check if it contains y.
+    # Otherwise, check if x and y are equal.
+    try:
+      return y in x
+    except TypeError:
+      return y == x
 
 
 class NotContains(GenericBinaryOperator):
@@ -447,8 +455,7 @@ OP2FN = {"equals": Equals,
          "<=": LessEqual,
          "inset": InSet,
          "notinset": NotInSet,
-         "regexp": Regexp,
-        }
+         "regexp": Regexp}
 
 
 class ValueExpander(object):
@@ -470,15 +477,32 @@ class ValueExpander(object):
 
   def _AtLeaf(self, attr_value):
     """Called when at a leaf value. Should yield a value."""
-    yield attr_value
+    if isinstance(attr_value, collections.Mapping):
+      # If the result is a dict, return each key/value pair as a new dict.
+      for k, v in attr_value.items():
+        yield {k: v}
+    else:
+      yield attr_value
 
   def _AtNonLeaf(self, attr_value, path):
     """Called when at a non-leaf value. Should recurse and yield values."""
     try:
-      # Check first for iterables
-      # If it's a dictionary, we yield it
-      if isinstance(attr_value, dict):
-        yield attr_value
+      if isinstance(attr_value, collections.Mapping):
+        # If it's dictionary-like, treat the dict key as the attribute..
+        sub_obj = attr_value.get(path[1])
+        if len(path) > 2:
+          # Expand any additional elements underneath the key.
+          sub_obj = self.Expand(sub_obj, path[2:])
+        if isinstance(sub_obj, basestring):
+          # If it is a string, stop here
+          yield sub_obj
+        elif isinstance(sub_obj, collections.Mapping):
+          # If the result is a dict, return each key/value pair as a new dict.
+          for k, v in sub_obj.items():
+            yield {k: v}
+        else:
+          for value in sub_obj:
+            yield value
       else:
         # If it's an iterable, we recurse on each value.
         for sub_obj in attr_value:
@@ -526,6 +550,8 @@ class AttributeValueExpander(ValueExpander):
   """An expander that gives values based on object attribute names."""
 
   def _GetValue(self, obj, attr_name):
+    if isinstance(obj, collections.Mapping):
+      return obj.get(attr_name)
     return getattr(obj, attr_name, None)
 
 
@@ -543,8 +569,9 @@ class DictValueExpander(ValueExpander):
     return obj.get(attr_name, None)
 
 
-### PARSER DEFINITION
+# PARSER DEFINITION
 class BasicExpression(lexer.Expression):
+
   def Compile(self, filter_implementation):
     arguments = [self.attribute]
     op_str = self.operator.lower()
@@ -586,6 +613,7 @@ class ContextExpression(lexer.Expression):
 
 
 class BinaryExpression(lexer.BinaryExpression):
+
   def Compile(self, filter_implemention):
     """Compile the binary expression into a filter object."""
     operator = self.operator.lower()
@@ -601,6 +629,7 @@ class BinaryExpression(lexer.BinaryExpression):
 
 
 class IdentityExpression(lexer.Expression):
+
   def Compile(self, filter_implementation):
     return filter_implementation.FILTERS["IdentityFilter"]()
 
@@ -617,6 +646,8 @@ class Parser(lexer.SearchParser):
   binary_expression_cls = BinaryExpression
   context_cls = ContextExpression
   identity_expression_cls = IdentityExpression
+
+  list_args = []
 
   tokens = [
       # Operators and related tokens
@@ -641,12 +672,22 @@ class Parser(lexer.SearchParser):
       lexer.Token("SQ_STRING", r"\\(.)", "StringEscape", None),
       lexer.Token("SQ_STRING", r"[^\\']+", "StringInsert", None),
 
+      # List processing.
+      lexer.Token("LIST_ARG", r"]", "PopState,ListFinish", None),
+      lexer.Token("LIST_ARG", r"(\d+\.\d+)", "InsertFloatArg", "LIST_ARG"),
+      lexer.Token("LIST_ARG", r"(0x[a-f\d]+)", "InsertInt16Arg", "LIST_ARG"),
+      lexer.Token("LIST_ARG", r"(\d+)", "InsertIntArg", "LIST_ARG"),
+      lexer.Token("LIST_ARG", "\"", "PushState,StringStart", "STRING"),
+      lexer.Token("LIST_ARG", "'", "PushState,StringStart", "SQ_STRING"),
+      lexer.Token("LIST_ARG", r",", None, None),
+
       # Basic expression
       lexer.Token("ATTRIBUTE", r"[\w._0-9]+", "StoreAttribute", "OPERATOR"),
       lexer.Token("OPERATOR", r"(\w+|[<>!=]=?)", "StoreOperator", "ARG"),
       lexer.Token("ARG", r"(\d+\.\d+)", "InsertFloatArg", "ARG"),
-      lexer.Token("ARG", r"(0x\d+)", "InsertInt16Arg", "ARG"),
+      lexer.Token("ARG", r"(0x[a-f\d]+)", "InsertInt16Arg", "ARG"),
       lexer.Token("ARG", r"(\d+)", "InsertIntArg", "ARG"),
+      lexer.Token("ARG", r"\[", "PushState,ListStart", "LIST_ARG"),
       lexer.Token("ARG", "\"", "PushState,StringStart", "STRING"),
       lexer.Token("ARG", "'", "PushState,StringStart", "SQ_STRING"),
       # When the last parameter from arg_list has been pushed
@@ -661,14 +702,16 @@ class Parser(lexer.SearchParser):
 
       # Skip whitespace.
       lexer.Token(".", r"\s+", None, None),
-      ]
+  ]
 
   def InsertArg(self, string="", **_):
     """Insert an arg to the current expression."""
     logging.debug("Storing Argument %s", string)
 
-    # This expression is complete
-    if self.current_expression.AddArg(string):
+    if self.state == "LIST_ARG":
+      self.list_args.append(string)
+    elif self.current_expression.AddArg(string):
+      # This expression is complete
       self.stack.append(self.current_expression)
       self.current_expression = self.expression_cls()
       # We go to the BINARY state, to find if there's an AND or OR operator
@@ -698,11 +741,17 @@ class Parser(lexer.SearchParser):
     except (TypeError, ValueError):
       raise ParseError("%s is not a valid base16 integer." % string)
 
+  def ListStart(self, **_):
+    self.list_args = []
+
+  def ListFinish(self, **_):
+    return self.InsertArg(string=self.list_args)
+
   def StringFinish(self, **_):
     if self.state == "ATTRIBUTE":
       return self.StoreAttribute(string=self.string)
 
-    elif self.state == "ARG":
+    elif self.state == "ARG" or "LIST_ARG":
       return self.InsertArg(string=self.string)
 
   def StringEscape(self, string, match, **_):
@@ -715,9 +764,15 @@ class Parser(lexer.SearchParser):
       match: The match object (m.group(1) is the escaped code)
 
     Raises:
-      ParseError: When the escaped string is not one of [\'"rnbt]
+      ParseError: For strings other than those used to define a regexp, raise an
+        error if the escaped string is not one of [\'"rnbt].
     """
-    if match.group(1) in "\\'\"rnbt":
+    # Allow unfiltered strings for regexp operations so that escaped special
+    # characters (e.g. \*) or special sequences (e.g. \w) can be used in
+    # objectfilter.
+    if self.current_expression.operator == "regexp":
+      self.string += string.decode("string_escape")
+    elif match.group(1) in "\\'\"rnbt":
       self.string += string.decode("string_escape")
     else:
       raise ParseError("Invalid escape character %s." % string)
@@ -763,35 +818,35 @@ class Parser(lexer.SearchParser):
         self.buffer))
 
   def _CombineBinaryExpressions(self, operator):
-    for i in range(1, len(self.stack)-1):
+    for i in range(1, len(self.stack) - 1):
       item = self.stack[i]
       if (isinstance(item, lexer.BinaryExpression) and
           item.operator.lower() == operator.lower() and
-          isinstance(self.stack[i-1], lexer.Expression) and
-          isinstance(self.stack[i+1], lexer.Expression)):
-        lhs = self.stack[i-1]
-        rhs = self.stack[i+1]
+          isinstance(self.stack[i - 1], lexer.Expression) and
+          isinstance(self.stack[i + 1], lexer.Expression)):
+        lhs = self.stack[i - 1]
+        rhs = self.stack[i + 1]
 
         self.stack[i].AddOperands(lhs, rhs)
-        self.stack[i-1] = None
-        self.stack[i+1] = None
+        self.stack[i - 1] = None
+        self.stack[i + 1] = None
 
     self.stack = filter(None, self.stack)
 
   def _CombineContext(self):
     # Context can merge from item 0
-    for i in range(len(self.stack)-1, 0, -1):
-      item = self.stack[i-1]
+    for i in range(len(self.stack) - 1, 0, -1):
+      item = self.stack[i - 1]
       if (isinstance(item, ContextExpression) and
           isinstance(self.stack[i], lexer.Expression)):
         expression = self.stack[i]
-        self.stack[i-1].SetExpression(expression)
+        self.stack[i - 1].SetExpression(expression)
         self.stack[i] = None
 
     self.stack = filter(None, self.stack)
 
 
-### FILTER IMPLEMENTATIONS
+# FILTER IMPLEMENTATIONS
 
 
 class BaseFilterImplementation(object):

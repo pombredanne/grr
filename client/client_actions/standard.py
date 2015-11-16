@@ -2,6 +2,7 @@
 """Standard actions that happen on the client."""
 
 
+import cStringIO as StringIO
 import ctypes
 import gzip
 import hashlib
@@ -25,17 +26,21 @@ from grr.lib import config_lib
 from grr.lib import flags
 from grr.lib import rdfvalue
 from grr.lib import utils
-from grr.lib.rdfvalues import crypto
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import crypto as rdf_crypto
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import paths as rdf_paths
+from grr.lib.rdfvalues import protodict as rdf_protodict
 
 
 # We do not send larger buffers than this:
-MAX_BUFFER_SIZE = 640*1024
+MAX_BUFFER_SIZE = 640 * 1024
 
 
 class ReadBuffer(actions.ActionPlugin):
   """Reads a buffer from a file and returns it to a server callback."""
-  in_rdfvalue = rdfvalue.BufferReference
-  out_rdfvalue = rdfvalue.BufferReference
+  in_rdfvalue = rdf_client.BufferReference
+  out_rdfvalue = rdf_client.BufferReference
 
   def Run(self, args):
     """Reads a buffer on the client and sends it to the server."""
@@ -44,7 +49,7 @@ class ReadBuffer(actions.ActionPlugin):
       raise RuntimeError("Can not read buffers this large.")
 
     try:
-      fd = vfs.VFSOpen(args.pathspec)
+      fd = vfs.VFSOpen(args.pathspec, progress_callback=self.Progress)
 
       fd.Seek(args.offset)
       offset = fd.Tell()
@@ -52,7 +57,7 @@ class ReadBuffer(actions.ActionPlugin):
       data = fd.Read(args.length)
 
     except (IOError, OSError), e:
-      self.SetStatus(rdfvalue.GrrStatus.ReturnedStatus.IOERROR, e)
+      self.SetStatus(rdf_flows.GrrStatus.ReturnedStatus.IOERROR, e)
       return
 
     # Now return the data to the server
@@ -65,8 +70,8 @@ HASH_CACHE = utils.FastStore(100)
 
 class TransferBuffer(actions.ActionPlugin):
   """Reads a buffer from a file and returns it to the server efficiently."""
-  in_rdfvalue = rdfvalue.BufferReference
-  out_rdfvalue = rdfvalue.BufferReference
+  in_rdfvalue = rdf_client.BufferReference
+  out_rdfvalue = rdf_client.BufferReference
 
   def Run(self, args):
     """Reads a buffer on the client and sends it to the server."""
@@ -74,10 +79,11 @@ class TransferBuffer(actions.ActionPlugin):
     if args.length > MAX_BUFFER_SIZE:
       raise RuntimeError("Can not read buffers this large.")
 
-    data = vfs.ReadVFS(args.pathspec, args.offset, args.length)
-    result = rdfvalue.DataBlob(
+    data = vfs.ReadVFS(args.pathspec, args.offset, args.length,
+                       progress_callback=self.Progress)
+    result = rdf_protodict.DataBlob(
         data=zlib.compress(data),
-        compression=rdfvalue.DataBlob.CompressionType.ZCOMPRESSION)
+        compression=rdf_protodict.DataBlob.CompressionType.ZCOMPRESSION)
 
     digest = hashlib.sha256(data).digest()
 
@@ -88,7 +94,7 @@ class TransferBuffer(actions.ActionPlugin):
     # Now return the data to the server into the special TransferStore well
     # known flow.
     self.grr_worker.SendReply(
-        result, session_id=rdfvalue.SessionID("aff4:/flows/W:TransferStore"))
+        result, session_id=rdfvalue.SessionID(flow_name="TransferStore"))
 
     # Now report the hash of this blob to our flow as well as the offset and
     # length.
@@ -98,8 +104,8 @@ class TransferBuffer(actions.ActionPlugin):
 
 class HashBuffer(actions.ActionPlugin):
   """Hash a buffer from a file and returns it to the server efficiently."""
-  in_rdfvalue = rdfvalue.BufferReference
-  out_rdfvalue = rdfvalue.BufferReference
+  in_rdfvalue = rdf_client.BufferReference
+  out_rdfvalue = rdf_client.BufferReference
 
   def Run(self, args):
     """Reads a buffer on the client and sends it to the server."""
@@ -117,33 +123,77 @@ class HashBuffer(actions.ActionPlugin):
                    data=digest)
 
 
+class HashFile(actions.ActionPlugin):
+  """Hash an entire file using multiple algorithms."""
+  in_rdfvalue = rdf_client.FingerprintRequest
+  out_rdfvalue = rdf_client.FingerprintResponse
+
+  _hash_types = {
+      "MD5": hashlib.md5,
+      "SHA1": hashlib.sha1,
+      "SHA256": hashlib.sha256,
+  }
+
+  def Run(self, args):
+    hashers = {}
+    for t in args.tuples:
+      for hash_name in t.hashers:
+        hashers[str(hash_name).lower()] = self._hash_types[str(hash_name)]()
+
+    with vfs.VFSOpen(args.pathspec,
+                     progress_callback=self.Progress) as file_obj:
+      # Only read as many bytes as we were told.
+      bytes_read = 0
+      while bytes_read < args.max_filesize:
+        self.Progress()
+        to_read = min(MAX_BUFFER_SIZE, args.max_filesize - bytes_read)
+        data = file_obj.Read(to_read)
+        if not data:
+          break
+        for hasher in hashers.values():
+          hasher.update(data)
+
+        bytes_read += len(data)
+
+      response = rdf_client.FingerprintResponse(
+          pathspec=file_obj.pathspec,
+          bytes_read=bytes_read,
+          hash=rdf_crypto.Hash(
+              **dict((k, v.digest()) for k, v in hashers.iteritems())))
+
+      self.SendReply(response)
+
+
 class CopyPathToFile(actions.ActionPlugin):
   """Copy contents of a pathspec to a file on disk."""
-  in_rdfvalue = rdfvalue.CopyPathToFileRequest
-  out_rdfvalue = rdfvalue.CopyPathToFileRequest
+  in_rdfvalue = rdf_client.CopyPathToFileRequest
+  out_rdfvalue = rdf_client.CopyPathToFileRequest
 
   BLOCK_SIZE = 10 * 1024 * 1024
 
-  def _Copy(self, dest_fd):
-    """Copy from VFS to file until no more data or self.length is reached.
+  def _Copy(self, src_fd, dest_fd, length):
+    """Copy from VFS to file until no more data or length is reached.
 
     Args:
-      dest_fd: file object to write to
+      src_fd: File object to read from.
+      dest_fd: File object to write to.
+      length: Number of bytes to write.
     Returns:
-      self.written: bytes written
+      Bytes written.
     """
-    while self.written < self.length:
-      to_read = min(self.length - self.written, self.BLOCK_SIZE)
-      data = self.src_fd.read(to_read)
+    written = 0
+    while written < length:
+      to_read = min(length - written, self.BLOCK_SIZE)
+      data = src_fd.read(to_read)
       if not data:
         break
 
       dest_fd.write(data)
-      self.written += len(data)
+      written += len(data)
 
       # Send heartbeats for long files.
       self.Progress()
-    return self.written
+    return written
 
   def Run(self, args):
     """Read from a VFS file and write to a GRRTempFile on disk.
@@ -153,48 +203,45 @@ class CopyPathToFile(actions.ActionPlugin):
     Args:
       args: see CopyPathToFile in jobs.proto
     """
-    self.src_fd = vfs.VFSOpen(args.src_path)
-    self.src_fd.Seek(args.offset)
-    offset = self.src_fd.Tell()
+    src_fd = vfs.VFSOpen(args.src_path, progress_callback=self.Progress)
+    src_fd.Seek(args.offset)
+    offset = src_fd.Tell()
 
-    self.length = args.length or (1024 ** 4)  # 1 TB
+    length = args.length or (1024 ** 4)  # 1 TB
 
-    self.written = 0
     suffix = ".gz" if args.gzip_output else ""
 
-    self.dest_fd = tempfiles.CreateGRRTempFile(directory=args.dest_dir,
-                                               lifetime=args.lifetime,
-                                               suffix=suffix)
-    self.dest_file = self.dest_fd.name
-    with self.dest_fd:
+    dest_fd, dest_pathspec = tempfiles.CreateGRRTempFileVFS(
+        directory=args.dest_dir, lifetime=args.lifetime, suffix=suffix)
+
+    dest_file = dest_fd.name
+    with dest_fd:
 
       if args.gzip_output:
-        gzip_fd = gzip.GzipFile(self.dest_file, "wb", 9, self.dest_fd)
+        gzip_fd = gzip.GzipFile(dest_file, "wb", 9, dest_fd)
 
         # Gzip filehandle needs its own close method called
         with gzip_fd:
-          self._Copy(gzip_fd)
+          written = self._Copy(src_fd, gzip_fd, length)
       else:
-        self._Copy(self.dest_fd)
+        written = self._Copy(src_fd, dest_fd, length)
 
-    pathspec_out = rdfvalue.PathSpec(
-        path=self.dest_file, pathtype=rdfvalue.PathSpec.PathType.OS)
-    self.SendReply(offset=offset, length=self.written, src_path=args.src_path,
-                   dest_dir=args.dest_dir, dest_path=pathspec_out,
+    self.SendReply(offset=offset, length=written, src_path=args.src_path,
+                   dest_dir=args.dest_dir, dest_path=dest_pathspec,
                    gzip_output=args.gzip_output)
 
 
 class ListDirectory(ReadBuffer):
   """Lists all the files in a directory."""
-  in_rdfvalue = rdfvalue.ListDirRequest
-  out_rdfvalue = rdfvalue.StatEntry
+  in_rdfvalue = rdf_client.ListDirRequest
+  out_rdfvalue = rdf_client.StatEntry
 
   def Run(self, args):
     """Lists a directory."""
     try:
-      directory = vfs.VFSOpen(args.pathspec)
+      directory = vfs.VFSOpen(args.pathspec, progress_callback=self.Progress)
     except (IOError, OSError), e:
-      self.SetStatus(rdfvalue.GrrStatus.ReturnedStatus.IOERROR, e)
+      self.SetStatus(rdf_flows.GrrStatus.ReturnedStatus.IOERROR, e)
       return
 
     files = list(directory.ListFiles())
@@ -204,74 +251,77 @@ class ListDirectory(ReadBuffer):
       self.SendReply(response)
 
 
+class DumpProcessMemory(actions.ActionPlugin):
+  """This action creates a memory dump of a process."""
+  in_rdfvalue = rdf_client.DumpProcessMemoryRequest
+  out_rdfvalue = rdf_paths.PathSpec
+
+
 class IteratedListDirectory(actions.IteratedAction):
   """Lists a directory as an iterator."""
-  in_rdfvalue = rdfvalue.ListDirRequest
-  out_rdfvalue = rdfvalue.StatEntry
+  in_rdfvalue = rdf_client.ListDirRequest
+  out_rdfvalue = rdf_client.StatEntry
 
   def Iterate(self, request, client_state):
     """Restores its way through the directory using an Iterator."""
     try:
-      fd = vfs.VFSOpen(request.pathspec)
+      fd = vfs.VFSOpen(request.pathspec, progress_callback=self.Progress)
     except (IOError, OSError), e:
-      self.SetStatus(rdfvalue.GrrStatus.ReturnedStatus.IOERROR, e)
+      self.SetStatus(rdf_flows.GrrStatus.ReturnedStatus.IOERROR, e)
       return
     files = list(fd.ListFiles())
     files.sort(key=lambda x: x.pathspec.path)
 
     index = client_state.get("index", 0)
     length = request.iterator.number
-    for response in files[index:index+length]:
+    for response in files[index:index + length]:
       self.SendReply(response)
 
     # Update the state
     client_state["index"] = index + length
 
 
+class SuspendableListDirectory(actions.SuspendableAction):
+  """Lists a directory as a suspendable client action."""
+  in_rdfvalue = rdf_client.ListDirRequest
+  out_rdfvalue = rdf_client.StatEntry
+
+  def Iterate(self):
+    try:
+      fd = vfs.VFSOpen(self.request.pathspec, progress_callback=self.Progress)
+    except (IOError, OSError), e:
+      self.SetStatus(rdf_flows.GrrStatus.ReturnedStatus.IOERROR, e)
+      return
+
+    length = self.request.iterator.number
+    for group in utils.Grouper(fd.ListFiles(), length):
+      for response in group:
+        self.SendReply(response)
+
+      self.Suspend()
+
+
 class StatFile(ListDirectory):
-  """Sends a StatResponse for a single file."""
-  in_rdfvalue = rdfvalue.ListDirRequest
-  out_rdfvalue = rdfvalue.StatEntry
+  """Sends a StatEntry for a single file."""
+  in_rdfvalue = rdf_client.ListDirRequest
+  out_rdfvalue = rdf_client.StatEntry
 
   def Run(self, args):
-    """Sends a StatResponse for a single file."""
+    """Sends a StatEntry for a single file."""
     try:
-      fd = vfs.VFSOpen(args.pathspec)
+      fd = vfs.VFSOpen(args.pathspec, progress_callback=self.Progress)
       res = fd.Stat()
 
       self.SendReply(res)
     except (IOError, OSError), e:
-      self.SetStatus(rdfvalue.GrrStatus.ReturnedStatus.IOERROR, e)
+      self.SetStatus(rdf_flows.GrrStatus.ReturnedStatus.IOERROR, e)
       return
-
-
-class HashFile(ListDirectory):
-  """Hashes the file and transmits it to the server."""
-  in_rdfvalue = rdfvalue.ListDirRequest
-  out_rdfvalue = rdfvalue.DataBlob
-
-  def Run(self, args):
-    """Hash a file."""
-    try:
-      fd = vfs.VFSOpen(args.pathspec)
-      hasher = hashlib.sha256()
-      while True:
-        data = fd.Read(1024*1024)
-        if not data: break
-
-        hasher.update(data)
-
-    except (IOError, OSError), e:
-      self.SetStatus(rdfvalue.GrrStatus.ReturnedStatus.IOERROR, e)
-      return
-
-    self.SendReply(data=hasher.digest())
 
 
 class ExecuteCommand(actions.ActionPlugin):
   """Executes one of the predefined commands."""
-  in_rdfvalue = rdfvalue.ExecuteRequest
-  out_rdfvalue = rdfvalue.ExecuteResponse
+  in_rdfvalue = rdf_client.ExecuteRequest
+  out_rdfvalue = rdf_client.ExecuteResponse
 
   def Run(self, command):
     """Run."""
@@ -286,7 +336,7 @@ class ExecuteCommand(actions.ActionPlugin):
     stdout = stdout[:10 * 1024 * 1024]
     stderr = stderr[:10 * 1024 * 1024]
 
-    result = rdfvalue.ExecuteResponse(
+    result = rdf_client.ExecuteResponse(
         request=command,
         stdout=stdout,
         stderr=stderr,
@@ -306,17 +356,40 @@ class ExecuteBinaryCommand(actions.ActionPlugin):
   which should be stored offline and well protected.
 
   This method can be utilized as part of an autoupdate mechanism if necessary.
+
+  NOTE: If the binary is too large to fit inside a single request, the request
+  will have the more_data flag enabled, indicating more data is coming.
   """
-  in_rdfvalue = rdfvalue.ExecuteBinaryRequest
-  out_rdfvalue = rdfvalue.ExecuteBinaryResponse
+  in_rdfvalue = rdf_client.ExecuteBinaryRequest
+  out_rdfvalue = rdf_client.ExecuteBinaryResponse
 
-  def WriteBlobToFile(self, signed_pb, lifetime, suffix=""):
+  def WriteBlobToFile(self, request):
     """Writes the blob to a file and returns its path."""
+    lifetime = 0
+    # Only set the lifetime thread on the last chunk written.
+    if not request.more_data:
+      lifetime = request.time_limit
 
-    temp_file = tempfiles.CreateGRRTempFile(suffix=suffix, lifetime=lifetime)
+      # Keep the file for at least 5 seconds after execution.
+      if lifetime > 0:
+        lifetime += 5
+
+    # First chunk truncates the file, later chunks append.
+    if request.offset == 0:
+      mode = "w+b"
+    else:
+      mode = "r+b"
+
+    temp_file = tempfiles.CreateGRRTempFile(
+        filename=request.write_path, mode=mode)
     with temp_file:
       path = temp_file.name
-      temp_file.write(signed_pb.data)
+      temp_file.seek(0, 2)
+      if temp_file.tell() != request.offset:
+        raise IOError("Chunks out of order Error.")
+
+      # Write the new chunk.
+      temp_file.write(request.executable.data)
 
     return path
 
@@ -334,30 +407,23 @@ class ExecuteBinaryCommand(actions.ActionPlugin):
     args.executable.Verify(config_lib.CONFIG[
         "Client.executable_signing_public_key"])
 
-    if sys.platform == "win32":
-      # We need .exe here.
-      suffix = ".exe"
-    else:
-      suffix = ""
+    path = self.WriteBlobToFile(args)
 
-    lifetime = args.time_limit
-    # Keep the file for at least 5 seconds after execution.
-    if lifetime > 0:
-      lifetime += 5
+    # Only actually run the file on the last chunk.
+    if not args.more_data:
+      self.ProcessFile(path, args)
+      self.CleanUp(path)
 
-    path = self.WriteBlobToFile(args.executable, lifetime, suffix)
-
+  def ProcessFile(self, path, args):
     res = client_utils_common.Execute(path, args.args, args.time_limit,
                                       bypass_whitelist=True)
     (stdout, stderr, status, time_used) = res
-
-    self.CleanUp(path)
 
     # Limit output to 10MB so our response doesn't get too big.
     stdout = stdout[:10 * 1024 * 1024]
     stderr = stderr[:10 * 1024 * 1024]
 
-    result = rdfvalue.ExecuteBinaryResponse(
+    result = rdf_client.ExecuteBinaryResponse(
         stdout=stdout,
         stderr=stderr,
         exit_status=status,
@@ -376,28 +442,50 @@ class ExecutePython(actions.ActionPlugin):
   This is protected by CONFIG[PrivateKeys.executable_signing_private_key], which
   should be stored offline and well protected.
   """
-  in_rdfvalue = rdfvalue.ExecutePythonRequest
-  out_rdfvalue = rdfvalue.ExecutePythonResponse
+  in_rdfvalue = rdf_client.ExecutePythonRequest
+  out_rdfvalue = rdf_client.ExecutePythonResponse
 
   def Run(self, args):
     """Run."""
     time_start = time.time()
 
+    class StdOutHook(object):
+
+      def __init__(self, buf):
+        self.buf = buf
+
+      def write(self, text):
+        self.buf.write(text)
+
     args.python_code.Verify(config_lib.CONFIG[
         "Client.executable_signing_public_key"])
 
     # The execed code can assign to this variable if it wants to return data.
-    magic_return_str = ""
     logging.debug("exec for python code %s", args.python_code.data[0:100])
-    # pylint: disable=exec-used,unused-variable
-    py_args = args.py_args.ToDict()
-    exec(args.python_code.data)
-    # pylint: enable=exec-used,unused-variable
+
+    context = globals().copy()
+    context["py_args"] = args.py_args.ToDict()
+    context["magic_return_str"] = ""
+    # Export the Progress function to allow python hacks to call it.
+    context["Progress"] = self.Progress
+
+    stdout = StringIO.StringIO()
+    with utils.Stubber(sys, "stdout", StdOutHook(stdout)):
+      exec(args.python_code.data, context)  # pylint: disable=exec-used
+
+    stdout_output = stdout.getvalue()
+    magic_str_output = context.get("magic_return_str")
+
+    if stdout_output and magic_str_output:
+      output = "Stdout: %s\nMagic Str:%s\n" % (stdout_output, magic_str_output)
+    else:
+      output = stdout_output or magic_str_output
+
     time_used = time.time() - time_start
     # We have to return microseconds.
-    result = rdfvalue.ExecutePythonResponse(
+    result = rdf_client.ExecutePythonResponse(
         time_used=int(1e6 * time_used),
-        return_val=utils.SmartStr(magic_return_str))
+        return_val=utils.SmartStr(output))
     self.SendReply(result)
 
 
@@ -418,7 +506,7 @@ class Segfault(actions.ActionPlugin):
 class ListProcesses(actions.ActionPlugin):
   """This action lists all the processes running on a machine."""
   in_rdfvalue = None
-  out_rdfvalue = rdfvalue.Process
+  out_rdfvalue = rdf_client.Process
 
   def Run(self, unused_arg):
     # psutil will cause an active loop on Windows 2000
@@ -426,28 +514,33 @@ class ListProcesses(actions.ActionPlugin):
       raise RuntimeError("ListProcesses not supported on Windows 2000")
 
     for proc in psutil.process_iter():
-      response = rdfvalue.Process()
-      for field in ["pid", "ppid", "name", "exe", "username", "terminal"]:
-        try:
-          if not hasattr(proc, field) or not getattr(proc, field):
-            continue
-          value = getattr(proc, field)
-          if isinstance(value, (int, long)):
-            setattr(response, field, value)
-          else:
-            setattr(response, field, utils.SmartUnicode(value))
+      response = rdf_client.Process()
+      process_fields = ["pid", "ppid", "name", "exe", "username", "terminal"]
 
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+      for field in process_fields:
+        try:
+          value = getattr(proc, field)
+          if value is None:
+            continue
+
+          if callable(value):
+            value = value()
+
+          if not isinstance(value, (int, long)):
+            value = utils.SmartUnicode(value)
+
+          setattr(response, field, value)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
           pass
 
       try:
-        for arg in proc.cmdline:
+        for arg in proc.cmdline():
           response.cmdline.append(utils.SmartUnicode(arg))
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
       try:
-        response.nice = proc.get_nice()
+        response.nice = proc.nice()
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
@@ -455,53 +548,54 @@ class ListProcesses(actions.ActionPlugin):
         # Not available on Windows.
         if hasattr(proc, "uids"):
           (response.real_uid, response.effective_uid,
-           response.saved_uid) = proc.uids
+           response.saved_uid) = proc.uids()
           (response.real_gid, response.effective_gid,
-           response.saved_gid) = proc.gids
+           response.saved_gid) = proc.gids()
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
       try:
-        response.ctime = long(proc.create_time * 1e6)
-        response.status = str(proc.status)
+        response.ctime = long(proc.create_time() * 1e6)
+        response.status = str(proc.status())
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
       try:
         # Not available on OSX.
-        if hasattr(proc, "getcwd"):
-          response.cwd = utils.SmartUnicode(proc.getcwd())
+        if hasattr(proc, "cwd"):
+          response.cwd = utils.SmartUnicode(proc.cwd())
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
       try:
-        response.num_threads = proc.get_num_threads()
+        response.num_threads = proc.num_threads()
       except (psutil.NoSuchProcess, psutil.AccessDenied, RuntimeError):
         pass
 
       try:
         (response.user_cpu_time,
-         response.system_cpu_time) = proc.get_cpu_times()
+         response.system_cpu_time) = proc.cpu_times()
         # This is very time consuming so we do not collect cpu_percent here.
         # response.cpu_percent = proc.get_cpu_percent()
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
       try:
-        response.RSS_size, response.VMS_size = proc.get_memory_info()
-        response.memory_percent = proc.get_memory_percent()
+        response.RSS_size, response.VMS_size = proc.memory_info()
+        response.memory_percent = proc.memory_percent()
       except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
 
-      # Due to a bug in psutil, this function is disabled for now.
+      # Due to a bug in psutil, this function is disabled for now
+      # (https://github.com/giampaolo/psutil/issues/340)
       # try:
-      #   for f in proc.get_open_files():
-      #     response.open_files.append(utils.SmartUnicode(f.path))
+      #  for f in proc.open_files():
+      #    response.open_files.append(utils.SmartUnicode(f.path))
       # except (psutil.NoSuchProcess, psutil.AccessDenied):
-      #   pass
+      #  pass
 
       try:
-        for c in proc.get_connections():
+        for c in proc.connections():
           conn = response.connections.Append(family=c.family,
                                              type=c.type,
                                              pid=proc.pid)
@@ -536,8 +630,8 @@ class ListProcesses(actions.ActionPlugin):
 
 class SendFile(actions.ActionPlugin):
   """This action encrypts and sends a file to a remote listener."""
-  in_rdfvalue = rdfvalue.SendFileRequest
-  out_rdfvalue = rdfvalue.StatEntry
+  in_rdfvalue = rdf_client.SendFileRequest
+  out_rdfvalue = rdf_client.StatEntry
 
   BLOCK_SIZE = 1024 * 1024 * 10  # 10 MB
 
@@ -554,11 +648,11 @@ class SendFile(actions.ActionPlugin):
     """Run."""
 
     # Open the file.
-    fd = vfs.VFSOpen(args.pathspec)
+    fd = vfs.VFSOpen(args.pathspec, progress_callback=self.Progress)
 
-    if args.address_family == rdfvalue.NetworkAddress.Family.INET:
+    if args.address_family == rdf_client.NetworkAddress.Family.INET:
       family = socket.AF_INET
-    elif args.address_family == rdfvalue.NetworkAddress.Family.INET6:
+    elif args.address_family == rdf_client.NetworkAddress.Family.INET6:
       family = socket.AF_INET6
     else:
       raise RuntimeError("Socket address family not supported.")
@@ -570,8 +664,8 @@ class SendFile(actions.ActionPlugin):
     except socket.error as e:
       raise RuntimeError(str(e))
 
-    cipher = crypto.AES128CBCCipher(args.key, args.iv,
-                                    crypto.Cipher.OP_ENCRYPT)
+    cipher = rdf_crypto.AES128CBCCipher(args.key, args.iv,
+                                        rdf_crypto.Cipher.OP_ENCRYPT)
 
     while True:
       data = fd.read(self.BLOCK_SIZE)
@@ -584,3 +678,41 @@ class SendFile(actions.ActionPlugin):
     s.close()
 
     self.SendReply(fd.Stat())
+
+
+class StatFS(actions.ActionPlugin):
+  """Call os.statvfs for a given list of paths. OS X and Linux only.
+
+  Note that a statvfs call for a network filesystem (e.g. NFS) that is
+  unavailable, e.g. due to no network, will result in the call blocking.
+  """
+  in_rdfvalue = rdf_client.StatFSRequest
+  out_rdfvalue = rdf_client.Volume
+
+  def Run(self, args):
+    if platform.system() == "Windows":
+      raise RuntimeError("os.statvfs not available on Windows")
+
+    for path in args.path_list:
+
+      try:
+        fd = vfs.VFSOpen(rdf_paths.PathSpec(path=path, pathtype=args.pathtype),
+                         progress_callback=self.Progress)
+        st = fd.StatFS()
+        mount_point = fd.GetMountPoint()
+      except (IOError, OSError), e:
+        self.SetStatus(rdf_flows.GrrStatus.ReturnedStatus.IOERROR, e)
+        continue
+
+      unix = rdf_client.UnixVolume(mount_point=mount_point)
+
+      # On linux pre 2.6 kernels don't have frsize, so we fall back to bsize.
+      # The actual_available_allocation_units attribute is set to blocks
+      # available to the unprivileged user, root may have some additional
+      # reserved space.
+      result = rdf_client.Volume(bytes_per_sector=(st.f_frsize or st.f_bsize),
+                                 sectors_per_allocation_unit=1,
+                                 total_allocation_units=st.f_blocks,
+                                 actual_available_allocation_units=st.f_bavail,
+                                 unixvolume=unix)
+      self.SendReply(result)

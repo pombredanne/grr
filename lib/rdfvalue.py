@@ -18,7 +18,7 @@ import functools
 import posixpath
 import re
 import time
-import urlparse
+import zlib
 
 import dateutil
 from dateutil import parser
@@ -81,6 +81,9 @@ class RDFValue(object):
   # ParseFromDataStore()
   data_store_type = "bytes"
 
+  # URL pointing to a help page about this value type.
+  context_help_url = None
+
   _age = 0
 
   # Mark as dirty each time we modify this object.
@@ -118,6 +121,9 @@ class RDFValue(object):
     """Make a new copy of this RDFValue."""
     return self.__class__(initializer=self.SerializeToString())
 
+  def __copy__(self):
+    return self.Copy()
+
   @property
   def age(self):
     if self._age.__class__ is not RDFDatetime:
@@ -146,6 +152,21 @@ class RDFValue(object):
   @abc.abstractmethod
   def SerializeToString(self):
     """Serialize into a string which can be parsed using ParseFromString."""
+
+  def __getstate__(self):
+    """Support the pickle protocol."""
+    # __pickled_rdfvalue is used to mark RDFValues pickled via the new way.
+    return dict(__pickled_rdfvalue=True,
+                age=int(self.age),
+                data=self.SerializeToString())
+
+  def __setstate__(self, data):
+    """Support the pickle protocol."""
+    if "__pickled_rdfvalue" in data:
+      self.ParseFromString(data["data"])
+      self.age = RDFDatetime(data["age"])
+    else:
+      self.__dict__ = data
 
   def AsProto(self):
     """Serialize into an RDFValue protobuf."""
@@ -176,12 +197,6 @@ class RDFValue(object):
   # The operators this type supports in the query language
   operators = dict(contains=(1, "ContainsMatch"))
 
-# This will register all classes into this modules's namespace regardless of
-# where they are defined. This allows us to decouple the place of definition of
-# a class (which might be in a plugin) from its use which will reference this
-# module.
-RDFValue.classes = globals()
-
 
 class RDFBytes(RDFValue):
   """An attribute which holds bytes."""
@@ -190,7 +205,12 @@ class RDFBytes(RDFValue):
   _value = ""
 
   def ParseFromString(self, string):
-    self._value = string
+    # TODO(user): this needs some more test coverage, particularly around
+    # submitting unicode strings and byte literals in the UI forms.
+    if isinstance(string, unicode):
+      self._value = utils.SmartStr(string)
+    else:
+      self._value = string
 
   def SerializeToString(self):
     return self._value
@@ -199,13 +219,25 @@ class RDFBytes(RDFValue):
     return utils.SmartStr(self._value)
 
   def __lt__(self, other):
-    return self._value < other
+    if isinstance(other, self.__class__):
+      return self._value < other._value  # pylint: disable=protected-access
+    else:
+      return self._value < other
+
+  def __gt__(self, other):
+    if isinstance(other, self.__class__):
+      return self._value > other._value  # pylint: disable=protected-access
+    else:
+      return self._value > other
 
   def __eq__(self, other):
-    return self._value == other
+    if isinstance(other, self.__class__):
+      return self._value == other._value  # pylint: disable=protected-access
+    else:
+      return self._value == other
 
   def __ne__(self, other):
-    return self._value != other
+    return not self.__eq__(other)
 
   def __hash__(self):
     return hash(self._value)
@@ -218,6 +250,16 @@ class RDFBytes(RDFValue):
 
   def __len__(self):
     return len(self._value)
+
+
+class RDFZippedBytes(RDFBytes):
+  """Zipped bytes sequence."""
+
+  def Uncompress(self):
+    if self:
+      return zlib.decompress(self._value)
+    else:
+      return ""
 
 
 class RDFString(RDFBytes):
@@ -237,8 +279,18 @@ class RDFString(RDFBytes):
   operators["="] = (1, "ContainsMatch")
   operators["startswith"] = (1, "Startswith")
 
+  def format(self, *args, **kwargs):  # pylint: disable=invalid-name
+    return self._value.format(*args, **kwargs)
+
   def __unicode__(self):
     return utils.SmartUnicode(self._value)
+
+  def __getitem__(self, value):
+    return self._value.__getitem__(value)
+
+  def ParseFromString(self, string):
+    # This handles the cases when we're initialized from Unicode strings.
+    self._value = utils.SmartStr(string)
 
   def SerializeToString(self):
     return utils.SmartStr(self._value)
@@ -260,7 +312,7 @@ class HashDigest(RDFBytes):
             self._value.encode("hex") == other)
 
   def __ne__(self, other):
-    return not self == other  # pylint: disable=g-comparison-negation
+    return not self.__eq__(other)
 
 
 @functools.total_ordering
@@ -268,6 +320,10 @@ class RDFInteger(RDFString):
   """Represent an integer."""
 
   data_store_type = "integer"
+
+  @staticmethod
+  def IsNumeric(value):
+    return isinstance(value, (int, long, float, RDFInteger))
 
   def __init__(self, initializer=None, age=None):
     super(RDFInteger, self).__init__(initializer=initializer, age=age)
@@ -300,6 +356,12 @@ class RDFInteger(RDFString):
   def __int__(self):
     return int(self._value)
 
+  def __float__(self):
+    return float(self._value)
+
+  def __index__(self):
+    return self._value
+
   def __eq__(self, other):
     return self._value == other
 
@@ -309,8 +371,22 @@ class RDFInteger(RDFString):
   def __and__(self, other):
     return self._value & other
 
+  def __rand__(self, other):
+    return self._value & other
+
+  def __iand__(self, other):
+    self._value &= other
+    return self
+
   def __or__(self, other):
     return self._value | other
+
+  def __ror__(self, other):
+    return self._value | other
+
+  def __ior__(self, other):
+    self._value |= other
+    return self
 
   def __add__(self, other):
     return self._value + other
@@ -335,8 +411,14 @@ class RDFInteger(RDFString):
   def __mul__(self, other):
     return self._value * other
 
+  def __rmul__(self, other):
+    return self._value * other
+
   def __div__(self, other):
     return self._value / other
+
+  def __rdiv__(self, other):
+    return other / self._value
 
   @staticmethod
   def LessThan(attribute, filter_implemention, value):
@@ -379,6 +461,10 @@ class RDFDatetime(RDFInteger):
     elif isinstance(initializer, (int, long, float)):
       self._value = int(initializer)
 
+    elif isinstance(initializer, datetime.datetime):
+      seconds = calendar.timegm(initializer.utctimetuple())
+      self._value = (seconds * self.converter) + initializer.microsecond
+
     elif isinstance(initializer, basestring):
       try:
         # Can be just a serialized integer.
@@ -402,8 +488,7 @@ class RDFDatetime(RDFInteger):
 
   def __str__(self):
     """Return the date in human readable (UTC)."""
-    value = self._value / self.converter
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(value))
+    return self.Format("%Y-%m-%d %H:%M:%S")
 
   def __unicode__(self):
     return utils.SmartUnicode(str(self))
@@ -434,6 +519,23 @@ class RDFDatetime(RDFInteger):
 
     return NotImplemented
 
+  def __iadd__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      # Assume other is in seconds
+      self._value += other * self.converter
+      return self
+
+    return NotImplemented
+
+  def __mul__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      return self.__class__(self._value * other)
+
+    return NotImplemented
+
+  def __rmul__(self, other):
+    return self.__mul__(other)
+
   def __sub__(self, other):
     if isinstance(other, (int, long, float, Duration)):
       # Assume other is in seconds
@@ -441,6 +543,14 @@ class RDFDatetime(RDFInteger):
 
     if isinstance(other, RDFDatetime):
       return Duration(self.AsSecondsFromEpoch() - other.AsSecondsFromEpoch())
+
+    return NotImplemented
+
+  def __isub__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      # Assume other is in seconds
+      self._value -= other * self.converter
+      return self
 
     return NotImplemented
 
@@ -510,9 +620,9 @@ class Duration(RDFInteger):
   data_store_type = "unsigned_integer"
 
   DIVIDERS = collections.OrderedDict((
-      ("w", 60*60*24*7),
-      ("d", 60*60*24),
-      ("h", 60*60),
+      ("w", 60 * 60 * 24 * 7),
+      ("d", 60 * 60 * 24),
+      ("h", 60 * 60),
       ("m", 60),
       ("s", 1)))
 
@@ -557,6 +667,48 @@ class Duration(RDFInteger):
 
   def __unicode__(self):
     return utils.SmartUnicode(str(self))
+
+  def __add__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      # Assume other is in seconds
+      return self.__class__(self._value + other)
+
+    return NotImplemented
+
+  def __iadd__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      # Assume other is in seconds
+      self._value += other
+      return self
+
+    return NotImplemented
+
+  def __mul__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      return self.__class__(self._value * other)
+
+    return NotImplemented
+
+  def __rmul__(self, other):
+    return self.__mul__(other)
+
+  def __sub__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      # Assume other is in seconds
+      return self.__class__(self._value - other)
+
+    return NotImplemented
+
+  def __isub__(self, other):
+    if isinstance(other, (int, long, float, Duration)):
+      # Assume other is in seconds
+      self._value -= other
+      return self
+
+    return NotImplemented
+
+  def __abs__(self):
+    return Duration(abs(self._value))
 
   def Expiry(self, base_time=None):
     if base_time is None:
@@ -611,12 +763,12 @@ class ByteSize(RDFInteger):
   DIVIDERS = dict((
       ("", 1),
       ("k", 1000),
-      ("m", 1000**2),
-      ("g", 1000**3),
+      ("m", 1000 ** 2),
+      ("g", 1000 ** 3),
       ("ki", 1024),
-      ("mi", 1024**2),
-      ("gi", 1024**3),
-      ))
+      ("mi", 1024 ** 2),
+      ("gi", 1024 ** 3),
+  ))
 
   REGEX = re.compile("^([0-9.]+)([kmgi]*)b?$")
 
@@ -635,6 +787,22 @@ class ByteSize(RDFInteger):
     else:
       raise InitializeError("Unknown initializer for ByteSize: %s." %
                             type(initializer))
+
+  def __str__(self):
+    size_token = ""
+    if self._value > 1024 ** 3:
+      size_token = "Gb"
+      value = float(self._value) / 1024 ** 3
+    elif self._value > 1024 ** 2:
+      size_token = "Mb"
+      value = float(self._value) / 1024 ** 2
+    elif self._value > 1024:
+      size_token = "Kb"
+      value = float(self._value) / 1024
+    else:
+      return utils.SmartStr(self._value) + "b"
+
+    return "%.1f%s" % (value, size_token)
 
   def ParseFromHumanReadable(self, string):
     """Parse a human readable string of a byte string.
@@ -672,6 +840,10 @@ class RDFURN(RDFValue):
 
   data_store_type = "string"
 
+  # Careful when changing this value, this is hardcoded a few times in this
+  # class for performance reasons.
+  scheme = "aff4"
+
   def __init__(self, initializer=None, age=None):
     """Constructor.
 
@@ -683,10 +855,7 @@ class RDFURN(RDFValue):
     """
     if isinstance(initializer, RDFURN):
       # Make a direct copy of the other object
-      # pylint: disable=protected-access
-      self._urn = initializer._urn
-      self._string_urn = initializer._string_urn
-      # pylint: enable=protected-access
+      self._string_urn = initializer.Path()
       super(RDFURN, self).__init__(None, age)
       return
 
@@ -695,51 +864,35 @@ class RDFURN(RDFValue):
 
     super(RDFURN, self).__init__(initializer=initializer, age=age)
 
-  # TODO(user): This is another ugly hack but we need to support legacy
-  # clients that still send plain strings in their responses.
-  bare_string_re = re.compile("^[A-Z]{1,3}:[a-zA-Z]+$")
-
   def ParseFromString(self, initializer=None):
     """Create RDFRUN from string.
 
     Args:
       initializer: url string
     """
-    # TODO(user): This is another ugly hack but we need to support legacy
-    # clients that still send plain strings in their responses.
-    if self.bare_string_re.match(initializer):
-      initializer = "aff4:/" + initializer
+    # Strip off the aff4: prefix if necessary.
+    if initializer.startswith("aff4:/"):
+      initializer = initializer[5:]
 
-    self._urn = urlparse.urlparse(initializer, scheme="aff4")
-
-    # TODO(user): Another hack. Urlparse behaves differently in different
-    # Python versions. We have to make sure the URL is not split at '?' chars.
-    # At this point I think we should just give up on urlparse and roll our
-    # own parsing...
-    if self._urn.query:
-      scheme = self._urn.scheme
-      url = "%s?%s" % (self._urn.path, self._urn.query)
-      netloc, params, query, fragment = "", "", "", ""
-      self._urn = urlparse.ParseResult(
-          scheme, netloc, url, params, query, fragment)
-
-    # Normalize the URN path component
-    # namedtuple _replace() is not really private.
-    # pylint: disable=protected-access
-    self._urn = self._urn._replace(path=utils.NormalizePath(self._urn.path))
-    if not self._urn.scheme:
-      self._urn = self._urn._replace(scheme="aff4")
-
-    self._string_urn = self._urn.geturl()
+    self._string_urn = utils.NormalizePath(initializer)
 
   def SerializeToString(self):
     return str(self)
 
   def SerializeToDataStore(self):
-    return utils.SmartUnicode(self._string_urn)
+    return unicode(self)
+
+  def __setstate__(self, data):
+    """Support the pickle protocol."""
+    RDFValue.__setstate__(self, data)
+    # NOTE: This is done for backwards compatibility with
+    # old pickled RDFURNs that got pickled via default pickling mechanism and
+    # have 'aff4:/' pickled as part of _string_urn as a result.
+    if self._string_urn.startswith("aff4:/"):
+      self._string_urn = self._string_urn[5:]
 
   def Dirname(self):
-    return posixpath.dirname(self.SerializeToString())
+    return posixpath.dirname(self._string_urn)
 
   def Basename(self):
     return posixpath.basename(self.Path())
@@ -763,57 +916,56 @@ class RDFURN(RDFValue):
       raise ValueError("Only strings should be added to a URN.")
 
     result = self.Copy(age)
-    result.Update(path=utils.JoinPath(self._urn.path, path))
+    result.Update(path=utils.JoinPath(self._string_urn, path))
 
     return result
 
-  def Update(self, url=None, **kwargs):
+  def Update(self, url=None, path=None):
     """Update one of the fields.
 
     Args:
        url: An optional string containing a URL.
-       **kwargs: Can be one of "schema", "netloc", "query", "fragment"
+       path: If the path for this URN should be updated.
     """
-    if url: self.ParseFromString(url)
-
-    self._urn = self._urn._replace(**kwargs)  # pylint: disable=protected-access
-    self._string_urn = self._urn.geturl()
+    if url:
+      self.ParseFromString(url)
+    if path:
+      self._string_urn = path
     self.dirty = True
 
   def Copy(self, age=None):
     """Make a copy of ourselves."""
     if age is None:
       age = int(time.time() * MICROSECONDS)
-    return self.__class__(str(self), age=age)
+    return self.__class__(self, age=age)
 
   def __str__(self):
-    return utils.SmartStr(self._string_urn)
+    return utils.SmartStr("aff4:%s" % self._string_urn)
 
   def __unicode__(self):
-    return utils.SmartUnicode(self._string_urn)
+    return utils.SmartUnicode(u"aff4:%s" % self._string_urn)
 
   def __eq__(self, other):
     if isinstance(other, basestring):
       other = self.__class__(other)
 
-    elif not isinstance(other, self.__class__):
+    elif other is None:
+      return False
+
+    elif not isinstance(other, RDFURN):
       return NotImplemented
 
-    return self._string_urn == other._string_urn  # pylint: disable=protected-access
+    return self._string_urn == other.Path()
 
   def __ne__(self, other):
-    return self._string_urn != other
+    return not self.__eq__(other)
 
   def __lt__(self, other):
     return self._string_urn < other
 
   def Path(self):
     """Return the path of the urn."""
-    return self._urn.path
-
-  @property
-  def scheme(self):
-    return self._urn.scheme
+    return self._string_urn
 
   def Split(self, count=None):
     """Returns all the path components.
@@ -829,14 +981,14 @@ class RDFURN(RDFValue):
       A list of path components of this URN.
     """
     if count:
-      result = filter(None, self.Path().split("/", count))
+      result = filter(None, self._string_urn.split("/", count))
       while len(result) < count:
         result.append("")
 
       return result
 
     else:
-      return filter(None, self.Path().split("/"))
+      return filter(None, self._string_urn.split("/"))
 
   def RelativeName(self, volume):
     """Given a volume URN return the relative URN as a unicode string.
@@ -853,17 +1005,11 @@ class RDFURN(RDFValue):
     volume_url = utils.SmartUnicode(volume)
     if string_url.startswith(volume_url):
       result = string_url[len(volume_url):]
-      # Must always return a relative path
-      while result.startswith("/"):
-        result = result[1:]
-
-      # Should return a unicode string.
-      return utils.SmartUnicode(result)
+      # This must always return a relative path so we strip leading "/"s. The
+      # result is always a unicode string.
+      return result.lstrip("/")
 
     return None
-
-  def __hash__(self):
-    return hash(self._string_urn)
 
   def __repr__(self):
     return "<%s age=%s>" % (str(self), self.age)
@@ -890,12 +1036,15 @@ class Subject(RDFURN):
                    startswith=(1, "Startswith"),
                    has=(1, "HasAttribute"))
 
+DEFAULT_FLOW_QUEUE = RDFURN("F")
+
 
 class SessionID(RDFURN):
   """An rdfvalue object that represents a session_id."""
 
-  def __init__(self, initializer=None, age=None, base=None, queue=None,
-               flow_name=None):
+  def __init__(
+      self, initializer=None, age=None, base="aff4:/flows",
+      queue=DEFAULT_FLOW_QUEUE, flow_name=None):
     """Constructor.
 
     Args:
@@ -907,28 +1056,49 @@ class SessionID(RDFURN):
     Raises:
       InitializeError: The given URN cannot be converted to a SessionID.
     """
-    if base:
+    if initializer is None:
       # This SessionID is being constructed from scratch.
-      if not flow_name:
+      if flow_name is None:
         flow_name = utils.PRNG.GetULong()
 
-      initializer = RDFURN(base).Add("%s:%X" % (queue.Basename(), flow_name))
+      if isinstance(flow_name, int):
+        initializer = RDFURN(base).Add("%s:%X" % (queue.Basename(), flow_name))
+      else:
+        initializer = RDFURN(base).Add("%s:%s" % (queue.Basename(), flow_name))
     elif isinstance(initializer, RDFURN):
-      if initializer.Basename().count(":") != 1:
-        raise InitializeError("Invalid URN for SessionID: %s" % initializer)
-
+      try:
+        self.ValidateID(initializer.Basename())
+      except ValueError as e:
+        raise InitializeError("Invalid URN for SessionID: %s, %s" %
+                              (initializer, e.message))
     super(SessionID, self).__init__(initializer=initializer, age=age)
 
   def Queue(self):
     return RDFURN(self.Basename().split(":")[0])
 
+  def FlowName(self):
+    return self.Basename().split(":")[1]
+
+  def Add(self, path, age=None):
+    # Adding to a SessionID results in a normal RDFURN.
+    return RDFURN(self).Add(path, age=age)
+
+  @classmethod
+  def ValidateID(cls, id_str):
+    # This check is weaker than it could be because we allow queues called
+    # "DEBUG-user1" and IDs like "TransferStore"
+    allowed_re = re.compile(r"^[-0-9a-zA-Z]+:[0-9a-zA-Z]+$")
+    if not allowed_re.match(id_str):
+      raise ValueError("Invalid SessionID")
+
 
 class FlowSessionID(SessionID):
 
   # TODO(user): This is code to fix some legacy issues. Remove this when all
-  # clients are built after Jan, 2013.
+  # clients are built after Dec 2014.
+
   def ParseFromString(self, initializer=None):
-    # Old clients sometimes send bare well known flow ids e.g., CA:Enrol.
+    # Old clients sometimes send bare well known flow ids.
     if not utils.SmartStr(initializer).startswith("aff4"):
       initializer = "aff4:/flows/" + initializer
     super(FlowSessionID, self).ParseFromString(initializer)

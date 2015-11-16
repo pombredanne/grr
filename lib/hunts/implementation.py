@@ -28,13 +28,22 @@ from grr.lib import flow
 from grr.lib import flow_runner
 from grr.lib import queue_manager
 from grr.lib import rdfvalue
+from grr.lib import registry
+from grr.lib import stats
 from grr.lib import type_info
 from grr.lib import utils
-from grr.lib.rdfvalues import flows
+from grr.lib.aff4_objects import collections as aff4_collections
+from grr.lib.rdfvalues import client as rdf_client
+from grr.lib.rdfvalues import flows as rdf_flows
+from grr.lib.rdfvalues import foreman as rdf_foreman
+from grr.lib.rdfvalues import hunts
+from grr.lib.rdfvalues import protodict as rdf_protodict
+from grr.lib.rdfvalues import stats as rdf_stats
+from grr.lib.rdfvalues import structs as rdf_structs
 from grr.proto import flows_pb2
 
 
-class HuntRunnerArgs(rdfvalue.RDFProtoStruct):
+class HuntRunnerArgs(rdf_structs.RDFProtoStruct):
   protobuf = flows_pb2.HuntRunnerArgs
 
   def Validate(self):
@@ -59,6 +68,7 @@ class HuntRunner(flow_runner.FlowRunner):
   3) Resources are tallied for each client and as a hunt total.
   """
 
+  schedule_kill_notifications = False
   process_requests_in_order = False
 
   def _AddClient(self, client_id):
@@ -72,8 +82,7 @@ class HuntRunner(flow_runner.FlowRunner):
       self._RegisterAndRunClient(client_id)
 
   def _RegisterAndRunClient(self, client_id):
-    self.flow_obj.AddAttribute(
-        self.flow_obj.Schema.CLIENTS(client_id))
+    self.flow_obj.RegisterClient(client_id)
     self.RunStateMethod("RunClient", direct_response=[client_id])
 
   def _Process(self, request, responses, thread_pool=None, events=None):
@@ -110,7 +119,19 @@ class HuntRunner(flow_runner.FlowRunner):
       return
 
     if request.next_state == "RegisterClient":
-      self._RegisterAndRunClient(request.client_id)
+      state = self.flow_obj.Get(self.flow_obj.Schema.STATE)
+      # This allows the client limit to operate with a client rate. We still
+      # want clients to get registered for the hunt at times in the future.
+      # After they have been run, hunts only ever go into the paused state by
+      # hitting the client limit. If a user stops a hunt, it will go into the
+      # "STOPPED" state.
+      if state in ["STARTED", "PAUSED"]:
+        self._RegisterAndRunClient(request.client_id)
+      else:
+        logging.debug(
+            "Not starting client %s on hunt %s which is not running: %s",
+            request.client_id, self.session_id,
+            self.flow_obj.Get(self.flow_obj.Schema.STATE))
       return
 
     event = threading.Event()
@@ -120,6 +141,36 @@ class HuntRunner(flow_runner.FlowRunner):
     thread_pool.AddTask(target=self.RunStateMethod,
                         args=(request.next_state, request, responses, event),
                         name="Hunt processing")
+
+  def Log(self, format_str, *args):
+    """Logs the message using the flow's standard logging.
+
+    Args:
+      format_str: Format string
+      *args: arguments to the format string
+    Raises:
+      RuntimeError: on parent missing logs_collection
+    """
+    format_str = utils.SmartUnicode(format_str)
+
+    try:
+      # The status message is always in unicode
+      status = format_str % args
+    except TypeError:
+      logging.error("Tried to log a format string with the wrong number "
+                    "of arguments: %s", format_str)
+      status = format_str
+
+    logging.info("%s: %s", self.session_id, status)
+
+    self.SetStatus(utils.SmartUnicode(status))
+
+    logs_collection = self.OpenLogsCollection(self.args.logs_collection_urn)
+    logs_collection.Add(
+        rdf_flows.FlowLog(client_id=None, urn=self.session_id,
+                          flow_name=self.flow_obj.__class__.__name__,
+                          log_message=status))
+    logs_collection.Flush()
 
   def Error(self, backtrace, client_id=None):
     """Logs an error for a client but does not terminate the hunt."""
@@ -147,25 +198,29 @@ class HuntRunner(flow_runner.FlowRunner):
     if args.client_limit > 1000:
       raise RuntimeError("Please specify client_limit <= 1000.")
 
-    context = flows.DataObject(
+    context = utils.DataObject(
         args=args,
         backtrace=None,
-        client_resources=rdfvalue.ClientResources(),
+        client_resources=rdf_client.ClientResources(),
         create_time=rdfvalue.RDFDatetime().Now(),
         creator=self.token.username,
-        expires=rdfvalue.RDFDatetime().Now(),
+        expires=args.expiry_time.Expiry(),
+        # If not None, kill-stuck-flow notification is scheduled at the given
+        # time.
+        kill_timestamp=None,
         network_bytes_sent=0,
+        next_client_due=0,
         next_outbound_id=1,
         next_processed_request=1,
+        next_states=set(),
         outstanding_requests=0,
         current_state=None,
         start_time=rdfvalue.RDFDatetime().Now(),
-
         # Hunts are always in the running state.
-        state=rdfvalue.Flow.State.RUNNING,
-        usage_stats=rdfvalue.ClientResourcesStats(),
-        user=self.token.username,
-        )
+        state=rdf_flows.Flow.State.RUNNING,
+        usage_stats=rdf_stats.ClientResourcesStats(),
+        remaining_cpu_quota=args.cpu_limit,
+    )
 
     # Store the context in the flow_obj for next time.
     self.flow_obj.state.Register("context", context)
@@ -182,7 +237,19 @@ class HuntRunner(flow_runner.FlowRunner):
     """
     return rdfvalue.SessionID(base="aff4:/hunts", queue=self.args.queue)
 
-  def Start(self, add_foreman_rules=True):
+  def _CreateAuditEvent(self, event_action):
+    try:
+      flow_name = self.flow_obj.args.flow_runner_args.flow_name
+    except AttributeError:
+      flow_name = ""
+
+    event = flow.AuditEvent(user=self.flow_obj.token.username,
+                            action=event_action, urn=self.flow_obj.urn,
+                            flow_name=flow_name,
+                            description=self.args.description)
+    flow.Events.PublishEvent("Audit", event, token=self.flow_obj.token)
+
+  def Start(self):
     """This uploads the rules to the foreman and, thus, starts the hunt."""
     # We are already running.
     if self.flow_obj.Get(self.flow_obj.Schema.STATE) == "STARTED":
@@ -201,18 +268,19 @@ class HuntRunner(flow_runner.FlowRunner):
 
     # When the next client can be scheduled. Implements gradual client
     # recruitment rate according to the client_rate.
-    self.context.Register("next_client_due",
-                          rdfvalue.RDFDatetime().Now())
+    self.context.next_client_due = rdfvalue.RDFDatetime().Now()
+
+    self._CreateAuditEvent("HUNT_STARTED")
 
     # Start the hunt.
     self.flow_obj.Set(self.flow_obj.Schema.STATE("STARTED"))
     self.flow_obj.Flush()
 
-    if not add_foreman_rules:
+    if not self.args.add_foreman_rules:
       return
 
     # Add a new rule to the foreman
-    foreman_rule = rdfvalue.ForemanRule(
+    foreman_rule = rdf_foreman.ForemanRule(
         created=rdfvalue.RDFDatetime().Now(),
         expires=self.context.expires,
         description="Hunt %s %s" % (self.session_id,
@@ -244,6 +312,12 @@ class HuntRunner(flow_runner.FlowRunner):
           [r for r in aff4_rules if r.hunt_id != self.session_id])
       foreman.Set(aff4_rules)
 
+  def _Complete(self):
+    """Marks the hunt as completed."""
+    self._RemoveForemanRule()
+    self.flow_obj.Set(self.flow_obj.Schema.STATE("COMPLETED"))
+    self.flow_obj.Flush()
+
   def Pause(self):
     """Pauses the hunt (removes Foreman rules, does not touch expiry time)."""
     if not self.IsHuntStarted():
@@ -258,6 +332,8 @@ class HuntRunner(flow_runner.FlowRunner):
     self.flow_obj.Set(self.flow_obj.Schema.STATE("PAUSED"))
     self.flow_obj.Flush()
 
+    self._CreateAuditEvent("HUNT_PAUSED")
+
   def Stop(self):
     """Cancels the hunt (removes Foreman rules, resets expiry time to 0)."""
     # Make sure the user is allowed to stop this hunt.
@@ -270,6 +346,8 @@ class HuntRunner(flow_runner.FlowRunner):
 
     self.flow_obj.Set(self.flow_obj.Schema.STATE("STOPPED"))
     self.flow_obj.Flush()
+
+    self._CreateAuditEvent("HUNT_STOPPED")
 
   def IsRunning(self):
     """Hunts are always considered to be running.
@@ -295,15 +373,14 @@ class HuntRunner(flow_runner.FlowRunner):
     Returns:
       If a new client is allowed to be scheduled on this hunt.
     """
-    # Hunt is considered running in PAUSED or STARTED states.
     state = self.flow_obj.Get(self.flow_obj.Schema.STATE)
-    if state in ["STOPPED", "PAUSED"]:
+    if state != "STARTED":
       return False
 
     # Hunt has expired.
     if self.context.expires < rdfvalue.RDFDatetime().Now():
       # Stop the hunt due to expiry.
-      self.Stop()
+      self._Complete()
       return False
 
     return True
@@ -348,32 +425,32 @@ class HuntRunner(flow_runner.FlowRunner):
     # Now we construct a special response which will be sent to the hunt
     # flow. Randomize the request_id so we do not overwrite other messages in
     # the queue.
-    request_state = rdfvalue.RequestState(id=utils.PRNG.GetULong(),
-                                          session_id=self.context.session_id,
-                                          client_id=client_id,
-                                          next_state=next_state)
+    request_state = rdf_flows.RequestState(id=utils.PRNG.GetULong(),
+                                           session_id=self.context.session_id,
+                                           client_id=client_id,
+                                           next_state=next_state)
 
     if request_data:
-      request_state.data = rdfvalue.Dict().FromDict(request_data)
+      request_state.data = rdf_protodict.Dict().FromDict(request_data)
 
     self.QueueRequest(request_state, timestamp=start_time)
 
     # Add the status message if needed.
-    if not messages or not isinstance(messages[-1], rdfvalue.GrrStatus):
-      messages.append(rdfvalue.GrrStatus())
+    if not messages or not isinstance(messages[-1], rdf_flows.GrrStatus):
+      messages.append(rdf_flows.GrrStatus())
 
     # Send all the messages
     for i, payload in enumerate(messages):
       if isinstance(payload, rdfvalue.RDFValue):
-        msg = rdfvalue.GrrMessage(
+        msg = rdf_flows.GrrMessage(
             session_id=self.session_id, request_id=request_state.id,
             response_id=1 + i,
-            auth_state=rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED,
+            auth_state=rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED,
             payload=payload,
-            type=rdfvalue.GrrMessage.Type.MESSAGE)
+            type=rdf_flows.GrrMessage.Type.MESSAGE)
 
-        if isinstance(payload, rdfvalue.GrrStatus):
-          msg.type = rdfvalue.GrrMessage.Type.STATUS
+        if isinstance(payload, rdf_flows.GrrStatus):
+          msg.type = rdf_flows.GrrMessage.Type.STATUS
       else:
         raise flow_runner.FlowRunnerError("Bad message %s of type %s." %
                                           (payload, type(payload)))
@@ -381,23 +458,23 @@ class HuntRunner(flow_runner.FlowRunner):
       self.QueueResponse(msg, timestamp=start_time)
 
     # Add the status message if needed.
-    if not messages or not isinstance(messages[-1], rdfvalue.GrrStatus):
-      messages.append(rdfvalue.GrrStatus())
+    if not messages or not isinstance(messages[-1], rdf_flows.GrrStatus):
+      messages.append(rdf_flows.GrrStatus())
 
     # Notify the worker about it.
-    self.QueueNotification(self.session_id, timestamp=start_time)
+    self.QueueNotification(session_id=self.session_id, timestamp=start_time)
 
 
 class GRRHunt(flow.GRRFlow):
   """The GRR Hunt class."""
 
   # Some common rules.
-  MATCH_WINDOWS = rdfvalue.ForemanAttributeRegex(attribute_name="System",
-                                                 attribute_regex="Windows")
-  MATCH_LINUX = rdfvalue.ForemanAttributeRegex(attribute_name="System",
-                                               attribute_regex="Linux")
-  MATCH_DARWIN = rdfvalue.ForemanAttributeRegex(attribute_name="System",
-                                                attribute_regex="Darwin")
+  MATCH_WINDOWS = rdf_foreman.ForemanAttributeRegex(attribute_name="System",
+                                                    attribute_regex="Windows")
+  MATCH_LINUX = rdf_foreman.ForemanAttributeRegex(attribute_name="System",
+                                                  attribute_regex="Linux")
+  MATCH_DARWIN = rdf_foreman.ForemanAttributeRegex(attribute_name="System",
+                                                   attribute_regex="Darwin")
 
   class SchemaCls(flow.GRRFlow.SchemaCls):
     """The schema for hunts.
@@ -405,32 +482,21 @@ class GRRHunt(flow.GRRFlow):
     This object stores the persistent information for the hunt.
     """
 
-    CLIENTS = aff4.Attribute("aff4:clients", rdfvalue.RDFURN,
-                             "The list of clients this hunt was run against.",
-                             creates_new_object_version=False)
-
     CLIENT_COUNT = aff4.Attribute("aff4:client_count", rdfvalue.RDFInteger,
                                   "The total number of clients scheduled.",
                                   versioned=False,
                                   creates_new_object_version=False)
 
-    FINISHED = aff4.Attribute("aff4:finished", rdfvalue.RDFURN,
-                              "The list of clients the hunt has completed on.",
-                              creates_new_object_version=False)
-
-    ERRORS = aff4.Attribute("aff4:errors", rdfvalue.HuntError,
-                            "The list of clients that returned an error.",
-                            creates_new_object_version=False)
-
-    LOG = aff4.Attribute("aff4:result_log", rdfvalue.HuntLog,
-                         "The log entries.",
-                         creates_new_object_version=False)
-
     # This needs to be kept out the args semantic value since must be updated
     # without taking a lock on the hunt object.
     STATE = aff4.Attribute(
         "aff4:hunt_state", rdfvalue.RDFString,
-        "The state of this hunt Can be 'STOPPED', 'STARTED' or 'PAUSED'.",
+        "The state of a hunt can be "
+        "'STARTED': running, "
+        "'STOPPED': stopped by the user, "
+        "'PAUSED': paused due to client limit, "
+        "'COMPLETED': hunt has met its expiry time. New hunts are created in"
+        " the PAUSED state.",
         versioned=False, lock_protected=False, default="PAUSED")
 
   args_type = None
@@ -441,9 +507,84 @@ class GRRHunt(flow.GRRFlow):
     super(GRRHunt, self).Initialize()
     # Hunts run in multiple threads so we need to protect access.
     self.lock = threading.RLock()
+    self.processed_responses = False
 
     if "r" in self.mode:
       self.client_count = self.Get(self.Schema.CLIENT_COUNT)
+
+  @property
+  def logs_collection_urn(self):
+    return self.urn.Add("Logs")
+
+  @property
+  def all_clients_collection_urn(self):
+    return self.urn.Add("AllClients")
+
+  @property
+  def completed_clients_collection_urn(self):
+    return self.urn.Add("CompletedClients")
+
+  @property
+  def clients_errors_collection_urn(self):
+    return self.urn.Add("ErrorClients")
+
+  @property
+  def output_plugins_status_collection_urn(self):
+    return self.urn.Add("OutputPluginsStatus")
+
+  @property
+  def output_plugins_errors_collection_urn(self):
+    return self.urn.Add("OutputPluginsErrors")
+
+  @property
+  def creator(self):
+    return self.state.context.creator
+
+  def _AddObjectToCollection(self, obj, collection_urn):
+    aff4_collections.PackedVersionedCollection.AddToCollection(
+        collection_urn, [obj], sync=False, token=self.token)
+
+  def _GetCollectionItems(self, collection_urn):
+    collection = aff4.FACTORY.Create(collection_urn,
+                                     "PackedVersionedCollection",
+                                     mode="r", token=self.token)
+    return collection.GenerateItems()
+
+  def _ClientSymlinkUrn(self, client_id):
+    return client_id.Add("flows").Add("%s:hunt" % (self.urn.Basename()))
+
+  def RegisterClient(self, client_urn):
+    self._AddObjectToCollection(client_urn, self.all_clients_collection_urn)
+
+  def RegisterCompletedClient(self, client_urn):
+    self._AddObjectToCollection(client_urn,
+                                self.completed_clients_collection_urn)
+
+  def RegisterClientError(self, client_id, log_message=None, backtrace=None):
+    error = rdf_flows.HuntError(client_id=client_id,
+                                backtrace=backtrace)
+    if log_message:
+      error.log_message = utils.SmartUnicode(log_message)
+
+    self._AddObjectToCollection(error, self.clients_errors_collection_urn)
+
+  def OnDelete(self, deletion_pool=None):
+    super(GRRHunt, self).OnDelete(deletion_pool=deletion_pool)
+
+    # Delete all the symlinks in the clients namespace that point to the flows
+    # initiated by this hunt.
+    children_urns = deletion_pool.ListChildren(self.urn)
+    clients_ids = []
+    for urn in children_urns:
+      try:
+        clients_ids.append(rdf_client.ClientURN(urn.Basename()))
+      except type_info.TypeValueError:
+        # Ignore children that are not valid clients ids.
+        continue
+
+    symlinks_urns = [self._ClientSymlinkUrn(client_id)
+                     for client_id in clients_ids]
+    deletion_pool.MultiMarkForDeletion(symlinks_urns)
 
   @flow.StateHandler()
   def RunClient(self, client_id):
@@ -463,11 +604,11 @@ class GRRHunt(flow.GRRFlow):
     if runner_args is None:
       runner_args = HuntRunnerArgs()
 
-    cls._FilterArgsFromSemanticProtobuf(runner_args, kwargs)
+    cls.FilterArgsFromSemanticProtobuf(runner_args, kwargs)
 
     # Is the required flow a known flow?
     if (runner_args.hunt_name not in cls.classes and
-        not aff4.issubclass(GRRHunt, cls.classes[runner_args.hunt_name])):
+        not aff4.issubclass(cls.classes[runner_args.hunt_name], GRRHunt)):
       raise RuntimeError("Unable to locate hunt %s" % runner_args.hunt_name)
 
     # Make a new hunt object and initialize its runner.
@@ -478,7 +619,7 @@ class GRRHunt(flow.GRRFlow):
     # kwargs..
     if hunt_obj.args_type and args is None:
       args = hunt_obj.args_type()
-      cls._FilterArgsFromSemanticProtobuf(args, kwargs)
+      cls.FilterArgsFromSemanticProtobuf(args, kwargs)
 
     if hunt_obj.args_type and not isinstance(args, hunt_obj.args_type):
       raise RuntimeError("Hunt args must be instance of %s" %
@@ -494,16 +635,28 @@ class GRRHunt(flow.GRRFlow):
     # should be called to start them.
     hunt_obj.Set(hunt_obj.Schema.STATE("PAUSED"))
 
-    with hunt_obj.CreateRunner(runner_args=runner_args) as runner:
-      # Allow the hunt to do its own initialization.
-      runner.RunStateMethod("Start")
+    runner = hunt_obj.CreateRunner(runner_args=runner_args)
+    # Allow the hunt to do its own initialization.
+    runner.RunStateMethod("Start")
 
     hunt_obj.Flush()
+
+    try:
+      flow_name = args.flow_runner_args.flow_name
+    except AttributeError:
+      flow_name = ""
+
+    event = flow.AuditEvent(user=runner_args.token.username,
+                            action="HUNT_CREATED",
+                            urn=hunt_obj.urn,
+                            flow_name=flow_name,
+                            description=runner_args.description)
+    flow.Events.PublishEvent("Audit", event, token=runner_args.token)
 
     return hunt_obj
 
   @classmethod
-  def StartClient(cls, hunt_id, client_id):
+  def StartClients(cls, hunt_id, client_ids, token=None):
     """This method is called by the foreman for each client it discovers.
 
     Note that this function is performance sensitive since it is called by the
@@ -511,49 +664,66 @@ class GRRHunt(flow.GRRFlow):
 
     Args:
       hunt_id: The hunt to schedule.
-      client_id: The client that should be added to the hunt.
+      client_ids: List of clients that should be added to the hunt.
+      token: An optional access token to use.
     """
-    token = access_control.ACLToken(username="Hunt", reason="hunting")
+    token = token or access_control.ACLToken(username="Hunt", reason="hunting")
 
-    # Now we construct a special response which will be sent to the hunt
-    # flow. Randomize the request_id so we do not overwrite other messages in
-    # the queue.
-    state = rdfvalue.RequestState(id=utils.PRNG.GetULong(),
-                                  session_id=hunt_id,
-                                  client_id=client_id,
-                                  next_state="AddClient")
-
-    # Queue the new request.
     with queue_manager.QueueManager(token=token) as flow_manager:
-      flow_manager.QueueRequest(hunt_id, state)
+      for client_id in client_ids:
+        # Now we construct a special response which will be sent to the hunt
+        # flow. Randomize the request_id so we do not overwrite other messages
+        # in the queue.
+        state = rdf_flows.RequestState(id=utils.PRNG.GetULong(),
+                                       session_id=hunt_id,
+                                       client_id=client_id,
+                                       next_state="AddClient")
 
-      # Send a response.
-      msg = rdfvalue.GrrMessage(
-          session_id=hunt_id,
-          request_id=state.id, response_id=1,
-          auth_state=rdfvalue.GrrMessage.AuthorizationState.AUTHENTICATED,
-          type=rdfvalue.GrrMessage.Type.STATUS,
-          payload=rdfvalue.GrrStatus())
+        # Queue the new request.
+        flow_manager.QueueRequest(hunt_id, state)
 
-      flow_manager.QueueResponse(hunt_id, msg)
+        # Send a response.
+        msg = rdf_flows.GrrMessage(
+            session_id=hunt_id,
+            request_id=state.id, response_id=1,
+            auth_state=rdf_flows.GrrMessage.AuthorizationState.AUTHENTICATED,
+            type=rdf_flows.GrrMessage.Type.STATUS,
+            payload=rdf_flows.GrrStatus())
 
-      # And notify the worker about it.
-      flow_manager.QueueNotification(hunt_id)
+        flow_manager.QueueResponse(hunt_id, msg)
+
+        # And notify the worker about it.
+        flow_manager.QueueNotification(session_id=hunt_id)
 
   def Run(self):
     """A shortcut method for starting the hunt."""
-    with self.GetRunner() as runner:
-      runner.Start()
+    self.GetRunner().Start()
 
   def Pause(self):
     """A shortcut method for pausing the hunt."""
-    with self.GetRunner() as runner:
-      runner.Pause()
+    self.GetRunner().Pause()
 
   def Stop(self):
     """A shortcut method for stopping the hunt."""
-    with self.GetRunner() as runner:
-      runner.Stop()
+    self.GetRunner().Stop()
+
+  def AddResultsToCollection(self, responses, client_id):
+    if responses.success:
+      with self.lock:
+        self.processed_responses = True
+
+        msgs = [rdf_flows.GrrMessage(payload=response, source=client_id)
+                for response in responses]
+        aff4.ResultsOutputCollection.AddToCollection(
+            self.state.context.results_collection_urn, msgs,
+            sync=True, token=self.token)
+
+        # Update stats.
+        stats.STATS.IncrementCounter("hunt_results_added",
+                                     delta=len(msgs))
+    else:
+      self.LogClientError(client_id, log_message=utils.SmartStr(
+          responses.status))
 
   def CallFlow(self, flow_name=None, next_state=None, request_data=None,
                client_id=None, **kwargs):
@@ -564,10 +734,13 @@ class GRRHunt(flow.GRRFlow):
       base_session_id = self.urn.Add(client_id.Basename())
 
     # Actually start the new flow.
-    child_urn = self.runner.CallFlow(flow_name=flow_name, next_state=next_state,
-                                     base_session_id=base_session_id,
-                                     client_id=client_id,
-                                     request_data=request_data, **kwargs)
+    # We need to pass the logs_collection_urn here rather than in __init__ to
+    # wait for the hunt urn to be created.
+    child_urn = self.runner.CallFlow(
+        flow_name=flow_name, next_state=next_state,
+        base_session_id=base_session_id, client_id=client_id,
+        request_data=request_data, logs_collection_urn=self.logs_collection_urn,
+        **kwargs)
 
     if client_id:
       # But we also create a symlink to it from the client's namespace.
@@ -615,13 +788,13 @@ class GRRHunt(flow.GRRFlow):
 
         value = int(client.Get(aff4.Attribute.NAMES[i.attribute_name]))
         op = i.operator
-        if op == rdfvalue.ForemanAttributeInteger.Operator.LESS_THAN:
+        if op == rdf_foreman.ForemanAttributeInteger.Operator.LESS_THAN:
           if value >= i.value:
             return False
-        elif op == rdfvalue.ForemanAttributeInteger.Operator.GREATER_THAN:
+        elif op == rdf_foreman.ForemanAttributeInteger.Operator.GREATER_THAN:
           if value <= i.value:
             return False
-        elif op == rdfvalue.ForemanAttributeInteger.Operator.EQUAL:
+        elif op == rdf_foreman.ForemanAttributeInteger.Operator.EQUAL:
           if value != i.value:
             return False
         else:
@@ -668,12 +841,71 @@ class GRRHunt(flow.GRRFlow):
     if matching_clients:
       logging.info("Example matches: %s", str(matching_clients[:3]))
 
+  def SetDescription(self, description=None):
+    if description:
+      self.state.context.args.description = description
+    else:
+      try:
+        flow_name = self.state.args.flow_runner_args.flow_name
+      except AttributeError:
+        flow_name = ""
+      self.state.context.args.description = flow_name
+
   @flow.StateHandler()
   def Start(self):
-    """This method is called when the hunt is first created.
+    """Initializes this hunt from arguments."""
+    self.state.context.Register("results_metadata_urn",
+                                self.urn.Add("ResultsMetadata"))
+    self.state.context.Register("results_collection_urn",
+                                self.urn.Add("Results"))
+    self.state.context.Register("output_plugins_base_urn",
+                                self.urn.Add("Results"))
 
-    Here we do any global initializations of the hunt we might need.
-    """
+    with aff4.FACTORY.Create(
+        self.state.context.results_metadata_urn, "HuntResultsMetadata",
+        mode="rw", token=self.token) as results_metadata:
+
+      state = rdf_flows.FlowState()
+      try:
+        plugins_descriptors = self.state.args.output_plugins
+      except AttributeError:
+        plugins_descriptors = []
+
+      for index, plugin_descriptor in enumerate(plugins_descriptors):
+        output_base_urn = self.state.context.output_plugins_base_urn.Add(
+            plugin_descriptor.plugin_name)
+
+        plugin_class = plugin_descriptor.GetPluginClass()
+        plugin_obj = plugin_class(self.state.context.results_collection_urn,
+                                  output_base_urn=output_base_urn,
+                                  args=plugin_descriptor.plugin_args,
+                                  token=self.token)
+
+        state.Register("%s_%d" % (plugin_descriptor.plugin_name, index),
+                       (plugin_descriptor, plugin_obj.state))
+
+      results_metadata.Set(results_metadata.Schema.OUTPUT_PLUGINS(state))
+
+    # Create results collection.
+    with aff4.FACTORY.Create(
+        self.state.context.results_collection_urn, "ResultsOutputCollection",
+        mode="w", token=self.token) as results_collection:
+      results_collection.Set(results_collection.Schema.RESULTS_SOURCE,
+                             self.urn)
+
+    # Create all other hunt-related collections.
+    for urn in [self.logs_collection_urn,
+                self.all_clients_collection_urn,
+                self.completed_clients_collection_urn,
+                self.clients_errors_collection_urn,
+                self.output_plugins_status_collection_urn,
+                self.output_plugins_errors_collection_urn]:
+      with aff4.FACTORY.Create(urn, "PackedVersionedCollection", mode="w",
+                               token=self.token):
+        pass
+
+    if not self.state.context.args.description:
+      self.SetDescription()
 
   @flow.StateHandler()
   def End(self):
@@ -681,37 +913,17 @@ class GRRHunt(flow.GRRFlow):
 
   def MarkClientDone(self, client_id):
     """Adds a client_id to the list of completed tasks."""
-    self.MarkClient(client_id, self.SchemaCls.FINISHED)
+    self.RegisterCompletedClient(client_id)
 
     if self.state.context.args.notification_event:
-      status = rdfvalue.HuntNotification(session_id=self.session_id,
-                                         client_id=client_id)
+      status = hunts.HuntNotification(session_id=self.session_id,
+                                      client_id=client_id)
       self.Publish(self.state.context.args.notification_event, status)
 
   def LogClientError(self, client_id, log_message=None, backtrace=None):
     """Logs an error for a client."""
-    error = self.Schema.ERRORS()
-    if client_id:
-      error.client_id = client_id
-    if log_message:
-      error.log_message = utils.SmartUnicode(log_message)
-    if backtrace:
-      error.backtrace = backtrace
-    self.AddAttribute(error)
-
-  def LogResult(self, client_id, log_message=None, urn=None):
-    """Logs a message for a client."""
-    log_entry = self.Schema.LOG()
-    log_entry.client_id = client_id
-    if log_message:
-      log_entry.log_message = utils.SmartUnicode(log_message)
-    if urn:
-      log_entry.urn = utils.SmartUnicode(urn)
-    self.AddAttribute(log_entry)
-
-  def MarkClient(self, client_id, attribute):
-    """Adds a client to the list indicated by attribute."""
-    self.AddAttribute(attribute(client_id))
+    self.RegisterClientError(client_id, log_message=log_message,
+                             backtrace=backtrace)
 
   def ProcessClientResourcesStats(self, client_id, status):
     """Process status message from a client and update the stats.
@@ -724,57 +936,46 @@ class GRRHunt(flow.GRRFlow):
       status: Status returned from the client.
     """
 
-  def _Num(self, attribute):
-    return len(set(self.GetValuesForAttribute(attribute)))
+  def GetClientsCounts(self):
+    collections = aff4.FACTORY.MultiOpen(
+        [self.all_clients_collection_urn, self.completed_clients_collection_urn,
+         self.clients_errors_collection_urn],
+        aff4_type="PackedVersionedCollection", mode="r", token=self.token)
+    collections_dict = dict((coll.urn, coll) for coll in collections)
 
-  def NumClients(self):
-    return self._Num(self.Schema.CLIENTS)
+    def CollectionLen(collection_urn):
+      if collection_urn in collections_dict:
+        return collections_dict[collection_urn].CalculateLength()
+      else:
+        return 0
 
-  def NumCompleted(self):
-    return self._Num(self.Schema.FINISHED)
+    all_clients_count = CollectionLen(self.all_clients_collection_urn)
+    completed_clients_count = CollectionLen(
+        self.completed_clients_collection_urn)
+    clients_errors_count = CollectionLen(self.clients_errors_collection_urn)
 
-  def NumOutstanding(self):
-    return self.NumClients() - self.NumCompleted()
+    return all_clients_count, completed_clients_count, clients_errors_count
 
-  def _List(self, attribute):
-    items = self.GetValuesForAttribute(attribute)
-    if items:
-      print len(items), "items:"
-      for item in items:
-        print item
+  def GetClientsErrors(self, client_id=None):
+    errors = self._GetCollectionItems(self.clients_errors_collection_urn)
+    if not client_id:
+      return errors
     else:
-      print "Nothing found."
+      return [error for error in errors if error.client_id == client_id]
 
-  def ListClients(self):
-    self._List(self.Schema.CLIENTS)
-
-  def GetCompletedClients(self):
-    return sorted(self.GetValuesForAttribute(self.Schema.FINISHED))
-
-  def ListCompletedClients(self):
-    self._List(self.Schema.FINISHED)
-
-  def GetOutstandingClients(self):
-    started = self.GetValuesForAttribute(self.Schema.CLIENTS)
-    done = self.GetValuesForAttribute(self.Schema.FINISHED)
-    return sorted(list(set(started) - set(done)))
-
-  def ListOutstandingClients(self):
-    outstanding = self.GetOutstandingClients()
-    if not outstanding:
-      print "No outstanding clients."
-      return
-
-    print len(outstanding), "outstanding clients:"
-    for client in outstanding:
-      print client
+  def GetClients(self):
+    return set(self._GetCollectionItems(self.all_clients_collection_urn))
 
   def GetClientsByStatus(self):
     """Get all the clients in a dict of {status: [client_list]}."""
-    completed = set(self.GetCompletedClients())
+    started = set(self._GetCollectionItems(self.all_clients_collection_urn))
+    completed = set(self._GetCollectionItems(
+        self.completed_clients_collection_urn))
+    outstanding = started - completed
 
-    return {"COMPLETED": sorted(completed),
-            "OUTSTANDING": self.GetOutstandingClients()}
+    return {"STARTED": sorted(started),
+            "COMPLETED": sorted(completed),
+            "OUTSTANDING": sorted(outstanding)}
 
   def GetClientStates(self, client_list, client_chunk=50):
     """Take in a client list and return dicts with their age and hostname."""
@@ -787,20 +988,20 @@ class GRRHunt(flow.GRRFlow):
         result["hostname"] = fd.Get(fd.Schema.HOSTNAME)
         yield (fd.urn, result)
 
-  def PrintLog(self, client_id=None):
+  def GetLog(self, client_id=None):
+    log_vals = aff4.FACTORY.Create(
+        self.logs_collection_urn, mode="r",
+        aff4_type="PackedVersionedCollection", token=self.token)
     if not client_id:
-      self._List(self.Schema.LOG)
-      return
+      return log_vals
+    else:
+      return [val for val in log_vals if val.client_id == client_id]
 
-    for log in self.GetValuesForAttribute(self.Schema.LOG):
-      if log.client_id == client_id:
-        print log
 
-  def PrintErrors(self, client_id=None):
-    if not client_id:
-      self._List(self.Schema.ERRORS)
-      return
+class HuntInitHook(registry.InitHook):
 
-    for error in self.GetValuesForAttribute(self.Schema.ERRORS):
-      if error.client_id == client_id:
-        print error
+  pre = ["StatsInit"]
+
+  def RunOnce(self):
+    """Register standard hunt-related stats."""
+    stats.STATS.RegisterCounterMetric("hunt_results_added")

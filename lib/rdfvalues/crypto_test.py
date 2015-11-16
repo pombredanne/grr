@@ -9,17 +9,18 @@ from M2Crypto import RSA
 
 from grr.lib import config_lib
 from grr.lib import rdfvalue
+from grr.lib import test_lib
+from grr.lib.rdfvalues import crypto as rdf_crypto
 from grr.lib.rdfvalues import test_base
 
 
 class SignedBlobTest(test_base.RDFValueTestCase):
-  rdfvalue_class = rdfvalue.SignedBlob
+  rdfvalue_class = rdf_crypto.SignedBlob
 
   def setUp(self):
     super(SignedBlobTest, self).setUp()
     self.private_key = config_lib.CONFIG[
         "PrivateKeys.driver_signing_private_key"]
-
     self.public_key = config_lib.CONFIG[
         "Client.driver_signing_public_key"]
 
@@ -58,6 +59,15 @@ class TestCryptoTypeInfos(test_base.RDFValueBaseTest):
   would not be able to run any tests.
   """
 
+  def setUp(self):
+    super(TestCryptoTypeInfos, self).setUp()
+    self.config_stubber = test_lib.PreserveConfig()
+    self.config_stubber.Start()
+
+  def tearDown(self):
+    super(TestCryptoTypeInfos, self).tearDown()
+    self.config_stubber.Stop()
+
   def testX509Certificates(self):
     """Deliberately try to parse an invalid certificate."""
     config_lib.CONFIG.Initialize(data="""
@@ -67,6 +77,7 @@ certificate = -----BEGIN CERTIFICATE-----
         uqnFquJfg8xMWHHJmPEocDpJT8Tlmbw=
         -----END CERTIFICATE-----
 """)
+    config_lib.CONFIG.context = []
 
     errors = config_lib.CONFIG.Validate("Frontend")
     self.assertItemsEqual(errors.keys(), ["Frontend.certificate"])
@@ -89,6 +100,7 @@ driver_signing_private_key = -----BEGIN RSA PRIVATE KEY-----
     wDcAa2GW9htKHmv9/Rzg05iAD+FYTsp8Gi2r4icV
     -----END RSA PRIVATE KEY-----
 """)
+    config_lib.CONFIG.context = []
 
     key = config_lib.CONFIG.Get("PrivateKeys.server_key")
     self.assertRaises(RSA.RSAError, key.GetPrivateKey)
@@ -106,6 +118,8 @@ driver_signing_public_key = -----BEGIN PUBLIC KEY-----
     QAI3WluLh0sW7/ro93eoIZ0FbipnTpzGkPpriONbSOXmxWNTo0b9ma8CAwEAAQ==
     -----END PUBLIC KEY-----
 """)
+    config_lib.CONFIG.context = []
+
     errors = config_lib.CONFIG.Validate("Client")
     self.assertItemsEqual(errors.keys(),
                           ["Client.executable_signing_public_key"])
@@ -118,6 +132,7 @@ driver_signing_private_key = -----BEGIN RSA PRIVATE KEY-----
         MIIBOgIBAAJBALnfFW1FffeKPs5PLUhFOSkNrr9TDCODQAI3WluLh0sW7/ro93eo
         -----END RSA PRIVATE KEY-----
 """)
+    config_lib.CONFIG.context = []
 
     key = config_lib.CONFIG.Get("PrivateKeys.driver_signing_private_key")
     self.assertRaises(RSA.RSAError, key.GetPrivateKey)

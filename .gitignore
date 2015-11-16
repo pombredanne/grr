@@ -1,0 +1,7 @@
+*.pyc
+proto/*_pb2.py
+*.swp
+*.o
+*.pb.cc
+*.pb.h
+*~
